@@ -3,10 +3,26 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
+namespace {
 
-Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
-    if (t <= 0) { throw std::invalid_argument("q6 linear: unsupported shape or T"); }
+// TP2 shard geometries. See the block comment in q5_dispatch.cpp for the rules. Q6 serves only the
+// vocabulary head in this target, which the ShardPlan splits column-parallel by vocabulary rows.
+// Returns nullptr when (n, k) is not a registered shard extent.
+Q6Launch select_q6_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    const bool column_shard = n == 124160 && (k == 5120 || k == 2048); // 248320 / 2
+    if (!column_shard) { return nullptr; }
+    if (t <= 4) { return launch_q6_simt_r8_c4; }
+    if (t <= 16) { return launch_q6_mma_r64_c16_k128; }
+    if (t <= 24) { return launch_q6_mma_r64_c24_k128; }
+    if (t <= 32) { return launch_q6_mma_r64_c32_k128; }
+    if (t <= 48) { return launch_q6_mma_r64_c48_k128; }
+    return launch_q6_mma_r64_c128;
+}
 
+// The tp1 table, exactly as it was: returns nullptr rather than throwing so the caller
+// can fall back to the tp2 shard table. It is consulted FIRST, so a geometry that is
+// both registered here and listed as a shard extent keeps its tuned tp1 launcher.
+Q6Launch select_q6_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t) {
     switch (k) {
     case 5120:
         if (n == 248320) {
@@ -59,14 +75,40 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         break;
     }
 
+    return nullptr;
+}
+
+} // namespace
+
+Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
+    if (t <= 0) { throw std::invalid_argument("q6 linear: unsupported shape or T"); }
+    if (const Q6Launch tp1 = select_q6_a16_registered(n, k, t); tp1 != nullptr) {
+        return tp1;
+    }
+    if (const Q6Launch shard = select_q6_tp2_shard_launch(n, k, t); shard != nullptr) {
+        return shard;
+    }
     throw std::invalid_argument("q6 linear: unsupported shape or T");
 }
+
+#ifdef NINFER_VOLTA_BUILD
+bool q6_launch_needs_volta_fallback(Q6Launch launch) noexcept {
+    return launch != launch_q6_simt_r8_c4 && launch != launch_q6_simt_r8_c5 &&
+           launch != launch_q6_simt_r8_c6 && launch != launch_q6_simt_r8_c7 &&
+           launch != launch_q6_simt_r8_c8;
+}
+#endif
 
 Q6Launch select_q6_launch(std::int32_t n, std::int32_t k, std::int32_t t, LinearPolicy policy) {
     switch (policy) {
     case LinearPolicy::A16Only:
-    case LinearPolicy::AllowA8:
-        return select_q6_a16_launch(n, k, t);
+    case LinearPolicy::AllowA8: {
+        const Q6Launch launch = select_q6_a16_launch(n, k, t);
+#ifdef NINFER_VOLTA_BUILD
+        if (q6_launch_needs_volta_fallback(launch)) { return launch_q6_simt_r8_c8; }
+#endif
+        return launch;
+    }
     case LinearPolicy::AllowA4:
         break;
     }

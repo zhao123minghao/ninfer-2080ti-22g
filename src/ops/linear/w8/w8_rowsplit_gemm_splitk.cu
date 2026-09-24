@@ -30,8 +30,8 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cuda
                               : ActiveCols <= 32 ? 32
                               : ActiveCols <= 40 ? 40
                                                  : 48;
-#if defined(NINFER_SM75)
-    constexpr int KWarps    = ActiveCols <= 32 ? 8 : 4;
+#if defined(NINFER_SM8X_COMPAT)
+    constexpr int KWarps    = 4;
     constexpr int MinBlocks = 2;
 #else
     constexpr int KWarps    = ActiveCols <= 36 ? 16 : 8;
@@ -90,8 +90,8 @@ void launch_w8_exact_t_splitk(const Tensor& x, const Weight& w, Tensor& out, cud
 void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream) {
     require_problem(x, w, out);
-    if (x.ne[1] < 33 || x.ne[1] > 127) {
-        throw std::invalid_argument("W8 exact-T composite requires T=33..127");
+    if (x.ne[1] < 33) {
+        throw std::invalid_argument("W8 exact-T composite requires T>=33");
     }
 
     std::int32_t offset = 0;
@@ -130,28 +130,8 @@ void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cuda
         throw std::invalid_argument("W8 DFlash medium route requires T=49..128");
     }
 
-#if defined(NINFER_SM75)
-    if (t <= 64) {
-        launch_medium<64, 2, 2, 1>(x, w, out, stream);
-    } else if (t == 65) {
-        launch_medium<80, 2, 2, 1>(x, w, out, stream);
-    } else if (t <= 72) {
-        launch_medium<72, 2, 3, 1>(x, w, out, stream);
-    } else if (t <= 80) {
-        launch_medium<80, 2, 2, 1>(x, w, out, stream);
-    } else if (t <= 96) {
-        launch_medium<96, 2, 2, 1>(x, w, out, stream);
-    } else if (t <= 104) {
-        launch_medium<104, 2, 1, 1>(x, w, out, stream);
-    } else if (t <= 112) {
-        launch_medium<112, 2, 2, 1>(x, w, out, stream);
-    } else if (t <= 120) {
-        launch_medium<120, 2, 3, 1>(x, w, out, stream);
-    } else if (t <= 125) {
-        launch_medium<128, 2, 2, 1>(x, w, out, stream);
-    } else {
-        launch_medium<128, 2, 2, 1>(x, w, out, stream);
-    }
+#if defined(NINFER_SM8X_COMPAT)
+    launch_w8_exact_t_composite(x, w, out, stream);
 #else
     if (t <= 64) {
         launch_medium<64, 8, 4, 1>(x, w, out, stream);
@@ -180,8 +160,8 @@ void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cuda
 
 void launch_w8_medium_splitk_c144(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream) {
-#if defined(NINFER_SM75)
-    launch_medium_route<144, 2, 3, 2>(x, w, out, stream);
+#if defined(NINFER_SM8X_COMPAT)
+    launch_w8_exact_t_composite(x, w, out, stream);
 #else
     launch_medium_route<144, 2, 9, 2>(x, w, out, stream);
 #endif

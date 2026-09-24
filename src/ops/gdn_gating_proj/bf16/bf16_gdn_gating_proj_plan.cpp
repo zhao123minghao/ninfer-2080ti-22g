@@ -26,27 +26,15 @@ struct RouteSpec {
     Bf16GdnGatingScheduleId schedule;
 };
 
-#if defined(NINFER_SM75)
-constexpr std::array<RouteSpec, 6> k27Routes{{
+#ifdef NINFER_VOLTA_BUILD
+// Volta build: the MmaCooperative*/MmaUnsplit schedules below route through
+// bf16_gdn_gating_proj_gemm_mma_kernel, which is trap-stubbed on sm_70 (Ampere+ mma/ldmatrix).
+// SmallTSplit10 (ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.cu) is a plain SIMT
+// dot-product kernel that tiles over blockIdx.z in groups of 8 tokens, so it already handles
+// arbitrary T with no new kernel needed -- see the V100 performance summary.
+constexpr std::array<RouteSpec, 2> k27Routes{{
     {{1, 1}, Bf16GdnGatingScheduleId::GemvPairedRows},
-    {{2, 8}, Bf16GdnGatingScheduleId::SmallTSplit10},
-    // On SM75 (RTX 2080 Ti, 68 SMs), 27B BN128 MMA kernels consume 40 KiB dynamic shared memory
-    // per CTA out of 64 KiB available per SM, strictly limiting cooperative residency to 1 CTA/SM
-    // (maximum 68 CTAs device-wide).
-    // Grid sizes:
-    // Split8: ceil(T/128) * 3 * 8 <= 68 -> legal for T <= 256 (48 CTAs at T=256)
-    // Split4: ceil(T/128) * 3 * 4 <= 68 -> legal for T <= 640 (60 CTAs at T=640)
-    // Split2: ceil(T/128) * 3 * 2 <= 68 -> legal for T <= 1408 (66 CTAs at T=1408)
-    // Unsplit: T >= 1409 (at T=2048: 48 CTAs; at T=2414: 57 CTAs)
-    {{9, 256}, Bf16GdnGatingScheduleId::MmaCooperativeSplit8},
-    {{257, 640}, Bf16GdnGatingScheduleId::MmaCooperativeSplit4},
-    {{641, 1408}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
-    {{1409, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
-}};
-
-constexpr std::array<RouteSpec, 2> k35Routes{{
-    {{1, 8}, Bf16GdnGatingScheduleId::SimtWarpRowC4},
-    {{9, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
+    {{2, kAnyCols}, Bf16GdnGatingScheduleId::SmallTSplit10},
 }};
 #else
 constexpr std::array<RouteSpec, 6> k27Routes{{
@@ -60,7 +48,19 @@ constexpr std::array<RouteSpec, 6> k27Routes{{
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
+#endif
 
+#ifdef NINFER_VOLTA_BUILD
+// Same story as k27Routes above, for the 35B-A3B geometry: every Mma* schedule
+// routes through the trap-stubbed bf16_gdn_gating_proj_gemm_mma_kernel. Unlike
+// the 27B geometry, GemvPairedRows and SmallTSplit10 are not legal here (see
+// candidate_is_legal), so the SIMT sibling is SimtWarpRowC8 -- a warp-per-row
+// dot product, legal to 8*65535 columns, which is far beyond any context this
+// engine serves. Without this, a3b traps on its first GDN layer.
+constexpr std::array<RouteSpec, 1> k35Routes{{
+    {{1, kAnyCols}, Bf16GdnGatingScheduleId::SimtWarpRowC8},
+}};
+#else
 constexpr std::array<RouteSpec, 5> k35Routes{{
     // The same progression keeps the long-range cooperative routes near 256 CTAs.
     {{1, 127}, Bf16GdnGatingScheduleId::MmaCooperativeSplit16},
@@ -69,7 +69,7 @@ constexpr std::array<RouteSpec, 5> k35Routes{{
     {{2049, 4096}, Bf16GdnGatingScheduleId::MmaCooperativeSplit2},
     {{4097, kAnyCols}, Bf16GdnGatingScheduleId::MmaUnsplit},
 }};
-#endif
+#endif // NINFER_VOLTA_BUILD
 
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes,
@@ -148,38 +148,19 @@ bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t
 }
 
 bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
-    // BN128 uses 40 KiB of dynamic shared memory. On Turing SM75 (64 KiB shared memory per SM),
-    // 40 KiB strictly limits cooperative residency to 1 CTA/SM.
-    // For the registered RTX 2080 Ti target (68 SMs), maximum resident cooperative grid = 68 CTAs
-    // (68 RTX 2080 Ti SMs * 1 verified resident CTA/SM for this exact 40-KiB compiled kernel,
-    // rather than a generic SM75 limit).
-#if defined(NINFER_SM75)
-    constexpr std::int32_t kResidentCtas = 68;
-#elif defined(NINFER_SM86)
-    constexpr std::int32_t kResidentCtas = 82 * 2;
-#else
-    constexpr std::int32_t kResidentCtas = 340;
-#endif
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, kResidentCtas);
+    // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
+    // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
+    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
+    return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
 }
 
 bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
-    // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles.
-    // On Turing SM75 (64 KiB shared memory per SM), 24 KiB dynamic shared memory allows 2 CTAs/SM
-    // (2 * 24 KiB = 48 KiB <= 64 KiB), and cudaOccupancyMaxActiveBlocksPerMultiprocessor
-    // independently confirms 2 active blocks/SM across all compiled 35B SplitK and NormFused
-    // specializations (Warps=8 / 256 threads, 89..125 registers <= 65536 registers per SM).
-    // For the registered RTX 2080 Ti target (68 SMs), maximum resident cooperative grid = 136 CTAs
-    // (68 RTX 2080 Ti SMs * 2 verified resident CTAs/SM).
-#if defined(NINFER_SM75)
-    constexpr std::int32_t resident_ctas = 136;
-#elif defined(NINFER_SM86)
-    const std::int32_t resident_ctas =
-        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? (82 * 2) : (82 * 4);
-#else
+    // BN64 uses 24 KiB of dynamic shared memory and two 16-row tiles. With the registered CUDA
+    // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
+    // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
+    // device-wide limits are 340 and 680 CTAs respectively.
     const std::int32_t resident_ctas =
         schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
-#endif
     return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
 }
 
@@ -191,7 +172,11 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
         case Bf16GdnGatingScheduleId::GemvPairedRows:
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
+#ifdef NINFER_VOLTA_BUILD
+            return problem.cols >= 2;
+#else
             return problem.cols >= 2 && problem.cols <= 8;
+#endif
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
         case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
@@ -397,13 +382,41 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
     if (is_27(problem)) {
         for (const RouteSpec& route : k27Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                if (candidate_is_legal(route.schedule, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit4, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit4, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit2, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit2, problem);
+                }
+                return bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaUnsplit,
+                                                         problem);
             }
         }
     } else {
         for (const RouteSpec& route : k35Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                if (candidate_is_legal(route.schedule, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit8, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit8, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit4, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit4, problem);
+                }
+                if (candidate_is_legal(Bf16GdnGatingScheduleId::MmaCooperativeSplit2, problem)) {
+                    return bf16_gdn_gating_resolve_candidate(
+                        Bf16GdnGatingScheduleId::MmaCooperativeSplit2, problem);
+                }
+                return bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaUnsplit,
+                                                         problem);
             }
         }
     }
@@ -426,14 +439,22 @@ Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProbl
     Bf16GdnGatingPlan control            = bf16_gdn_gating_resolve_plan(problem);
     Bf16GdnNormGatingScheduleId schedule = Bf16GdnNormGatingScheduleId::Composed;
     std::int32_t norm_splits             = 0;
-#if !defined(NINFER_SM75)
-    if (is_35(problem) && problem.cols <= 16) {
+    // The fused norm+gating schedule launches
+    // bf16_gdn_norm_gating_proj_35_mma_split32_launch directly, bypassing the
+    // route table above, so the Volta k35Routes entry does not protect it. Its
+    // Composed alternative is the same computation as rmsnorm + the routed gating
+    // projection, which does go through the table.
+#ifdef NINFER_VOLTA_BUILD
+    constexpr bool fused_norm_gating_available = false;
+#else
+    constexpr bool fused_norm_gating_available = true;
+#endif // NINFER_VOLTA_BUILD
+    if (fused_norm_gating_available && is_35(problem) && problem.cols <= 16) {
         control  = bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaCooperativeSplit32,
                                                      problem);
         schedule = Bf16GdnNormGatingScheduleId::MmaCooperativeSplit32;
         norm_splits = 32;
     }
-#endif
     const std::size_t norm_partial_bytes =
         static_cast<std::size_t>(norm_splits) * problem.cols * sizeof(float);
     return {schedule, control, control.workspace_bytes + norm_partial_bytes};
@@ -445,14 +466,12 @@ std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t max_cols) {
     std::size_t maximum =
         bf16_gdn_gating_capacity_workspace_bytes(heads, input_rows, min_cols, max_cols);
-#if !defined(NINFER_SM75)
     if (heads == 32 && input_rows == 2048 && min_cols <= 16) {
         const std::int32_t fused_cols = std::min<std::int32_t>(max_cols, 16);
         maximum                       = std::max(
             maximum,
             bf16_gdn_norm_gating_resolve_plan({heads, input_rows, fused_cols}).workspace_bytes);
     }
-#endif
     return maximum;
 }
 

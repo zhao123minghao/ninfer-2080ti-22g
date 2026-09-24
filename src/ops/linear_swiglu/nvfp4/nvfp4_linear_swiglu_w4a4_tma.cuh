@@ -51,7 +51,13 @@ __global__ __launch_bounds__(
                                                                           descriptors,
                                                                   float alpha,
                                                                   __nv_bfloat16* __restrict__ output) {
-    static_assert(Geometry::kOutputRows == 34816);
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
+    // Geometry is either the tp1 parent (Nvfp4MlpGateUpGeometry, 34816x5120) or the tp2 column
+    // shard (Nvfp4MlpGateUpTp2ColumnGeometry, 17408x5120) -- see
+    // src/ops/linear/nvfp4/nvfp4_config.h. Every address computed below is linear in kIntermediate
+    // (= Geometry::kOutputRows / 2), so nothing here actually depends on the literal 34816; the
+    // real structural requirements are the two kIntermediate asserts a few lines down (both derive
+    // from the same 128-row scale tile the shard boundary itself is required to respect).
     static_assert(Geometry::kInputRows == 5120);
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert(Schedule::kBlockN == 128);
@@ -256,6 +262,12 @@ __global__ __launch_bounds__(
                       row_vector * 8,
                   values);
     }
+#else  // __CUDA_ARCH__ < 900
+    (void)descriptors;
+    (void)alpha;
+    (void)output;
+    __trap();
+#endif // __CUDA_ARCH__ >= 900
 }
 
 } // namespace ninfer::ops::detail
