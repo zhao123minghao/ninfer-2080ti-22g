@@ -5,7 +5,6 @@
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
 #include <array>
-#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
@@ -16,11 +15,7 @@ namespace {
 constexpr int kRows           = 2048;
 constexpr int kRowsPerCta     = 16;
 constexpr int kFirstExactCols = 2;
-#if defined(NINFER_SM8X_COMPAT)
-constexpr int kLastExactCols = 32;
-#else
-constexpr int kLastExactCols = 48;
-#endif
+constexpr int kLastExactCols  = 48;
 using ProjectionLauncher      = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
 template <int Hidden, int ActiveCols>
@@ -32,13 +27,14 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
                              : ActiveCols <= 32 ? 32
                              : ActiveCols <= 40 ? 40
                                                 : 48;
-#if defined(NINFER_SM8X_COMPAT)
-    constexpr int KWarps = ActiveCols <= 32 ? 8 : 4;
+#if defined(NINFER_SM75)
+    constexpr int KWarps    = ActiveCols <= 32 ? 8 : 4;
+    constexpr int MinBlocks = 2;
 #else
     constexpr int KWarps =
         Hidden == 4096 ? (ActiveCols <= 12 ? 16 : 8) : (ActiveCols <= 32 ? 8 : 4);
-#endif
     constexpr int MinBlocks = Hidden == 4096 ? (KWarps == 16 ? 1 : 2) : (ActiveCols <= 32 ? 2 : 3);
+#endif
     constexpr auto ScaleAccess =
         ActiveCols > 4 ? W8SmallTMmaScaleAccess::Shared : W8SmallTMmaScaleAccess::Direct;
     constexpr auto ActivationCache =
@@ -94,31 +90,9 @@ void dispatch_medium_shape(const Tensor& x, const Weight& weight, Tensor& residu
 
 void w8_linear_add_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& residual_out,
                                      cudaStream_t stream) {
-    if (x.ne[1] < kFirstExactCols || x.ne[1] > 48) {
+    if (x.ne[1] < kFirstExactCols || x.ne[1] > kLastExactCols) {
         throw std::invalid_argument("W8 linear_add split-K MMA requires exact T=2..48");
     }
-#if defined(NINFER_SM8X_COMPAT)
-    if (x.ne[1] > kLastExactCols) {
-        std::int32_t offset = 0;
-        while (x.ne[1] - offset >= kLastExactCols) {
-            const Tensor x_slice = x.slice(1, offset, kLastExactCols);
-            Tensor residual_slice = residual_out.slice(1, offset, kLastExactCols);
-            w8_linear_add_splitk_mma_launch(x_slice, weight, residual_slice, stream);
-            offset += kLastExactCols;
-        }
-        const std::int32_t tail = x.ne[1] - offset;
-        if (tail == 1) {
-            const Tensor x_slice = x.slice(1, offset, 1);
-            Tensor residual_slice = residual_out.slice(1, offset, 1);
-            w8_linear_add_decode_r16_launch(x_slice, weight, residual_slice, stream);
-        } else if (tail >= kFirstExactCols) {
-            const Tensor x_slice = x.slice(1, offset, tail);
-            Tensor residual_slice = residual_out.slice(1, offset, tail);
-            w8_linear_add_splitk_mma_launch(x_slice, weight, residual_slice, stream);
-        }
-        return;
-    }
-#endif
     if (weight.k == 6144) {
         kK6144ProjectionLaunchers[x.ne[1] - kFirstExactCols](x, weight, residual_out, stream);
     } else {
@@ -133,18 +107,25 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     if ((weight.k != 4096 && weight.k != 6144) || t < 49 || t > 128) {
         throw std::invalid_argument("W8 linear_add medium split-K requires T=49..128");
     }
-#if defined(NINFER_SM8X_COMPAT)
-    std::int32_t offset = 0;
-    while (offset < t) {
-        const std::int32_t count = std::min<std::int32_t>(kLastExactCols, t - offset);
-        const Tensor x_slice = x.slice(1, offset, count);
-        Tensor residual_slice = residual_out.slice(1, offset, count);
-        if (count == 1) {
-            w8_linear_add_decode_r16_launch(x_slice, weight, residual_slice, stream);
-        } else {
-            w8_linear_add_splitk_mma_launch(x_slice, weight, residual_slice, stream);
-        }
-        offset += count;
+#if defined(NINFER_SM75)
+    if (t <= 64) {
+        dispatch_medium_shape<64, 2, 2, 1>(x, weight, residual_out, stream);
+    } else if (t == 65) {
+        dispatch_medium_shape<80, 2, 2, 1>(x, weight, residual_out, stream);
+    } else if (t <= 72) {
+        dispatch_medium_shape<72, 2, 3, 1>(x, weight, residual_out, stream);
+    } else if (t <= 80) {
+        dispatch_medium_shape<80, 2, 2, 1>(x, weight, residual_out, stream);
+    } else if (t <= 96) {
+        dispatch_medium_shape<96, 2, 2, 1>(x, weight, residual_out, stream);
+    } else if (t <= 112) {
+        dispatch_medium_shape<112, 2, 2, 1>(x, weight, residual_out, stream);
+    } else if (t <= 120) {
+        dispatch_medium_shape<120, 2, 3, 1>(x, weight, residual_out, stream);
+    } else if (t <= 125) {
+        dispatch_medium_shape<128, 2, 2, 1>(x, weight, residual_out, stream);
+    } else {
+        dispatch_medium_shape<128, 2, 2, 1>(x, weight, residual_out, stream);
     }
 #else
     if (t <= 64) {

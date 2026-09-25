@@ -674,7 +674,8 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
             throw std::invalid_argument("--tp 2 does not support Vision in this build");
         }
     }
-    if (device.sm() != 70 && device.sm() != 86 && device.sm() != 89 && device.sm() != 120) {
+    if (device.sm() != 70 && device.sm() != 75 && device.sm() != 86 && device.sm() != 89 &&
+        device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires a registered CUDA target");
     }
     return effective_max_context;
@@ -742,10 +743,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // budget there is one multiplier, 20 MiB, against a 0.3b-style worst case of ~19.9
             // MiB: roughly 1 MiB of headroom. Raising this multiplier, not the warm pass, is the
             // lever if that transient is ever observed at tp 2.
+#if defined(NINFER_SM75)
+            // Turing instantiations are far larger than the Blackwell table above: 64 MiB per
+            // concurrent request at tp 1 is this fork's measured value and replaces the 12 MiB
+            // entry. The tp 2 factor is the table's own 20/12 ratio, rounded up.
+            const std::uint64_t per_batch = (impl->tp == 2 ? 112ULL : 64ULL) * kMiB;
+#else
             const std::uint64_t per_batch = impl->tp == 2 ? 20ULL * kMiB : 12ULL * kMiB;
+#endif
             impl->graph_allowance_bytes =
-                checked_mul(per_batch, impl->max_concurrency, "ordinary exact-b graph allowance");
-        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
+                checked_mul(per_batch, impl->max_concurrency, "ordinary exact-b graph allowance");        } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
@@ -753,7 +760,11 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
+#if defined(NINFER_SM75)
+                    return (final_visible <= 4096 ? 64ULL : 96ULL) * kMiB;
+#else
                     return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+#endif
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,

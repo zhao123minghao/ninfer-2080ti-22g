@@ -38,6 +38,12 @@ if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(86|89)$")
   add_compile_definitions(NINFER_SM8X_COMPAT=1)
 endif()
 
+# Turing rides the same pre-Ampere paths as Volta but keeps native sm_75 mma, so it gets its own
+# macro: the fork's measured graph-allowance and small-T schedule constants are keyed on it.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+  add_compile_definitions(NINFER_SM75=1)
+endif()
+
 # --- Global settings ---------------------------------------------------------
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)

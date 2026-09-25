@@ -149,8 +149,13 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
 
 DeviceArena::DeviceArena(DeviceSpan storage)
     : base_(storage.data), cap_(storage.bytes), owns_(false) {
-    if (base_ == nullptr || cap_ == 0) {
-        throw std::invalid_argument("borrowed DeviceArena storage must be non-empty");
+    // An empty span is the documented "no workspace" placeholder the split-form wrappers pass
+    // (e.g. gdn_input_proj.cpp's `WorkspaceArena no_workspace(DeviceSpan{})`); it must remain
+    // constructible. Reject only the inconsistent case that names storage but no bytes, which
+    // cannot come from a valid allocator result.
+    if (base_ == nullptr && cap_ != 0) {
+        throw std::invalid_argument("borrowed DeviceArena storage has a null base with nonzero "
+                                    "capacity");
     }
 }
 
