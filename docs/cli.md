@@ -240,7 +240,38 @@ because a BF16 pool at that window does not fit two RTX 5090s. The 1,048,576-tok
 `--tp 2 --devices A,B --rope yarn --yarn-factor 4.0 --yarn-origin 262144 --kv-dtype int8
 --kv-capacity auto`; it reserves 26.93 GiB per device without a speculative backend and 28.42 GiB
 with `--spec mtp --draft-tokens 3`. A full-ceiling prefill takes about 19 minutes on the measured
-host. The prepared prompt must fit
+host.
+
+### Choosing the KV-cache dtype
+
+The KV cache is the one large allocation whose *precision* belongs to the user rather than to the
+artifact. Both values are complete, supported routes through the same public Engine, both are
+selected with one flag, and neither is a debug or fallback mode:
+
+| `--kv-dtype` | Stores | Resident KV bytes per element | Accuracy |
+|---|---|---:|---|
+| `bf16` (default) | the model's K/V values unchanged | 2.0 | lossless: the projections emit BF16 K/V, so a BF16 cache stores them bit exactly |
+| `int8` | a signed 8-bit code plus one FP16 scale per 64-element group | ~1.03 | lossy by construction; the only route to the largest windows |
+
+"16-bit KV" in this engine means **`bf16`, not `fp16`**, and there is no `fp16` value to select.
+The attention projections produce BF16 K and V, so BF16 storage round-trips them exactly; an FP16
+cache would re-round every value into a narrower exponent range while gaining no mantissa the source
+never had. `bf16` is therefore the 16-bit option, and it is the more accurate of the two values by
+construction rather than by measurement.
+
+The tradeoff is bytes against cache precision, and which side wins on decode throughput is a
+property of the target, not a rule: the halved footprint only converts into time where the attention
+path is bandwidth-bound. On a Turing target it measures the other way round -- `bf16` is both the
+more accurate and the *faster* value -- because the attention kernel is latency-bound there and the
+`int8` path pays a dequantization that cancels its byte saving, while the reduced MTP acceptance
+costs more than the round time it saves. See
+[KV-cache dtype on the Turing target](performance.md#kv-cache-dtype-on-the-turing-target).
+
+At a 262,144-token capacity the two choices measured 4.38 GiB (`int8`) and 8.50 GiB (`bf16`) of KV
+payload per device for a 27B target with MTP3 enabled, a ratio of 1.94x. The choice therefore also
+decides which capacities fit: `int8` is mandatory where a BF16 pool is too large.
+
+The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU

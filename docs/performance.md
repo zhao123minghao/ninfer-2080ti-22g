@@ -343,6 +343,54 @@ The HTTP smoke uses a temporary local server with a 1,024-token capacity and 128
 The cache remains process-local and can resume only the current frontier or its saved complete
 turn/response checkpoint; see [serving cache behavior](serving.md#execution-behavior).
 
+## KV-cache dtype on the Turing target
+
+On this target `--kv-dtype` is not a close call, and the reason is worth stating plainly: the two
+values do not differ in round time at all, and the entire throughput difference is MTP acceptance.
+
+Method: one artifact, one prompt, one capacity, one draft window; only the KV dtype changes between
+the paired rows. Both rows of a pair are single runs on the same idle machine, in the same session.
+
+- Hardware and toolchain: 2 x RTX 2080 Ti 22 GB (`sm_75`), CUDA 12.8, TP2 with host-staged
+  collectives, GDN state in FP32.
+- Artifact: `qwen3.8-27b/groupwise-int` (registered `Q4`/`Q5`/`W8` weights), native RoPE.
+- Runtime: `--tp 2 --devices 0,1 --max-context 262144`, explicit `--kv-capacity 262144`, CUDA Graphs
+  on, `--spec mtp --draft-tokens 3 --lm-head-draft`, greedy, `--max-new 64`.
+- Prompts: a 16,042-token and an 85,070-token prompt, each filled from cold with no prefix reuse.
+
+| Occupied context | `--kv-dtype` | Decode | MTP acceptance | tok/round | Round time | Prefill |
+|---:|---|---:|---:|---:|---:|---:|
+| 16,042 | `int8` | 48.50 tok/s | 42.68% | 2.25 | 46.4 ms | 386 tok/s |
+| 16,042 | `bf16` | **64.30 tok/s** | **67.74%** | **3.00** | 46.7 ms | 371 tok/s |
+| 85,070 | `int8` | 39.91 tok/s | 50.00% | 2.48 | 62.1 ms | 300 tok/s |
+| 85,070 | `bf16` | **45.69 tok/s** | **62.12%** | **2.86** | 62.6 ms | 254 tok/s |
+
+Round time is derived as `tok/round / decode`; it is reported because it is the quantity that did
+*not* change. At both context lengths the two dtypes agree on it within one percent, in spite of
+`bf16` reading twice the KV bytes. The attention kernel is latency-bound at this width and occupancy,
+not bandwidth-bound, so the halved footprint buys no time, while the `int8` staging path pays a
+dequantization the `bf16` path does not. What `int8` does cost is accuracy: 15.4 acceptance points at
+85,070 tokens and 25.1 at 16,042, which is a 19.5% and 37% throughput penalty respectively, and it is
+larger than the round-time difference it was supposed to buy.
+
+Two further measured facts bear on interpreting the acceptance column:
+
+- **MTP acceptance is content-dominated.** The same `int8` KV at 85,070 tokens accepted 46.75% at
+  `--max-new 128` and 50.00% at 64; a nested 32,066-token prompt accepted more (51.39%) than its own
+  16,042-token prefix (42.68%). MTP numbers are comparable only at equal `--max-new` on the same
+  prompt, which is why every row above is `--max-new 64` on a fixed prompt.
+- **The `int8` deficit is cache precision, not a defect in the `int8` route.** Two cheaper
+  explanations were tested and refuted. Routing the `int8` narrow widths (T=1/T=2) onto the same
+tensor-core kernel the verify width uses left the 16,042-token acceptance bit-identical
+  (42.68%, per-position accept counts 18/10/7 unchanged), so the draft and verify steps already
+  agreed. A finer quantization group is not the answer either: at 64 elements per group the
+  symmetric `absmax/127` scale already holds about 43 dB of SNR on a Gaussian input, and halving the
+group buys roughly 1 dB, against a deficit of 15-25 acceptance points.
+
+Consequently this checkout's default remains `bf16`, and the `int8` value is selected explicitly by
+callers that need its capacity -- including the V100X2 launcher, whose own recorded measurements were
+taken with `int8`.
+
 ## Inherited RTX 5090 campaigns
 
 Tested Git revisions for the inherited campaigns:
