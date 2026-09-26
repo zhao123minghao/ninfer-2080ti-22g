@@ -13,11 +13,13 @@
 // addresses, which every 64-bit Linux CUDA context has: a device pointer already names its
 // device, so this one entry point expresses a cross-device transfer as well as a local one. When
 // the driver grants peer access and startup validates it, the copy is a direct device-to-device
-// PCIe transfer. Linux translated IOMMU domains (DMA/DMA-FQ) prohibit direct P2P regardless of
-// advertised support or small-copy results. If either device uses such a domain, peer access is
-// unavailable, or copies fail the exact startup check, both directions are disabled and CUDA
-// stages the same copy through an explicit pair of long-lived pinned host buffers. This avoids the
-// opaque driver-side staging path observed with UVA D2D copies behind translated IOMMU domains.
+// transfer -- over NVLink where the pair has it. Peer access is decided by measurement, not by the
+// IOMMU domain type: a translated domain (DMA/DMA-FQ) is recorded in the diagnostic but does not by
+// itself disqualify the direct route, because hosts exist that report one and still copy exactly at
+// every payload size. If peer access is not advertised, or copies fail the exact startup check,
+// both directions are disabled and CUDA stages the same copy through an explicit pair of
+// long-lived pinned host buffers. This avoids the opaque driver-side staging path observed with
+// UVA D2D copies behind translated IOMMU domains.
 // Startup validates that route too before allowing inference. Both qualified paths are
 // stream-ordered, so callers need no peer-access branch; enable_peer_access() below reports which
 // one is active.
@@ -90,15 +92,16 @@
 
 namespace ninfer::ops {
 
-// Qualifies the actual cross-device copy route at startup. On Linux, first resolve both CUDA
-// devices' PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ select the
-// pinned host-staged route without ever enabling direct P2P, even if a small probe could pass. Otherwise,
-// when both directions advertise peer access, enable them and check two distinct 16 KiB patterns
-// with the collectives' UVA D2D API on
-// their destination compute streams. Returns true only when both copies are exact. A data
-// mismatch or unavailable peer access disables both directions (including previously enabled
-// access), verifies the same copies through CUDA's host-staged route, emits one diagnostic, and
-// returns false. A failed staged check or CUDA API error throws; inference must not continue.
+// Qualifies the actual cross-device copy route at startup. When both directions advertise peer
+// access, enables it and checks exact payloads through the collectives' own UVA D2D API on their
+// destination compute streams: several sizes bracketing the real payload range up to and including
+// the full host-staging cap, plus a sliced walk that covers every mapping of that buffer with many
+// separate small copies. Returns true only when every probe is exact. On Linux the two devices' PCI
+// bus IDs and their /sys/bus/pci/devices/<BDF>/iommu_group/type are resolved as diagnostic context,
+// not as a gate. A data mismatch or unadvertised peer access disables both directions (including
+// previously enabled access), verifies the same copies through CUDA's host-staged route, emits one
+// diagnostic, and returns false. A failed staged check or CUDA API error throws; inference must not
+// continue.
 //
 // Call once during setup, before graph capture or concurrent inference. This function allocates
 // temporary probe buffers, synchronizes each compute stream, and releases its buffers while

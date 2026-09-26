@@ -41,15 +41,24 @@ positions remain the resident frontier and complete typed checkpoints, as specif
 
 ---
 
-## 2. Transport: no peer-to-peer on these cards
+## 2. Transport: the route is measured, not inferred
 
 `cudaDeviceCanAccessPeer` reports **0 in both directions** between two RTX 5090s (GeForce driver
-restriction; PCIe topology PHB). This is a measured property of the hardware, not a configuration
-choice, and it is the single fact that shapes the collective layer.
+restriction; PCIe topology PHB), so on that pair the collectives are **host-staged asynchronous
+copies over PCIe**, measured at 22.55/23.16 GiB/s bulk and 8.50/8.73 µs per 10 KiB transfer.
+`cudaMemcpyPeerAsync` is the same API with or without peer access, so the absence of peer access
+changes the cost, not the code shape.
 
-The collectives are therefore **host-staged asynchronous copies over PCIe**, measured at
-22.55/23.16 GiB/s bulk and 8.50/8.73 µs per 10 KiB transfer. `cudaMemcpyPeerAsync` is the same API
-with or without peer access, so the absence of peer access changes the cost, not the code shape.
+That is a measured property of that pair, not a platform rule, and startup tests it instead of
+inferring it. Whenever both directions advertise peer access, the direct route is enabled and then
+required to copy exact payloads through the collectives' own UVA D2D form at every size they move --
+up to and including the full 64 MiB host-staging cap -- plus a sliced walk covering every mapping of
+that buffer. Only a fully exact probe selects it; otherwise both directions are disabled and the
+staged route is validated and used. A Linux IOMMU `DMA`/`DMA-FQ` domain is reported in the diagnostic
+but is not by itself disqualifying: reading the domain string as a verdict retired a working link. On
+the RTX 2080 Ti pair this checkout is developed against, both cards report `DMA-FQ`,
+`cudaDeviceEnablePeerAccess` succeeds, every probe is exact, and one 10 KiB collective costs 7.3 us
+direct against 11.5 us staged.
 
 `allreduce_sum` / `allgather` live in `include/ninfer/ops/allreduce.h` and
 `src/ops/common/allreduce.cu`. The design is **pull-based with four events per call**. A two-event

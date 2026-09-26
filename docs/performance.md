@@ -86,10 +86,13 @@ with 180,000-token capacity. This establishes the speed result for this prompt a
 it does not guarantee the same speed on every prompt. The RTX 5090 tables later in this document
 are inherited results for different hardware and weight profiles.
 
-Startup disables direct P2P for Linux IOMMU `DMA` and `DMA-FQ` domains, verifies the selected
-transfer route with exact byte comparisons in both directions, and rejects startup if verification
-fails. On this `DMA-FQ` host, TP2 now uses two long-lived pinned host slots and explicit asynchronous
-D2H/H2D legs for every collective instead of relying on the driver's opaque UVA-D2D staging path.
+Startup chooses the transfer route by measurement, not by inference: when both devices advertise
+peer access it enables it and verifies the route with exact byte comparisons in both directions
+across the range of payload sizes the collectives move, and it rejects startup if verification fails.
+A Linux IOMMU `DMA` or `DMA-FQ` domain appears in the diagnostic but is not by itself disqualifying.
+Where peer access is unavailable or fails that verification, TP2 uses two long-lived pinned host
+slots and explicit asynchronous D2H/H2D legs for every collective instead of relying on the driver's
+opaque UVA-D2D staging path.
 The real 10 KiB decode-shaped all-reduce measures **33.67 us mean / 33.05 us p50** over 500
 iterations (down from the earlier 48.4 us host-staged measurement); this reduces transport overhead
 but cannot remove the 128 per-token collective dependencies. The explicit route passes the collective
@@ -390,6 +393,40 @@ group buys roughly 1 dB, against a deficit of 15-25 acceptance points.
 Consequently this checkout's default remains `bf16`, and the `int8` value is selected explicitly by
 callers that need its capacity -- including the V100X2 launcher, whose own recorded measurements were
 taken with `int8`.
+
+### TP2 transport on this target
+
+TP2 collectives here run over the **direct NVLink path** rather than the pinned host-staged route.
+Startup selects the route by measurement, not by inference (see
+[the transport rule](maintainer/tp2-yarn-1m.md#2-transport-the-route-is-measured-not-inferred)):
+this pair reports an IOMMU `DMA-FQ` domain, yet it advertises peer access in both directions and
+copies exact payloads at every probed size, so the direct route is chosen. The evidence is a
+same-session A/B in which only the route differs:
+
+| Configuration | Host-staged | Direct |
+|---|---:|---:|
+| 85,070 tokens, `bf16` | 45.53 tok/s | **46.89** (46.83 / 46.86 / 46.88 / 46.99) |
+| 85,070 tokens, `int8` | 39.95 | **41.03** (41.00 / 41.07) |
+| 16,042 tokens, `bf16` | 60.69 (61.18 / 60.20) | **63.38** (64.69 / 62.60 / 62.85) |
+| 16,042 tokens, `int8` | 46.28 (47.17 / 45.55 / 46.13) | **46.58** (46.58 / 46.68 / 46.47) |
+
+Prefill moves the same way, which is expected because a 4,096-token chunk's all-reduce is the
+largest payload the collectives carry: at 85,070 tokens it measures 256.55 -> 268.27 tok/s for
+`bf16` and 300.97 -> 317.46 for `int8`.
+
+MTP acceptance is **bit-identical** on both routes -- 62.12% and 2.86 tokens/round at 85,070 `bf16`,
+50.00% and 2.48 at 85,070 `int8`. That is structural rather than incidental: both routes deliver the
+same bytes into the same staging tensor and then run the same combine, so the committed token stream
+must not move. At the operator level, the same 10 KiB decode-shaped all-reduce that
+`ninfer_allreduce_test` times reports 29.86 us mean / 29.59 us p50 on this build.
+
+The machine's session spread is real but not uniform, so read the absolute values with it in mind.
+At 85,070 tokens the host-staged route reproduced its earlier value closely -- 45.53 here against
+45.69 in the table above, and four direct runs spread 0.17% -- while at 16,042 tokens the same
+unchanged configuration moved from **64.30 tok/s** in the table to **60.69** in the A/B session. The
+paired comparison inside one session is therefore the durable evidence for the transport change, and
+a single absolute value at the short context is not. The current build's 85,070-token `bf16`
+acceptance result is **46.89 tok/s** at 62.12% acceptance.
 
 ## Inherited RTX 5090 campaigns
 

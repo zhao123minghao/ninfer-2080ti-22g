@@ -33,6 +33,7 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -100,9 +101,9 @@ void startup_check(cudaError_t status, const char* operation) {
     }
 }
 
-// Linux CUDA PCIe P2P is unsupported behind a translated IOMMU domain. A small
-// allocation can nevertheless pass a copy probe while other mappings silently
-// lose writes, so the domain restriction takes precedence over that probe.
+// Diagnostic context for a refused or failed direct peer route: which cards sit behind a
+// translated IOMMU domain. Recorded in the startup message only. It is deliberately NOT a veto --
+// see enable_peer_access() for the measurement that retired that shortcut.
 std::string translated_iommu_domain(const ExecutionContext& ec) {
     std::string reason;
 #if defined(__linux__)
@@ -161,7 +162,7 @@ public:
             set_device(rank);
             startup_check(cudaMalloc(&source_[rank], kBytes), "cudaMalloc source");
             startup_check(cudaMalloc(&destination_[rank], kBytes), "cudaMalloc destination");
-            std::array<std::uint32_t, kWords> values{};
+            std::vector<std::uint32_t> values(kWords);
             for (std::size_t i = 0; i < kWords; ++i) { values[i] = pattern(rank, i); }
             startup_check(cudaMemcpyAsync(source_[rank], values.data(), kBytes,
                                            cudaMemcpyHostToDevice, ec_.dev[rank]->stream),
@@ -170,32 +171,58 @@ public:
         }
     }
 
-    // Empty means both complete copies matched their independent host patterns exactly.
+    // Empty means every probed size, both directions, and the whole-buffer sliced walk returned
+    // the peer's exact payload.
     std::string qualify() {
-        std::string mismatch;
+        std::vector<std::uint32_t> actual(kWords);
+        // Bracket the payload range rather than testing one convenient block. The reason a
+        // domain-based veto looked attractive was the suspicion that a copy can pass at one size
+        // while silently losing writes at another, so size is exactly what this has to vary.
+        for (const std::size_t size : kSizes) {
+            const std::size_t words = size / sizeof(std::uint32_t);
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(rank);
+                cudaStream_t stream = ec_.dev[rank]->stream;
+                startup_check(cudaMemsetAsync(destination_[rank], 0xcd, size, stream),
+                              "clear destination");
+                startup_check(pull_peer(destination_[rank], source_[1 - rank], size, stream),
+                              "cross-device copy");
+                startup_check(cudaStreamSynchronize(stream), "retire cross-device copy");
+                startup_check(cudaMemcpy(actual.data(), destination_[rank], size,
+                                         cudaMemcpyDeviceToHost),
+                              "read destination");
+                for (std::size_t i = 0; i < words; ++i) {
+                    if (actual[i] != pattern(1 - rank, i)) {
+                        return describe(size, 1 - rank, rank, i);
+                    }
+                }
+            }
+        }
+        // Then cover every mapping of the whole buffer with many separate small transfers: that is
+        // the shape a decode round actually issues (128 independent 10 KiB collectives into
+        // distinct staging regions), and the shape a single large copy cannot speak for.
         for (int rank = 0; rank < 2; ++rank) {
             set_device(rank);
             cudaStream_t stream = ec_.dev[rank]->stream;
             startup_check(cudaMemsetAsync(destination_[rank], 0xcd, kBytes, stream),
                           "clear destination");
-            startup_check(pull_peer(destination_[rank], source_[1 - rank], kBytes, stream),
-                          "cross-device copy");
-            startup_check(cudaStreamSynchronize(stream), "retire cross-device copy");
-            std::array<std::uint32_t, kWords> actual{};
+            for (std::size_t offset = 0; offset < kBytes; offset += kSliceBytes) {
+                startup_check(pull_peer(byte_offset(destination_[rank], offset),
+                                        byte_offset(source_[1 - rank], offset), kSliceBytes,
+                                        stream),
+                              "sliced cross-device copy");
+            }
+            startup_check(cudaStreamSynchronize(stream), "retire sliced copies");
             startup_check(cudaMemcpy(actual.data(), destination_[rank], kBytes,
-                                      cudaMemcpyDeviceToHost), "read destination");
+                                     cudaMemcpyDeviceToHost),
+                          "read destination");
             for (std::size_t i = 0; i < kWords; ++i) {
                 if (actual[i] != pattern(1 - rank, i)) {
-                    if (mismatch.empty()) {
-                        mismatch = "device " + std::to_string(ec_.dev[1 - rank]->device) +
-                                   " -> " + std::to_string(ec_.dev[rank]->device) +
-                                   " data mismatch at word " + std::to_string(i);
-                    }
-                    break;
+                    return describe(kSliceBytes, 1 - rank, rank, i);
                 }
             }
         }
-        return mismatch;
+        return std::string();
     }
 
     // Validate the explicit fallback used by the collectives.  This is intentionally separate
@@ -262,8 +289,25 @@ public:
     }
 
 private:
-    static constexpr std::size_t kWords = 4096;
-    static constexpr std::size_t kBytes = kWords * sizeof(std::uint32_t);
+    // The probe must bracket the payloads the collectives move rather than test one small block.
+    // kBytes equals the host-staging cap, which covers every registered shape's collective (a
+    // 4096-token prefill all-reduce is about 40 MiB), so the largest probed copy is the real worst
+    // case and spans every mapping of the buffer. Peak cost is two 64 MiB device buffers per rank,
+    // allocated and released inside enable_peer_access() before any inference work is enqueued.
+    static constexpr std::size_t kBytes = 64U * 1024U * 1024U;
+    static constexpr std::size_t kWords = kBytes / sizeof(std::uint32_t);
+    static constexpr std::size_t kSizes[]      = {4U * 1024U, 64U * 1024U, 1U << 20U, 8U << 20U,
+                                                  kBytes};
+    static constexpr std::size_t kSliceBytes   = 64U * 1024U;
+    static_assert(kBytes == kDefaultHostStagingBytes,
+                  "the peer probe must cover the host-staging cap");
+
+    std::string describe(std::size_t size, int source_device, int destination_device,
+                         std::size_t word) const {
+        return "device " + std::to_string(source_device) + " -> " +
+               std::to_string(destination_device) + " copy of " + std::to_string(size) +
+               " bytes mismatched at word " + std::to_string(word);
+    }
 
     static std::uint32_t pattern(int rank, std::size_t index) {
         return 0x4f000000U ^ (std::uint32_t(rank) << 20U) ^
@@ -312,16 +356,25 @@ bool enable_peer_access(const ExecutionContext& ec) {
 
     PeerTransferProbe probe(ec);
     try {
-        std::string direct_failure = translated_iommu_domain(ec);
+        // The IOMMU domain type is recorded as context, never used as a decision. On this host
+        // both cards report a translated DMA-FQ domain, yet cudaDeviceEnablePeerAccess succeeds
+        // and every probed payload copies exactly, including a full staging-cap block up to 64 MiB
+        // and a sliced walk over the whole buffer -- so reading the domain string first selected
+        // the two-hop host-staged route on a machine whose peer link was fully usable, at the cost
+        // of a bus round trip per collective. The failure that motivated the shortcut, a small
+        // copy passing while other mappings lose writes, is a property to MEASURE; qualify()
+        // measures it across the payload range and across every mapping.
+        const std::string iommu_note = translated_iommu_domain(ec);
+
         int forward = 0;
         int reverse = 0;
-        if (direct_failure.empty()) {
-            startup_check(cudaDeviceCanAccessPeer(&forward, pair[0], pair[1]),
-                          "cudaDeviceCanAccessPeer forward");
-            startup_check(cudaDeviceCanAccessPeer(&reverse, pair[1], pair[0]),
-                          "cudaDeviceCanAccessPeer reverse");
-        }
-        const bool supported = direct_failure.empty() && forward != 0 && reverse != 0;
+        startup_check(cudaDeviceCanAccessPeer(&forward, pair[0], pair[1]),
+                      "cudaDeviceCanAccessPeer forward");
+        startup_check(cudaDeviceCanAccessPeer(&reverse, pair[1], pair[0]),
+                      "cudaDeviceCanAccessPeer reverse");
+        const bool supported = forward != 0 && reverse != 0;
+
+        std::string direct_failure;
         if (supported) {
             for (int rank = 0; rank < 2; ++rank) {
                 probe.set_device(rank);
@@ -333,7 +386,7 @@ bool enable_peer_access(const ExecutionContext& ec) {
                 }
             }
         } else {
-            if (direct_failure.empty()) { direct_failure = "peer access unavailable"; }
+            direct_failure = "peer access unavailable";
             probe.disable_peer_access();
         }
         probe.initialize();
@@ -341,6 +394,13 @@ bool enable_peer_access(const ExecutionContext& ec) {
             direct_failure = probe.qualify();
             if (direct_failure.empty()) {
                 ec.direct_peer_access = true;
+                // State the route on success as well. The failure branch below is unconditional, so
+                // a silent success was previously only inferable from a missing line -- which is
+                // exactly the kind of claim that went unchecked while this function was refusing a
+                // working link from the IOMMU domain string.
+                std::fprintf(stderr,
+                             "[ninfer] direct P2P enabled (every probed payload and mapping exact); "
+                             "using direct device-to-device copies\n");
                 return true;
             }
             probe.disable_peer_access();
@@ -351,6 +411,7 @@ bool enable_peer_access(const ExecutionContext& ec) {
             throw std::runtime_error("peer transport startup: host-staged validation failed: " +
                                      staged_failure);
         }
+        if (!iommu_note.empty()) { direct_failure += "; " + iommu_note; }
         std::fprintf(stderr,
                      "[ninfer] direct P2P disabled (%s); using verified pinned host-staged copies\n",
                      direct_failure.c_str());
