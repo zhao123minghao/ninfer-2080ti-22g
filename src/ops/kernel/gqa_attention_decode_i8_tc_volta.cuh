@@ -124,7 +124,19 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     constexpr int PVChunks      = Bc / 8;          // key sub-groups per Bc tile
     constexpr int DSlice        = D / DimSplit;    // this warp's PV output width
     constexpr int DChunksLocal  = DSlice / 8;       // this warp's resident accumulator chunks
-    constexpr int PageIds       = 64;
+    // Upper bound on the physical page ids one split stages here -- derived from the Op's declared
+    // visible-key domain, NOT a fixed 64. A split's page count grows linearly with the window once
+    // `active_splits` saturates at DecodeSplits, so the domain (now 1,048,576 keys) sets the bound:
+    // 194 ids for the DecodeSplits 85 geometries and 98 for the head-local DecodeSplits 170 one.
+    // The per-split bound this kernel used to carry was sized for the pre-YaRN 262,144-key domain's
+    // 50, so a long tp1 window (>=342k keys) or a long head-local window (>=685k) overran it. The
+    // overrun is not a wrong answer, which is what makes it dangerous: the staging loop writes and
+    // reads the same out-of-range slots, so the page ids it reads back stay self-consistent while
+    // the neighbouring staging arrays are silently corrupted, and a clobbered slot later read as a
+    // page id walks the page table to an arbitrary physical page. That is the mechanism behind
+    // ninfer_gqa_attention_long_context_test's illegal memory access. The SIMT kernels derive this
+    // same bound; this kernel and its bf16 sibling were the two that did not.
+    constexpr int PageIds       = kGqaSmallTSplitPageIds<Geometry, Bc>;
     constexpr int Groups        = D / kGqaKvQuantGroup; // quant groups per key row
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
@@ -152,6 +164,16 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     __shared__ __align__(16) half k_s[Bc * SmemStride];
     __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
+
+    // Two blocks of this kernel must still fit Turing's 64 KiB per SM, and passing this is
+    // sufficient for Volta's 96 KiB as well. The page-id staging is the only term here that grows
+    // with the declared visible-key domain, so raising that domain is exactly the edit that could
+    // silently drop the kernel to one 128-thread block per SM -- a performance cliff with no
+    // diagnostic. CUDA reserves 1 KiB per block on top of the declared size, so it is counted.
+    constexpr int StageBytes = (Br + 2 * Bc) * SmemStride * static_cast<int>(sizeof(half)) +
+                               PageIds * static_cast<int>(sizeof(std::int32_t));
+    static_assert(2 * (StageBytes + 1024) <= 64 * 1024,
+                  "Bc, Br and the page-id staging must leave room for two blocks per SM on Turing");
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);

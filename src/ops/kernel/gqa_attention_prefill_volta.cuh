@@ -86,7 +86,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     constexpr int PVChunks      = Bc / 8;          // key sub-groups per Bc tile
     constexpr int DSlice        = D / DimSplit;    // this warp's PV output width
     constexpr int DChunksLocal  = DSlice / 8;       // this warp's resident accumulator chunks
-    constexpr int PageIds       = 64;
+    // Upper bound on the physical page ids one split stages here -- same derivation and same
+    // reason as the int8 sibling (gqa_attention_decode_i8_tc_volta.cuh): it comes from the Op's
+    // declared visible-key domain, not from a fixed 64. The overrun it used to allow is silent
+    // rather than wrong-looking, because the staging loop writes and reads the same out-of-range
+    // slots; the corruption lands on the neighbouring staging arrays, and a clobbered slot read
+    // back as a page id walks the page table to an arbitrary physical page.
+    constexpr int PageIds       = kGqaSmallTSplitPageIds<Geometry, Bc>;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -107,6 +113,14 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
 
+    // Two blocks of this kernel must still fit Turing's 64 KiB per SM (Volta's 96 KiB is more
+    // headroom, so passing this is sufficient for both). The page-id staging is the only term that
+    // grows with the declared visible-key domain; CUDA reserves 1 KiB per block on top of the
+    // declared size, so it is counted here.
+    constexpr int StageBytes = (Br + 2 * Bc) * SmemStride * static_cast<int>(sizeof(half)) +
+                               PageIds * static_cast<int>(sizeof(std::int32_t));
+    static_assert(2 * (StageBytes + 1024) <= 64 * 1024,
+                  "Bc, Br and the page-id staging must leave room for two blocks per SM on Turing");
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
