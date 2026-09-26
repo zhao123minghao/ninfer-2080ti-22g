@@ -19,8 +19,10 @@ W8Launch select_w8_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
                                             k == 5120 ||    // 10240  / 2 (mtp/input_projection)
                                             k == 8704);     // 17408  / 2 (mlp/down)
     if (!column_shard && !row_shard) { return nullptr; }
-    if (t <= 4) { return launch_w8_simt_r8_c4; }
-    if (t <= 16) { return launch_w8_simt_r8_c8; }
+    // No C8 step: C4 is the faster tile per column on sm_75, and C8 cannot split finer than eight
+    // columns, so it charges full width for a partial one. See the measurement note in
+    // q4_dispatch.cpp.
+    if (t <= 16) { return launch_w8_simt_r8_c4; }
     return n == 512 ? launch_w8_mma_r32_c128 : launch_w8_mma_r64_c128;
 }
 

@@ -34,8 +34,10 @@ Q5Launch select_q5_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
     const bool row_shard    = n == 5120 && (k == 3072 ||  // 6144  / 2 (attention/gdn output)
                                             k == 8704);   // 17408 / 2 (mlp/down)
     if (!column_shard && !row_shard) { return nullptr; }
-    if (t <= 4) { return launch_q5_simt_r8_c4; }
-    if (t <= 24) { return launch_q5_simt_r8_c8; }
+    // No C8 step: C4 is the faster tile per column on sm_75, and C8 cannot split finer than eight
+    // columns, so it charges full width for a partial one. See the measurement note in
+    // q4_dispatch.cpp.
+    if (t <= 24) { return launch_q5_simt_r8_c4; }
     return launch_q5_mma_r64_c128;
 }
 

@@ -20,8 +20,14 @@ Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
                               (k == 2048 && n == 65536);    // 131072/ 2 (draft_head, short K)
     if (!column_shard) { return nullptr; }
     if (t == 1) { return n >= 65536 ? launch_q4_gemv_r4_w1_direct : launch_q4_gemv_r1_w8_direct; }
-    if (t <= 4) { return launch_q4_simt_r8_c4; }
-    if (t <= 16) { return launch_q4_simt_r8_c8; }
+    // C4 covers the whole SIMT band; there is no C8 step. The C8 tile was chosen here for its wider
+    // column coverage, but on sm_75 it is the slower one *per column*: measured at a 16K occupied
+    // context, 0.0264 ms per column for C4 against 0.0294 for C8, and a tile that cannot split finer
+    // than eight columns charges full width for a partial one. That is what made a T=6 verify round
+    // spend 2.2x a T=4 round per GEMM call instead of the 1.5x its extra columns justify, and it is
+    // why draft-5 measured 1.8x the wall time for 10% more tokens per round. Several C4 column
+    // slices are cheaper than one C8 tile at every width in this band.
+    if (t <= 16) { return launch_q4_simt_r8_c4; }
     return launch_q4_mma_r64_c128;
 }
 
