@@ -5,7 +5,12 @@
 #include "ops/kernel/gqa_attention_decode.cuh"
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
-#ifdef NINFER_VOLTA_BUILD
+// The Volta tensor-core decode kernels are compiled for arch 70 and, since the Turing port, arch
+// 75: both have mma.sync.m8n8k4 and no ldmatrix, and both carry the same 96 KiB/SM shared budget
+// with a 64 KiB per-block ceiling, so that kernel family's tile -- sized for V100 -- fits either
+// target unchanged. This deliberately does NOT define NINFER_VOLTA_BUILD, which would also pull
+// the pre-Ampere GEMM plan fallbacks and the CUTLASS Sm70 sources into an sm_75 build.
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM75)
 #include "ops/kernel/gqa_attention_decode_i8_tc_volta.cuh"
 #include "ops/kernel/gqa_attention_prefill_volta.cuh"
 #endif
@@ -19,12 +24,6 @@
 
 namespace ninfer::ops::detail {
 namespace {
-
-#ifdef NINFER_VOLTA_BUILD
-// Narrowest token tile that takes the Volta tensor-core decode route; anything below stays on the
-// SIMT kernel. Tuned by measurement -- see the note at the route itself and the V100 implementation.
-inline constexpr int kVoltaTcDecodeMinWidth = 3;
-#endif
 
 // Supplies an upper bound for the device-side active-split policy over one explicit execution
 // envelope. Eager calls normally pass an exact window; graph calls pass their target-private
@@ -103,7 +102,7 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     Tensor& cache_k = cache.k_pages;
     Tensor& cache_v = cache.v_pages;
-#ifdef NINFER_VOLTA_BUILD
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM75)
     // The Volta tensor-core kernel always splits the head dim 4 ways (DimSplit=4, enforced
     // by its own static_assert), independent of the Ampere+ dispatch table's per-TokenTile
     // WarpsPerCta choice -- see gqa_attention_prefill_volta.cuh's file comment for why.
@@ -156,13 +155,27 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_k_scale = cache.k_scale_pages;
     Tensor& cache_v_scale = cache.v_scale_pages;
 
-#ifdef NINFER_VOLTA_BUILD
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM75)
     // Tensor-core route for the verify widths. The SIMT kernel below holds ~1.9 TFLOP/s at every
     // width, so its cost is linear in the width; the tensor-core tile is flat in the width
     // instead, which is exactly what a speculative verify pass needs. Narrow widths stay on SIMT:
     // with no query tile to amortize, the tensor-core kernel pays its fixed cost for nothing (the
     // bf16 measurements put it 2.5x behind at width 1). See the V100 performance summary.
-    if constexpr (TokenTile >= kVoltaTcDecodeMinWidth) {
+    //
+    // Unlike the bf16 route -- which is tensor-core at every width -- that split makes the int8
+    // draft and verify steps run different kernels: drafting walks the cache one row at a time and
+    // so takes the SIMT path, while the verify pass that decides whether to keep the draft takes the
+    // tensor-core path. The gate itself is inherited from bf16 measurements, and it does not
+    // transfer: the two dtypes do not share a narrow-width cost structure, because the int8 SIMT
+    // kernel dequantizes every staged element where the bf16 one converts in place. int8 narrow
+    // widths therefore take the tensor-core kernel as well.
+    //
+    // This is a routing cleanup, not a fix for int8's MTP acceptance. An A/B test of exactly this
+    // change left the 16k acceptance bit-identical (42.68%, per-position accept counts 18/10/7
+    // unchanged), so the 15-25 point acceptance gap between int8 and bf16 KV at every context length
+    // is KV precision itself, not a draft/verify kernel disagreement. See the dtype note in
+    // docs/performance.md.
+    if constexpr (TokenTile >= 1) {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
         gqa_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
                                                          CacheInput><<<grid, 128, 0, stream>>>(
@@ -184,7 +197,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-#endif // NINFER_VOLTA_BUILD
+#endif // NINFER_VOLTA_BUILD || NINFER_SM75
 
     auto launch = [&]<int WarpsPerCta, int MinBlocksPerSm, int KeyBlock, bool DynamicArena>() {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);

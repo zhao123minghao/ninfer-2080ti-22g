@@ -54,7 +54,9 @@
 //      consumed into registers -- this kernel needs separate, simultaneously-live q_s/k_s/
 //      v_s buffers. To fit that under the 48KB static-shared-memory default, Br is fixed at
 //      one 32-row Volta tile (not scaled by warp count) and Bc is halved to 16 keys/tile;
-//      q_s+k_s+v_s then costs 16KB+8KB+8KB = 32KB, comfortably under budget.
+//      q_s+k_s+v_s then costs 16KB+8KB+8KB = 32KB, comfortably under budget. (Bc is 8 on sm_75,
+//      where the per-SM shared-memory budget is 64 KiB rather than Volta's 96 KiB -- the constant
+//      below carries that derivation.)
 //
 //   3. Row capacity. Fixing Br=32 means a single tile can't cover every (TokenTile x
 //      GroupSize) row count this op needs (up to 6*8=48 for the widest GQA geometry this
@@ -89,10 +91,33 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta == 4, "this kernel always splits the head dim 4 ways -- see file comment");
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+// Compiled for Volta and Turing: both have mma.sync.m8n8k4 and no ldmatrix. They do *not* share a
+// shared-memory budget, though, and that difference is load-bearing here: Volta reports 96 KiB per
+// SM while Turing (sm_75) reports 64 KiB (48 KiB default and 64 KiB opt-in per block on both).
+// CUDA also reserves 1 KiB of shared memory per block, so the effective per-block cost is the
+// declared size + 1024 B. The Bc constant below is sized from that.
+//
+// Measured on this target (sm_75, 85k window, width 4, ncu): 1.41 ms, DRAM 10.2%, Memory 23.6%,
+// Compute 23.4%, 12.50% achieved occupancy -- nothing is saturated, so the kernel is
+// latency-bound, which is why it sustains only ~64 GB/s against a 616 GB/s floor. The scarce
+// resource is resident warps: an SM holds 32 warps and this kernel runs 128-thread blocks, so one
+// block per SM is 4 warps and two blocks is 8. Widening the loads is not the lever -- the staging
+// path already issues coalesced 8-byte (int2) loads -- so the lever is the shared footprint that
+// caps blocks per SM.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
     constexpr int DimSplit      = WarpsPerCta; // warps split the head dim, not the row range
     constexpr int Br            = 32;          // one Volta tile's worth of rows per pass
-    constexpr int Bc            = 16;          // keys per shared-memory tile
+    // Keys per shared-memory tile. The V100 derivation in design note 2 picked 16 to fit under the
+    // 48 KiB static-shared default; on sm_75 the binding constraint is different and tighter. With
+    // SmemPad=8 (q_s 32x264x2 = 16,896 B; each of k_s/v_s is Bc x 264 x 2), Bc=16 declares
+    // 33,792 B, and 33,792 + the 1 KiB CUDA reserves per block exceeds half of Turing's 64 KiB,
+    // so exactly one block fits per SM -- ncu confirms "Block Limit Shared Mem 1" and the kernel
+    // runs 4 warps/SM = 12.5% occupancy. Bc=8 declares 16,896 + 4,224 + 4,224 = 25,344 B, so two
+    // blocks fit (2 x 26,368 = 52,736 <= 65,536), which is also the most that registers permit
+    // (222 regs/thread at 128 threads caps at two blocks). Resident warps are the resource this
+    // latency-bound kernel lacks, so this buys 8 warps/SM instead of 4; the price is twice as many
+    // key-tile iterations, which is loop fabric and barrier count around the same per-key work.
+    constexpr int Bc            = 8;           // keys per shared-memory tile
     constexpr int D             = kGqaHeadDim;
     constexpr int Threads       = DimSplit * 32;
     constexpr int DChunks       = D / 8;           // QK^T: full head-dim contraction, unsplit
@@ -503,7 +528,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
         }
         __syncthreads();
     }
-#endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+#endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
 }
 
 } // namespace ninfer::ops

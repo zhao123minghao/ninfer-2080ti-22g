@@ -67,10 +67,19 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(WarpsPerCta == 4, "this kernel always splits the head dim 4 ways -- see file comment");
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
     constexpr int DimSplit      = WarpsPerCta; // warps split the head dim, not the row range
     constexpr int Br            = 32;          // one Volta tile's worth of rows per pass
-    constexpr int Bc            = 16;          // keys per shared-memory tile
+    // Keys per shared-memory tile. Same derivation and same reason as the int8 sibling
+    // (gqa_attention_decode_i8_tc_volta.cuh): this kernel's footprint is identical to that one's
+    // (q_s 32x264x2 = 16,896 B, and each of k_s/v_s is Bc x 264 x 2), Volta's 96 KiB per SM does
+    // not apply to Turing, and CUDA reserves 1 KiB per block on top of the declared size. Bc=16
+    // therefore declares 33,792 B and no longer fits two blocks in Turing's 64 KiB, leaving one
+    // 128-thread block -- 4 warps -- per SM. Bc=8 declares 25,344 B, so two blocks fit
+    // (2 x 26,368 = 52,736 <= 65,536), which is also the most the 222 regs/thread permit. Resident
+    // warps are the resource this latency-bound kernel lacks, so this buys 8 warps/SM instead of 4.
+    // Prefill is unaffected: it has its own kernels and its own tile constants.
+    constexpr int Bc            = 8;           // keys per shared-memory tile
     constexpr int D             = kGqaHeadDim;
     constexpr int Threads       = DimSplit * 32;
     constexpr int DChunks       = D / 8;           // QK^T: full head-dim contraction, unsplit
@@ -97,6 +106,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     __shared__ __align__(16) half k_s[Bc * SmemStride];
     __shared__ __align__(16) half v_s[Bc * SmemStride];
     __shared__ std::int32_t physical_pages_s[PageIds];
+
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -465,7 +475,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
         }
         __syncthreads();
     }
-#endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+#endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
 }
 
 } // namespace ninfer::ops
