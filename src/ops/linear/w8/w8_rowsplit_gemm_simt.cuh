@@ -148,7 +148,7 @@ template <class Schedule, int ColsPerWarp, int WarpsPerCta, int PipelineStages, 
           W8Epilogue Epilogue = W8Epilogue::Store, class Output = W8ContiguousOutput,
           int ColWarpsPerRow = 1>
 __global__
-#ifdef NINFER_VOLTA_BUILD
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM75)
 // ncu measured this kernel (the w8 vocab/lm-head projection, N=248320) at 81 registers/thread,
 // Block Limit Registers=2, Theoretical Occupancy only 25% -- no __launch_bounds__ existed here
 // at all before this. Swept minBlocks 3/4/5/6/8 (each measured via ncu occupancy + nsys/decode
@@ -158,6 +158,20 @@ __global__
 // real regression at 8 (too tight a register squeeze, same shape of failure round 2 hit on a
 // different kernel). 5 is the plateau's conservative edge. Net win, both paths, same prompt:
 // MTP 33.33 -> ~36.2 tok/s (+8.6%), non-MTP 31.35 -> ~32.35 tok/s (+3.2%).
+//
+// ON TURING THIS BOUND IS INERT, AND THAT IS THE MEASURED OPTIMUM -- leave it alone. 5 x 256 =
+// 1280 threads exceeds sm_75's 1024 per SM, so ptxas reports "Value of threads per SM ... is out
+// of range. .minnctapersm will be ignored" for every instantiation of this kernel and falls back
+// to its own heuristic: 96 registers/thread, Block Limit Registers 2, 47-50% achieved occupancy.
+// Making the request legal -- asking for 1024 / (WarpsPerCta * 32) = 4 blocks instead, which IS
+// honored -- gives 64 registers, 3 blocks once shared memory co-limits, 72% occupancy, and a
+// clean build, and is 0.2% SLOWER end to end: both A/B repetitions landed under both control
+// repetitions, at identical acceptance counters (22 rounds, 62.12%, 2.86 tok/round, 20/14/7).
+// The reason is that this kernel is L1/TEX-throughput-bound, not occupancy-bound -- ncu puts the
+// vocab projection at L1/TEX 83.9% with 2 blocks and 92.0% with 3, DRAM 64-66% throughout -- so
+// the extra warps only push the binding unit harder. Volta's nonzero-sweep result therefore does
+// not transfer as a number, only as an intent, and on this target the intent is already what
+// ptxas picks. See history.md section 38.
 __launch_bounds__(WarpsPerCta * 32, 5)
 #endif
 void w8_rowsplit_gemm_simt_kernel(const __nv_bfloat16* __restrict__ x,

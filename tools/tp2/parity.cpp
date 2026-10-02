@@ -674,19 +674,19 @@ private:
 };
 
 // The KV storage the campaign runs under. Int8Group64 is the product configuration for long
-// context (and what the sibling tp2 tests use), so it is the default; NINFER_TP2_PARITY_KV=bf16
+// context (and what the sibling tp2 tests use), so it is the default; NINFER_TP2_PARITY_KV=fp16
 // switches it, which isolates how much of any tp1-vs-tp2 logit difference is carried by the
 // quantized KV path rather than by the split itself.
 ninfer::KvCacheStorage kv_storage() {
     const char* raw = std::getenv("NINFER_TP2_PARITY_KV");
-    if (raw != nullptr && std::string_view(raw) == "bf16") {
-        return ninfer::KvCacheStorage::BFloat16;
+    if (raw != nullptr && std::string_view(raw) == "fp16") {
+        return ninfer::KvCacheStorage::Float16;
     }
     return ninfer::KvCacheStorage::Int8Group64;
 }
 
 const char* kv_storage_name() {
-    return kv_storage() == ninfer::KvCacheStorage::BFloat16 ? "bfloat16" : "int8_group64";
+    return kv_storage() == ninfer::KvCacheStorage::Float16 ? "fp16" : "int8_group64";
 }
 
 ninfer::EngineOptions engine_options(const char* artifact, int tp, bool graphs,

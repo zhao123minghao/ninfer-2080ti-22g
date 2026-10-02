@@ -38,8 +38,6 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr std::size_t kDefaultHostStagingBytes = 64U * 1024U * 1024U;
-
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(message); }
 }
@@ -157,14 +155,16 @@ public:
         startup_check(cudaSetDevice(ec_.dev[rank]->device), "cudaSetDevice");
     }
 
-    void initialize() {
+    void initialize(std::size_t payload_bytes) {
+        payload_bytes_ = payload_bytes;
         for (int rank = 0; rank < 2; ++rank) {
             set_device(rank);
-            startup_check(cudaMalloc(&source_[rank], kBytes), "cudaMalloc source");
-            startup_check(cudaMalloc(&destination_[rank], kBytes), "cudaMalloc destination");
-            std::vector<std::uint32_t> values(kWords);
-            for (std::size_t i = 0; i < kWords; ++i) { values[i] = pattern(rank, i); }
-            startup_check(cudaMemcpyAsync(source_[rank], values.data(), kBytes,
+            startup_check(cudaMalloc(&source_[rank], payload_bytes_), "cudaMalloc source");
+            startup_check(cudaMalloc(&destination_[rank], payload_bytes_),
+                          "cudaMalloc destination");
+            std::vector<std::uint32_t> values(payload_bytes_ / sizeof(std::uint32_t));
+            for (std::size_t i = 0; i < values.size(); ++i) { values[i] = pattern(rank, i); }
+            startup_check(cudaMemcpyAsync(source_[rank], values.data(), payload_bytes_,
                                            cudaMemcpyHostToDevice, ec_.dev[rank]->stream),
                           "initialize source");
             startup_check(cudaStreamSynchronize(ec_.dev[rank]->stream), "retire source");
@@ -174,12 +174,13 @@ public:
     // Empty means every probed size, both directions, and the whole-buffer sliced walk returned
     // the peer's exact payload.
     std::string qualify() {
-        std::vector<std::uint32_t> actual(kWords);
+        const std::size_t words = payload_bytes_ / sizeof(std::uint32_t);
+        std::vector<std::uint32_t> actual(words);
         // Bracket the payload range rather than testing one convenient block. The reason a
         // domain-based veto looked attractive was the suspicion that a copy can pass at one size
         // while silently losing writes at another, so size is exactly what this has to vary.
-        for (const std::size_t size : kSizes) {
-            const std::size_t words = size / sizeof(std::uint32_t);
+        for (const std::size_t size : probe_sizes()) {
+            const std::size_t size_words = size / sizeof(std::uint32_t);
             for (int rank = 0; rank < 2; ++rank) {
                 set_device(rank);
                 cudaStream_t stream = ec_.dev[rank]->stream;
@@ -191,7 +192,7 @@ public:
                 startup_check(cudaMemcpy(actual.data(), destination_[rank], size,
                                          cudaMemcpyDeviceToHost),
                               "read destination");
-                for (std::size_t i = 0; i < words; ++i) {
+                for (std::size_t i = 0; i < size_words; ++i) {
                     if (actual[i] != pattern(1 - rank, i)) {
                         return describe(size, 1 - rank, rank, i);
                     }
@@ -204,19 +205,20 @@ public:
         for (int rank = 0; rank < 2; ++rank) {
             set_device(rank);
             cudaStream_t stream = ec_.dev[rank]->stream;
-            startup_check(cudaMemsetAsync(destination_[rank], 0xcd, kBytes, stream),
+            startup_check(cudaMemsetAsync(destination_[rank], 0xcd, payload_bytes_, stream),
                           "clear destination");
-            for (std::size_t offset = 0; offset < kBytes; offset += kSliceBytes) {
+            for (std::size_t offset = 0; offset < payload_bytes_; offset += kSliceBytes) {
+                const std::size_t slice =
+                    std::min(kSliceBytes, payload_bytes_ - offset);
                 startup_check(pull_peer(byte_offset(destination_[rank], offset),
-                                        byte_offset(source_[1 - rank], offset), kSliceBytes,
-                                        stream),
+                                        byte_offset(source_[1 - rank], offset), slice, stream),
                               "sliced cross-device copy");
             }
             startup_check(cudaStreamSynchronize(stream), "retire sliced copies");
-            startup_check(cudaMemcpy(actual.data(), destination_[rank], kBytes,
+            startup_check(cudaMemcpy(actual.data(), destination_[rank], payload_bytes_,
                                      cudaMemcpyDeviceToHost),
                           "read destination");
-            for (std::size_t i = 0; i < kWords; ++i) {
+            for (std::size_t i = 0; i < words; ++i) {
                 if (actual[i] != pattern(1 - rank, i)) {
                     return describe(kSliceBytes, 1 - rank, rank, i);
                 }
@@ -229,16 +231,22 @@ public:
     // from qualify(): the UVA D2D form exercises the driver's opaque staging path, while this
     // route must prove the two concrete D2H/H2D copies and their byte identity.
     std::string qualify_host_staged() {
+        const std::size_t words = payload_bytes_ / sizeof(std::uint32_t);
         std::array<void*, 2> host{nullptr, nullptr};
+        // Heap, not a stack array: the payload bound is the engine's real prefill collective size
+        // (tens of MiB), so a std::array<std::uint32_t, words> here overruns the 8 MiB thread
+        // stack. Only the pairs whose direct probe fails ever reach this route, so the overflow
+        // stayed hidden on the NVLink pair. See history.md 5.4.
+        std::vector<std::uint32_t> actual(words);
         std::string mismatch;
         try {
             for (void*& slot : host) {
-                startup_check(cudaHostAlloc(&slot, kBytes, cudaHostAllocPortable),
+                startup_check(cudaHostAlloc(&slot, payload_bytes_, cudaHostAllocPortable),
                               "cudaHostAlloc probe");
             }
             for (int rank = 0; rank < 2; ++rank) {
                 set_device(rank);
-                startup_check(cudaMemcpyAsync(host[rank], source_[rank], kBytes,
+                startup_check(cudaMemcpyAsync(host[rank], source_[rank], payload_bytes_,
                                               cudaMemcpyDeviceToHost, ec_.dev[rank]->stream),
                               "probe device-to-host");
                 startup_check(cudaStreamSynchronize(ec_.dev[rank]->stream),
@@ -246,15 +254,14 @@ public:
             }
             for (int rank = 0; rank < 2; ++rank) {
                 set_device(rank);
-                startup_check(cudaMemcpyAsync(destination_[rank], host[1 - rank], kBytes,
+                startup_check(cudaMemcpyAsync(destination_[rank], host[1 - rank], payload_bytes_,
                                               cudaMemcpyHostToDevice, ec_.dev[rank]->stream),
                               "probe host-to-device");
                 startup_check(cudaStreamSynchronize(ec_.dev[rank]->stream),
                               "retire probe host-to-device");
-                std::array<std::uint32_t, kWords> actual{};
-                startup_check(cudaMemcpy(actual.data(), destination_[rank], kBytes,
+                startup_check(cudaMemcpy(actual.data(), destination_[rank], payload_bytes_,
                                          cudaMemcpyDeviceToHost), "read staged destination");
-                for (std::size_t i = 0; i < kWords; ++i) {
+                for (std::size_t i = 0; i < words; ++i) {
                     if (actual[i] != pattern(1 - rank, i)) {
                         mismatch = "device " + std::to_string(ec_.dev[1 - rank]->device) +
                                    " -> " + std::to_string(ec_.dev[rank]->device) +
@@ -289,18 +296,23 @@ public:
     }
 
 private:
-    // The probe must bracket the payloads the collectives move rather than test one small block.
-    // kBytes equals the host-staging cap, which covers every registered shape's collective (a
-    // 4096-token prefill all-reduce is about 40 MiB), so the largest probed copy is the real worst
-    // case and spans every mapping of the buffer. Peak cost is two 64 MiB device buffers per rank,
+    // The probe must bracket the payloads the collectives move rather than test one small block,
+    // and its largest probed copy must be the real worst case: `payload_bytes_` is the declared
+    // bound the host-staging slots are sized for, so the probe speaks for exactly the transfers
+    // the collectives will issue. Peak cost is two `payload_bytes_` device buffers per rank,
     // allocated and released inside enable_peer_access() before any inference work is enqueued.
-    static constexpr std::size_t kBytes = 64U * 1024U * 1024U;
-    static constexpr std::size_t kWords = kBytes / sizeof(std::uint32_t);
-    static constexpr std::size_t kSizes[]      = {4U * 1024U, 64U * 1024U, 1U << 20U, 8U << 20U,
-                                                  kBytes};
-    static constexpr std::size_t kSliceBytes   = 64U * 1024U;
-    static_assert(kBytes == kDefaultHostStagingBytes,
-                  "the peer probe must cover the host-staging cap");
+    static constexpr std::size_t kSliceBytes = 64U * 1024U;
+
+    // Ascending, de-duplicated bracket of the sizes below the declared bound.
+    [[nodiscard]] std::vector<std::size_t> probe_sizes() const {
+        const std::array<std::size_t, 4> bracket{4u << 10, kSliceBytes, 1u << 20, 8u << 20};
+        std::vector<std::size_t> sizes;
+        for (const std::size_t candidate : bracket) {
+            if (candidate < payload_bytes_) { sizes.push_back(candidate); }
+        }
+        sizes.push_back(payload_bytes_);
+        return sizes;
+    }
 
     std::string describe(std::size_t size, int source_device, int destination_device,
                          std::size_t word) const {
@@ -323,6 +335,7 @@ private:
 
     const ExecutionContext& ec_;
     int previous_ = 0;
+    std::size_t payload_bytes_ = 0;
     std::array<void*, 2> source_{};
     std::array<void*, 2> destination_{};
 };
@@ -348,11 +361,12 @@ void require_disjoint(const void* first, std::size_t first_bytes, const void* se
 
 } // namespace
 
-bool enable_peer_access(const ExecutionContext& ec) {
+bool enable_peer_access(const ExecutionContext& ec, std::size_t host_staging_bytes) {
     ec.direct_peer_access = false;
     if (ec.tp != 2 || !ec.dev[0].has_value() || !ec.dev[1].has_value()) { return false; }
     const int pair[2] = {ec.dev[0]->device, ec.dev[1]->device};
     if (pair[0] == pair[1]) { return false; }
+    require(host_staging_bytes > 0, "enable_peer_access: the declared payload bound must be > 0");
 
     PeerTransferProbe probe(ec);
     try {
@@ -389,7 +403,7 @@ bool enable_peer_access(const ExecutionContext& ec) {
             direct_failure = "peer access unavailable";
             probe.disable_peer_access();
         }
-        probe.initialize();
+        probe.initialize(host_staging_bytes);
         if (supported) {
             direct_failure = probe.qualify();
             if (direct_failure.empty()) {
@@ -426,7 +440,7 @@ bool enable_peer_access(const ExecutionContext& ec) {
     }
 }
 
-PeerEvents::PeerEvents(const ExecutionContext& ec) {
+PeerEvents::PeerEvents(const ExecutionContext& ec, std::size_t host_staging_bytes) {
     require_two_devices(ec, "PeerEvents: requires an ExecutionContext with two distinct devices");
     const CurrentDeviceGuard guard;
     // Create through a local table so a mid-way failure destroys what was already created instead
@@ -453,11 +467,17 @@ PeerEvents::PeerEvents(const ExecutionContext& ec) {
     inputs_ready_ = {created[0], created[1]};
     transfer_ready_ = {created[2], created[3]};
     pull_done_      = {created[4], created[5]};
+    // The pinned staging slots are allocated here, once, for the declared payload bound. They are
+    // never moved afterwards: CUDA Graph capture bakes the host address into the staged route's
+    // D2H/H2D copy nodes, so a later reallocation would leave every replayed collective reading
+    // freed host memory. A collective that presents a larger payload reports an error instead --
+    // see require_host_staging(). The bound has to cover every collective the program issues,
+    // because a captured round may reach the largest prefill all-reduce before any eager call
+    // could have sized the buffer (the failure history.md 5.4 records: a 64 MiB default against
+    // an 8192-token prefill all-reduce of 80 MiB).
     try {
-        // Graph capture may encounter the largest prefill all-reduce or vocabulary gather before
-        // an eager call can grow the fallback buffer. The V100X2 4096-token prefill is below
-        // 42 MiB, so 64 MiB per source covers every registered shape.
-        ensure_host_staging(kDefaultHostStagingBytes);
+        require(host_staging_bytes > 0, "PeerEvents: the declared payload bound must be > 0");
+        allocate_host_staging(host_staging_bytes);
     } catch (...) {
         for (cudaEvent_t& event : created) {
             if (event != nullptr) { (void)cudaEventDestroy(event); }
@@ -543,27 +563,24 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
     return *this;
 }
 
-void PeerEvents::ensure_host_staging(std::size_t bytes) const {
-    if (direct_transport_ || bytes <= host_staging_bytes_) { return; }
-    if (bytes == 0) { return; }
-    for (cudaStream_t stream : streams_) {
-        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
-        if (capture != cudaStreamCaptureStatusNone) {
-            throw std::logic_error("host-staged collective grew its pinned buffer during CUDA graph capture");
-        }
-    }
-    // A resize is exceptional (normally the largest prefill chunk allocates it once). Retire both
-    // streams before releasing the old host slots so no in-flight H2D node can observe freed data.
-    for (cudaStream_t stream : streams_) { CUDA_CHECK(cudaStreamSynchronize(stream)); }
-    for (void*& slot : host_staging_) {
-        if (slot != nullptr) { CUDA_CHECK(cudaFreeHost(slot)); slot = nullptr; }
-    }
+void PeerEvents::require_host_staging(std::size_t bytes) const {
+    if (bytes <= host_staging_bytes_) { return; }
+    throw std::length_error(
+        "host-staged collective payload of " + std::to_string(bytes) +
+        " bytes exceeds the pinned staging allocated for " + std::to_string(host_staging_bytes_) +
+        " bytes; the staging cannot be relocated once a CUDA Graph has captured its address, so "
+        "the peer events must be constructed with a bound that covers every collective");
+}
+
+void PeerEvents::allocate_host_staging(std::size_t bytes) const {
+    require(bytes > 0 && host_staging_bytes_ == 0 && !host_staging_ready_,
+            "PeerEvents: host staging is allocated exactly once");
     try {
         for (void*& slot : host_staging_) {
             CUDA_CHECK(cudaHostAlloc(&slot, bytes, cudaHostAllocPortable));
         }
         host_staging_bytes_ = bytes;
+        host_staging_ready_ = true;
     } catch (...) {
         for (void*& slot : host_staging_) {
             if (slot != nullptr) { (void)cudaFreeHost(slot); slot = nullptr; }
@@ -593,7 +610,7 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
 
     const std::size_t bytes = buffer[0].bytes();
     if (bytes == 0) { return; }
-    events.ensure_host_staging(bytes);
+    events.require_host_staging(bytes);
 
 #ifndef NDEBUG
     for (int rank = 0; rank < 2; ++rank) {
@@ -648,6 +665,12 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
 
     // Phase C: the in-place combine may only overwrite buffer[rank] once the peer has finished
     // reading it. That same wait is what makes the next call's phase B safe.
+    //
+    // The wait cannot be hoisted into phase B, ahead of the export whose slot it protects, even
+    // though it would then be off this call's critical path: at that point the peer's stream has
+    // not joined a stream capture yet -- the fork is established by the wait(transfer_ready) in
+    // phase B's second loop -- so waiting there on the peer event's previous, uncaptured record
+    // raises cudaErrorStreamCaptureIsolation. Measured, not inferred; see history.md section 38.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
@@ -687,7 +710,7 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
     const std::size_t block[2]  = {row_bytes * static_cast<std::size_t>(part[0].ne[1]),
                                    row_bytes * static_cast<std::size_t>(part[1].ne[1])};
     const std::size_t offset[2] = {0, block[0]};
-    events.ensure_host_staging(std::max(block[0], block[1]));
+    events.require_host_staging(std::max(block[0], block[1]));
 
 #ifndef NDEBUG
     for (int rank = 0; rank < 2; ++rank) {
@@ -748,7 +771,8 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
 
     // Phase C: the Op writes nothing else, but the caller (or the next call) will overwrite
     // part[rank]. Ordering each stream after the peer's read is what makes that safe without a
-    // host synchronization.
+    // host synchronization. As in allreduce_sum, this wait cannot be hoisted ahead of the export:
+    // the peer's stream has not joined a capture that early.
     for (int rank = 0; rank < 2; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
@@ -768,7 +792,7 @@ void broadcast_rank0(const Tensor& source, const Tensor& destination,
     }
     const std::size_t bytes = source.bytes();
     if (bytes == 0) { return; }
-    events.ensure_host_staging(bytes);
+    events.require_host_staging(bytes);
 #ifndef NDEBUG
     require_resident_on(source.data, ec.dev[0]->device, "broadcast_rank0: source is not on rank 0");
     require_resident_on(destination.data, ec.dev[1]->device,

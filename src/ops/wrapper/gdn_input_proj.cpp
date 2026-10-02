@@ -1360,8 +1360,13 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
                                     const std::array<Weight, 2>& query_key_weight,
                                     const std::array<Weight, 2>& value_z_weight,
                                     const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+                                    LinearPolicy policy,
+                                    const std::array<WorkspaceArena*, 2>& workspace,
                                     const ExecutionContext& ec) {
     validate_split_storage_split_pair(x, query_key_weight, value_z_weight, ec);
+    if (policy != LinearPolicy::A16Only) {
+        throw std::invalid_argument("gdn_input_proj column-parallel: Q4/Q5 split admits only A16");
+    }
     for (std::size_t slot = 0; slot < 2; ++slot) {
         validate_split_storage_column_rank_semantics(x[slot], query_key_weight[slot],
                                                       value_z_weight[slot], qkv[slot], z[slot]);
@@ -1379,12 +1384,16 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
     }
     std::array<Tensor, 2> qkv_dst{qkv[0], qkv[1]};
     std::array<Tensor, 2> z_dst{z[0], z[1]};
+    // A rank without a caller workspace keeps the route that needs no transient storage, exactly as
+    // the fused column-parallel form above leaves that choice to each dispatcher.
+    std::array<WorkspaceArena, 2> empty_workspace{WorkspaceArena(DeviceSpan{}),
+                                                  WorkspaceArena(DeviceSpan{})};
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
-        WorkspaceArena no_workspace(DeviceSpan{});
+        WorkspaceArena& ws =
+            workspace[slot] != nullptr ? *workspace[slot] : empty_workspace[slot];
         detail::q4_q5_gdn_input_dispatch(x[slot], query_key_weight[slot], value_z_weight[slot],
-                                         qkv_dst[slot], z_dst[slot], no_workspace,
-                                         ec.dev[slot]->stream);
+                                         qkv_dst[slot], z_dst[slot], ws, ec.dev[slot]->stream);
     });
 }
 

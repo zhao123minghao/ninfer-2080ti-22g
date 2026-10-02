@@ -49,9 +49,9 @@ std::uint32_t parse_u32(std::string_view text, const char* label, bool allow_zer
 }
 
 KvCacheStorage parse_kv_cache(std::string_view text) {
-    if (text == "bf16") { return KvCacheStorage::BFloat16; }
+    if (text == "fp16") { return KvCacheStorage::Float16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
-    throw std::invalid_argument("--kv-dtype must be bf16 or int8");
+    throw std::invalid_argument("--kv-dtype must be fp16 or int8");
 }
 
 std::vector<int> parse_int_list(std::string_view value, const char* label) {
@@ -300,7 +300,7 @@ std::string usage_text(std::string_view program) {
         << "  --max-ctx <tokens>          override auto-sized context capacity\n"
         << "  --prefill-chunk <tokens>    multiple of " << kPrefillChunkAlignment
         << " (default: " << kDefaultPrefillChunk << ")\n"
-        << "  --kv-dtype <bf16|int8>      KV cache storage (default: bf16)\n"
+        << "  --kv-dtype <fp16|int8>      KV cache storage (default: fp16)\n"
         << "  --mtp-draft-tokens <0..5>   speculative draft window (default: 0)\n"
         << "  --lm-head-draft             use the optimized proposal head; requires MTP\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
@@ -893,8 +893,8 @@ std::string json_escape(std::string_view value) {
 
 std::string kv_cache_name(KvCacheStorage storage) {
     switch (storage) {
-    case KvCacheStorage::BFloat16:
-        return "bf16";
+    case KvCacheStorage::Float16:
+        return "fp16";
     case KvCacheStorage::Int8Group64:
         return "int8-group64";
     }

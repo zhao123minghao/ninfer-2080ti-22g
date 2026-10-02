@@ -21,7 +21,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
     const bool quantized = dtype == DType::I8;
-    if ((!quantized && (dtype != DType::BF16 || quant_group != 0)) ||
+    if ((!quantized && (dtype != DType::FP16 || quant_group != 0)) ||
         (quantized && (quant_group != kKvQuantGroup || head_dim % quant_group != 0))) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }

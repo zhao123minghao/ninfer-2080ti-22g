@@ -335,6 +335,17 @@ ninfer_add_op_test(ninfer_allreduce_test
   SOURCES ops/test_allreduce.cpp
   LIBRARIES ninfer_ops)
 
+# The Turing m16n8k16 routes in ops/common/mma.cuh: the bf16 -> fp16 restaging through the native
+# fp16 tensor core, and the m16n8k16 -> 2x m16n8k8 K-axis decomposition, both against a naive
+# FP64 oracle. Skips (77) unless the build defines NINFER_SM75.
+ninfer_add_op_test(ninfer_mma_bf16_sm75_test
+  SOURCES ops/test_mma_bf16_sm75.cu
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_mma_s8_sm75_test
+  SOURCES ops/test_mma_s8_sm75.cu
+  LIBRARIES ninfer_ops)
+
 # Tensor-parallel split forms. Same two-device requirement and skip code as the collectives above.
 ninfer_add_op_test(ninfer_linear_split_test
   SOURCES ops/test_linear_split.cpp

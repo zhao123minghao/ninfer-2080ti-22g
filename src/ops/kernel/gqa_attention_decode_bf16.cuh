@@ -15,11 +15,18 @@
 
 namespace ninfer::ops {
 
+// The PV A-operand: the softmax probability keeps its bf16 rounding -- that rounding is part of
+// the operator's arithmetic, not of the cache's element type -- and is then widened once for the
+// fp16 MMA.
+__device__ __forceinline__ half gqa_p_to_operand(float probability) {
+    return bf16_to_f16(__float2bfloat16(probability));
+}
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_kernel(
-    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, half* cache_k,
+    half* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
@@ -53,7 +60,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     // Occupancy guard: this kernel's `__launch_bounds__` asks for two CTAs per SM, and `PageIds`
     // scales with the Op's visible-key domain. See kGqaDecodeSharedResidencyBytes.
     constexpr int MinBlocksPerSm = 2;
-    constexpr int Bf16Bytes      = static_cast<int>(sizeof(__nv_bfloat16));
+    constexpr int Bf16Bytes      = static_cast<int>(sizeof(half));
     constexpr int SharedBytes = gqa_shared_align16(QkvRows * D * Bf16Bytes) +          // qkv_s
                                 gqa_shared_align16(Wc * 16 * Bc * Bf16Bytes) +         // p_s
                                 gqa_shared_align16(PageIds *
@@ -63,11 +70,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                   "SM -- raising kGqaAttentionMaximumVisibleKeys grew the page-id staging past the "
                   "residency budget; retune the split policy or the budget deliberately");
 
-    __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
-    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
+    __shared__ __align__(16) half qkv_s[QkvRows * D];
+    __shared__ __align__(16) half p_s[Wc * 16 * Bc];
     __shared__ std::int32_t physical_pages_s[PageIds];
-    __nv_bfloat16* k_s = qkv_s;
-    __nv_bfloat16* v_s = qkv_s + Bc * D;
+    half* k_s = qkv_s;
+    half* v_s = qkv_s + Bc * D;
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -180,8 +187,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 physical_page     = __shfl_sync(FullMask, physical_page, 0);
                 const std::int64_t cache_off =
                     gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
-                store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
-                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+                store_vec(&cache_k[cache_off], bf16x8_to_f16x8(load_vec<int4>(&input.k[new_off])));
+                store_vec(&cache_v[cache_off], bf16x8_to_f16x8(load_vec<int4>(&input.v[new_off])));
             }
         }
         __syncthreads();
@@ -197,7 +204,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         if (row < row_count && gqa_valid_q_head<Geometry>(kv_head, q_head)) {
             value = q[gqa_q_index<Geometry>(q_head, d, token)];
         }
-        qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = value;
+        qkv_s[row * D + gqa_small_t_tc_swz(row, d)] = bf16_to_f16(value);
     }
     __syncthreads();
 
@@ -212,7 +219,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
     const int warp_row0 = warp * 16;
-    __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
+    half* p_sw = &p_s[warp * 16 * Bc];
 
     unsigned af_q[QKKs][4];
 #pragma unroll
@@ -237,15 +244,16 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
             physical_page = physical_pages_s[(k0 >> kPagedKVPageShift) - first_page];
         }
-        // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
-        // Current-step tokens come from k_new/v_new; tail slots are zeroed.
+        // Stage the fp16 K/V key tile with one cp.async wave (16B/thread, high MLP).
+        // Current-step tokens come from k_new/v_new (bf16 activations, widened on the way in);
+        // tail slots are zeroed.
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
             const int key_l      = chunk / (D / 8);
             const int d          = (chunk - key_l * (D / 8)) * 8;
             const int key        = k0 + key_l;
-            __nv_bfloat16* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
-            __nv_bfloat16* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
+            half* k_dst = &k_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
+            half* v_dst = &v_s[key_l * D + gqa_small_t_tc_swz(key_l, d)];
             if (key >= split_start && key < split_end) {
                 if constexpr (CacheInput::writes_cache) {
                     const int new_token = key - first_pos;
@@ -253,8 +261,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                         new_token >= 0 && new_token < valid_tokens && key >= first_pos;
                     if (from_new) {
                         const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
-                        ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                        store_vec(k_dst, bf16x8_to_f16x8(load_vec<int4>(&input.k[off])));
+                        store_vec(v_dst, bf16x8_to_f16x8(load_vec<int4>(&input.v[off])));
                     } else {
                         const std::int64_t off = gqa_cache_index<Geometry>(
                             physical_page, kv_head, d, key & kPagedKVPageMask);
@@ -287,8 +295,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 const int bcol = k * 16 + b_koff;
                 ldmatrix_x2(bf[0], bf[1],
                             smem_addr(&k_s[brow * D + gqa_small_t_tc_swz(brow, bcol)]));
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
-                         af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
+                mma_f16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
+                        af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
             }
         }
 
@@ -353,10 +361,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                                   : 0.0f;
             bl0 += p00 + p01;
             bl1 += p10 + p11;
-            p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col0)]           = __float2bfloat16(p00);
-            p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col1)]           = __float2bfloat16(p01);
-            p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col0)] = __float2bfloat16(p10);
-            p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col1)] = __float2bfloat16(p11);
+            p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col0)]           = gqa_p_to_operand(p00);
+            p_sw[gid * Bc + gqa_small_t_tc_swz32(gid, col1)]           = gqa_p_to_operand(p01);
+            p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col0)] = gqa_p_to_operand(p10);
+            p_sw[(gid + 8) * Bc + gqa_small_t_tc_swz32(gid + 8, col1)] = gqa_p_to_operand(p11);
         }
         bl0 = warp_sum<4>(bl0, FullMask);
         bl1 = warp_sum<4>(bl1, FullMask);
@@ -387,8 +395,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 const int vcol = n * 8;
                 ldmatrix_x2_t(vf[0], vf[1],
                               smem_addr(&v_s[vrow * D + gqa_small_t_tc_swz(vrow, vcol)]));
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                         vf[0], vf[1]);
+                mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
+                        vf[0], vf[1]);
             }
         }
         __syncthreads();
@@ -414,7 +422,9 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
     }
 
     // MMA fragments hold each row in four-lane groups. Stage the final split-local
-    // accumulator through shared memory so partial_acc is written as contiguous d-vector stores.
+    // accumulator -- bf16, the partial_acc element type -- through the dead K/V operand buffer so
+    // partial_acc is written as contiguous d-vector stores.
+    __nv_bfloat16* acc_s = reinterpret_cast<__nv_bfloat16*>(qkv_s);
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
         const int d0   = n * 8 + 2 * lid;
@@ -422,12 +432,12 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         const int row0 = warp_row0 + gid;
         const int row1 = row0 + 8;
         if (row0 < row_count) {
-            qkv_s[row0 * D + d0] = __float2bfloat16(acc[n][0]);
-            qkv_s[row0 * D + d1] = __float2bfloat16(acc[n][1]);
+            acc_s[row0 * D + d0] = __float2bfloat16(acc[n][0]);
+            acc_s[row0 * D + d1] = __float2bfloat16(acc[n][1]);
         }
         if (row1 < row_count) {
-            qkv_s[row1 * D + d0] = __float2bfloat16(acc[n][2]);
-            qkv_s[row1 * D + d1] = __float2bfloat16(acc[n][3]);
+            acc_s[row1 * D + d0] = __float2bfloat16(acc[n][2]);
+            acc_s[row1 * D + d1] = __float2bfloat16(acc[n][3]);
         }
     }
     __syncthreads();
@@ -441,7 +451,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
             const std::int64_t dst =
                 gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
-            store_vec(&partial_acc[dst], load_vec<int4>(&qkv_s[row * D + d]));
+            store_vec(&partial_acc[dst], load_vec<int4>(&acc_s[row * D + d]));
         }
     }
 
@@ -569,8 +579,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 physical_page      = __shfl_sync(FullMask, physical_page, 0);
                 const std::int64_t cache_off =
                     gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
-                store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
-                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+                store_vec(&cache_k[cache_off], bf16x8_to_f16x8(load_vec<int4>(&input.k[new_off])));
+                store_vec(&cache_v[cache_off], bf16x8_to_f16x8(load_vec<int4>(&input.v[new_off])));
             }
         }
         __syncthreads();
@@ -605,8 +615,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
         int physical_page  = -1;
         const int key_last = (qabs < split_end - 1) ? qabs : split_end - 1;
         for (int key = split_start; key <= key_last; ++key) {
-            const __nv_bfloat16* k_ptr;
-            const __nv_bfloat16* v_ptr;
+            const void* k_ptr;
+            const void* v_ptr;
             bool from_new = false;
             if constexpr (CacheInput::writes_cache) {
                 const int new_token = key - first_pos;
@@ -628,12 +638,19 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
                 v_ptr = &cache_v[off];
             }
 
-            const int4 kv           = load_vec<int4>(k_ptr);
-            const __nv_bfloat16* kp = reinterpret_cast<const __nv_bfloat16*>(&kv);
-            float partial           = 0.0f;
+            // Two sources, two element types: the bypassed current-step rows are bf16
+            // activations, the cached keys are the cache's fp16.
+            const int4 kv = load_vec<int4>(k_ptr);
+            float kf[kDPerLane];
 #pragma unroll
             for (int i = 0; i < kDPerLane; ++i) {
-                partial = fmaf(q_reg[i], __bfloat162float(kp[i]), partial);
+                kf[i] = from_new ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&kv)[i])
+                                 : __half2float(reinterpret_cast<const half*>(&kv)[i]);
+            }
+            float partial = 0.0f;
+#pragma unroll
+            for (int i = 0; i < kDPerLane; ++i) {
+                partial = fmaf(q_reg[i], kf[i], partial);
             }
             const float score = warp_sum(partial, FullMask) * scale;
 
@@ -643,11 +660,16 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_partial_bf16_
             l = l * alpha + p;
             m = new_m;
 
-            const int4 vv           = load_vec<int4>(v_ptr);
-            const __nv_bfloat16* vp = reinterpret_cast<const __nv_bfloat16*>(&vv);
+            const int4 vv = load_vec<int4>(v_ptr);
+            float vf[kDPerLane];
 #pragma unroll
             for (int i = 0; i < kDPerLane; ++i) {
-                acc[i] = fmaf(acc[i], alpha, p * __bfloat162float(vp[i]));
+                vf[i] = from_new ? __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&vv)[i])
+                                 : __half2float(reinterpret_cast<const half*>(&vv)[i]);
+            }
+#pragma unroll
+            for (int i = 0; i < kDPerLane; ++i) {
+                acc[i] = fmaf(acc[i], alpha, p * vf[i]);
             }
         }
 

@@ -49,9 +49,8 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
         gqa_attention_prefill_bf16_kernel<Geometry, Metadata>
             <<<attention_grid, kGqaPrefillThreads, kGqaPrefillSmemBytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const __nv_bfloat16*>(cache_k.data),
-                static_cast<const __nv_bfloat16*>(cache_v.data), metadata,
-                static_cast<const std::int32_t*>(positions.data), scale,
+                static_cast<const half*>(cache_k.data), static_cast<const half*>(cache_v.data),
+                metadata, static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -111,8 +110,8 @@ void gqa_kv_append_launch_for(const Tensor& k, const Tensor& v, const Tensor& po
             <<<fill_grid, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(k.data),
                                                static_cast<const __nv_bfloat16*>(v.data),
                                                static_cast<const std::int32_t*>(positions.data),
-                                               metadata, static_cast<__nv_bfloat16*>(cache_k.data),
-                                               static_cast<__nv_bfloat16*>(cache_v.data), tokens);
+                                               metadata, static_cast<half*>(cache_k.data),
+                                               static_cast<half*>(cache_v.data), tokens);
         CUDA_CHECK(cudaGetLastError());
     }
 }

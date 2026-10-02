@@ -680,7 +680,7 @@ int run_attention_mscale_case() {
 
     // --- run the real Op (A1 append+attend) on the yarn-roped (mscale=M) q/k -------------------
     const tgqa::HostCache initial =
-        tgqa::make_cache(geometry, DType::BF16, kMaxContext, 0x6D6E75u);
+        tgqa::make_cache(geometry, DType::FP16, kMaxContext, 0x6D6E75u);
     tgqa::DeviceCache cache(initial, tgqa::MappingPattern::Identity);
 
     GuardedDeviceBuffer dq(scaled_run.q.size() * sizeof(std::uint16_t));
@@ -706,7 +706,7 @@ int run_attention_mscale_case() {
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(kTokens),
                                              static_cast<std::uint32_t>(kMaxContext)};
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        geometry.q_heads, DType::BF16, envelope, 1, kTokens, kTokens);
+        geometry.q_heads, DType::FP16, envelope, 1, kTokens, kTokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 

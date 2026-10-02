@@ -75,9 +75,9 @@ __device__ __forceinline__ void noncausal_gqa_row_to_qt(int row, int kv_head, in
 
 template <bool CyclicSwa, int KeyBlock, int Threads>
 __device__ __forceinline__ void
-bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
-                             const __nv_bfloat16* query, int key0, int valid_keys, bool query_tile,
-                             int kv_head, int context_stride, int physical_page, int tid) {
+bidirectional_gqa_stage_tile(half* dst, const half* context, const __nv_bfloat16* query,
+                             int key0, int valid_keys, bool query_tile, int kv_head,
+                             int context_stride, int physical_page, int tid) {
     constexpr int VecsPerRow = kBidirectionalGqaHeadDim / 8;
     constexpr int Page       = 64;
     const std::int64_t paged_base =
@@ -100,9 +100,15 @@ bidirectional_gqa_stage_tile(__nv_bfloat16* dst, const __nv_bfloat16* context,
                             : paged_base + d +
                                   static_cast<std::int64_t>(kBidirectionalGqaHeadDim) * safe_row;
         }
-        const __nv_bfloat16* src = query_tile ? query + src_index : context + src_index;
-        __nv_bfloat16* smem = &dst[row * kBidirectionalGqaHeadDim + bidirectional_gqa_swz(row, d)];
-        cp_async_zfill<16, Cache::cg>(smem, src, live ? 16 : 0);
+        half* smem = &dst[row * kBidirectionalGqaHeadDim + bidirectional_gqa_swz(row, d)];
+        if (query_tile) {
+            // The query tile is the bf16 activation and widens as it is staged.
+            store_vec(smem, bf16x8_to_f16x8(live ? load_ldg<int4>(query + src_index)
+                                                 : make_int4(0, 0, 0, 0)));
+        } else {
+            // The context tile is the fp16 cache and stages verbatim.
+            cp_async_zfill<16, Cache::cg>(smem, context + src_index, live ? 16 : 0);
+        }
     }
 }
 
@@ -111,7 +117,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_state,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ selectors,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const half* __restrict__ context_k, const half* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int context_stride, int logical_pages,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
@@ -128,7 +134,7 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
     constexpr int QKKs          = D / 16;
     constexpr int PVNt          = D / 8;
     constexpr int PVKs          = KeyBlock / 16;
-    constexpr int RowBytes      = D * static_cast<int>(sizeof(__nv_bfloat16));
+    constexpr int RowBytes      = D * static_cast<int>(sizeof(half));
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -218,12 +224,13 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         }
     }
 
-    extern __shared__ __align__(16) __nv_bfloat16 shared[];
-    __nv_bfloat16* k_s = shared;
-    __nv_bfloat16* v_s = shared + KeyBlock * D;
+    extern __shared__ __align__(16) half shared[];
+    half* k_s = shared;
+    half* v_s = shared + KeyBlock * D;
 
     // The two K/V buffers together hold at least Br rows. Use them once as Q staging, then retain
-    // all Q MMA fragments in registers for the complete split.
+    // all Q MMA fragments in registers for the complete split. Q arrives as a bf16 activation and
+    // widens into the fp16 operand buffer.
     for (int chunk = tid; chunk < Br * (D / 8); chunk += Threads) {
         const int row = chunk / (D / 8);
         const int d   = (chunk - row * (D / 8)) * 8;
@@ -232,8 +239,8 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
         const bool live = row < RowCount && token < valid;
         const __nv_bfloat16* src =
             q + bidirectional_gqa_q_index(live ? q_head : 0, d, live ? token : 0);
-        __nv_bfloat16* dst = &shared[row * D + bidirectional_gqa_swz(row, d)];
-        cp_async_zfill<16, Cache::cg>(dst, src, live ? 16 : 0);
+        half* dst = &shared[row * D + bidirectional_gqa_swz(row, d)];
+        store_vec(dst, bf16x8_to_f16x8(live ? load_ldg<int4>(src) : make_int4(0, 0, 0, 0)));
     }
     cp_commit();
     cp_wait<0>();
@@ -331,8 +338,8 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
                 const int bcol = ks * 16 + b_koff;
                 ldmatrix_x2(bf[0], bf[1],
                             smem_addr(&k_s[brow * D + bidirectional_gqa_swz(brow, bcol)]));
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[ks][0],
-                         af_q[ks][1], af_q[ks][2], af_q[ks][3], bf[0], bf[1]);
+                mma_f16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[ks][0],
+                        af_q[ks][1], af_q[ks][2], af_q[ks][3], bf[0], bf[1]);
             }
         }
 
@@ -411,11 +418,11 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
             block_l1 += p10 + p11;
             const int pk = nt >> 1;
             if ((nt & 1) == 0) {
-                p_frag[pk][0] = pack_bf16x2(p00, p01);
-                p_frag[pk][1] = pack_bf16x2(p10, p11);
+                p_frag[pk][0] = bf162_to_f162(pack_bf16x2(p00, p01));
+                p_frag[pk][1] = bf162_to_f162(pack_bf16x2(p10, p11));
             } else {
-                p_frag[pk][2] = pack_bf16x2(p00, p01);
-                p_frag[pk][3] = pack_bf16x2(p10, p11);
+                p_frag[pk][2] = bf162_to_f162(pack_bf16x2(p00, p01));
+                p_frag[pk][3] = bf162_to_f162(pack_bf16x2(p10, p11));
             }
         }
         block_l0 = warp_sum<4>(block_l0, FullMask);
@@ -452,12 +459,12 @@ __device__ __forceinline__ void noncausal_gqa_split_partial_body(
                                   v_lane_base + static_cast<unsigned>(next_pk * 16 * RowBytes),
                                   static_cast<unsigned>(next_n2 << 4), v_as, v_r));
             }
-            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[pk][0], p_frag[pk][1],
-                     p_frag[pk][2], p_frag[pk][3], vf[cur][0], vf[cur][1]);
+            mma_f16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[pk][0], p_frag[pk][1],
+                    p_frag[pk][2], p_frag[pk][3], vf[cur][0], vf[cur][1]);
             if (n2 + 1 < PVNt) {
-                mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
-                         p_frag[pk][0], p_frag[pk][1], p_frag[pk][2], p_frag[pk][3], vf[cur][2],
-                         vf[cur][3]);
+                mma_f16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                        p_frag[pk][0], p_frag[pk][1], p_frag[pk][2], p_frag[pk][3], vf[cur][2],
+                        vf[cur][3]);
             }
         }
 
@@ -523,7 +530,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void bidirectional_gqa_split_p
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ context_length,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ table_rows,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const half* __restrict__ context_k, const half* __restrict__ context_v,
     const std::int32_t* __restrict__ block_tables, int physical_pages, int logical_pages,
     int max_context, int split_capacity, float scale, __nv_bfloat16* __restrict__ partial_acc,
     float* __restrict__ partial_m, float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
@@ -538,7 +545,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void swa_split_partial_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ query_k,
     const __nv_bfloat16* __restrict__ query_v, const std::int32_t* __restrict__ positions,
     const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
-    const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
+    const half* __restrict__ context_k, const half* __restrict__ context_v,
     int padded_context, int max_context, int split_capacity, float scale,
     __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
     float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {

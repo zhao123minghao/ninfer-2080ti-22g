@@ -167,6 +167,7 @@ add_library(ninfer_ops STATIC
   ops/linear/nvfp4/nvfp4_dispatch.cpp
   ops/linear/q4/q4_small_t_mma.cu
   ops/linear/q4/q4_rowsplit_gemm_mma.cu
+  ops/linear/f16/f16_materialized_gemm.cu
   ops/linear/q4/q4_rowsplit_gemm_simt.cu
   ops/linear/q4/q4_rowsplit_gemv.cu
   ops/linear/q4/q4_dispatch.cpp

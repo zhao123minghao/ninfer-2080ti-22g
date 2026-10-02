@@ -587,11 +587,13 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
     }
 
     // Route sweep: T=1 exercises the gemv edge on the tp1 reference kernel (irrelevant to the
-    // shard, which always routes through the row-generic grouped-MMA kernel -- see
-    // attn_input_proj.h's design note); T around the BN=64 tile boundary (63/64/65) proves the
-    // partial-tile masking on the shard path; T=17/21 cross the tp1 reference's own small-T/MMA
-    // route boundaries.
-    const std::vector<std::int32_t> tokens_sweep{1, 2, 16, 17, 21, 48, 63, 64, 65, 128};
+    // shard, which routes its decode widths through the shard's own fused split-output SIMT pair
+    // and everything wider through the row-generic grouped-MMA kernel -- see
+    // attn_input_proj.h's design note); T=8/12 are the two- and three-request MTP3 decode round
+    // widths, which exist only under concurrency and therefore sit past every single-request
+    // sweep; T around the BN=64 tile boundary (63/64/65) proves the partial-tile masking on the
+    // shard path; T=17/21 cross the tp1 reference's own small-T/MMA route boundaries.
+    const std::vector<std::int32_t> tokens_sweep{1, 2, 8, 12, 16, 17, 21, 48, 63, 64, 65, 128};
 
     for (const std::int32_t tokens : tokens_sweep) {
         const std::string label = head + " T=" + std::to_string(tokens);
@@ -907,7 +909,10 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
+    // This suite signs its split forms locally rather than through the collectives, so the declared
+    // peer-staging bound only has to keep the startup transport probe meaningful.
+    constexpr std::size_t kPeerStagingBytes = 1u << 20;
+    const bool peer_access = ops::enable_peer_access(ec, kPeerStagingBytes);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (CUDA stages the device-to-device copies through "

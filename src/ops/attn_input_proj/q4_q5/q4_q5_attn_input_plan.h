@@ -49,14 +49,14 @@ void q4_q5_attn_input_dispatch(const Tensor& x, const Weight& query_key_weight,
 // --- TP2 column-shard sibling --------------------------------------------------------------------
 // query_key/gate_value shard shape [3584,5120] (query/gate 3072 rows, key/value 512 rows -- half
 // the heads of each section, same section order as the parent -- see
-// include/ninfer/ops/attn_input_proj.h for the ShardPlan derivation). Unlike
-// the tp1 dispatch above, this always routes through the grouped-MMA kernel
-// (q4_q5_attn_input_grouped_mma_r32_c64_s4_launch), which is row-count-generic and therefore
-// already correct at the shard shape for every T; the exact small-T kernels in
-// q4_q5_attn_input_small_t.cu remain compile-time-exact to the tp1 parent shape and are not used by
-// the shard (a documented performance-only gap, not a correctness one: the grouped-MMA kernel is
-// correct at every T>=1 at the shard's row counts, and ninfer_attn_input_proj_split_test sweeps
-// T down to 1).
+// include/ninfer/ops/attn_input_proj.h for the ShardPlan derivation). The exact small-T kernels in
+// q4_q5_attn_input_small_t.cu remain compile-time-exact to the tp1 parent shape, so the shard has
+// its own halved-extent instantiations of the same fused split-output GEMVs
+// (q4_q5_attn_input_small_t_shard_launch) for T == 1 and routes every wider T through the
+// row-count-generic grouped-MMA kernel (q4_q5_attn_input_grouped_mma_r32_c64_s4_launch). Only
+// T == 1 moves: it is the decode leaf, where the grouped-MMA route's 32x64 tile pays a whole tile
+// for one real column. Both routes are correct at every T >= 1 at the shard's row counts, and
+// ninfer_attn_input_proj_split_test sweeps T down to 1.
 bool q4_q5_attn_input_admits_shard(const Q4Q5AttnInputProblem& problem) noexcept;
 std::size_t q4_q5_attn_input_shard_capacity_workspace_bytes(std::int32_t min_cols,
                                                            std::int32_t max_cols);

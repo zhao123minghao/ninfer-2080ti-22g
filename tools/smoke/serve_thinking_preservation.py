@@ -301,7 +301,7 @@ def main() -> None:
     parser.add_argument("--server-bin", type=Path, default=Path("build/apps/ninfer-serve"))
     parser.add_argument("--tp", type=int, choices=(1, 2), default=1)
     parser.add_argument("--devices", default="0,1", help="CUDA device pair used with --tp 2")
-    parser.add_argument("--kv-dtype", choices=("bf16", "int8"), default="bf16")
+    parser.add_argument("--kv-dtype", choices=("fp16", "int8"), default="fp16")
     parser.add_argument(
         "--fixture",
         type=Path,

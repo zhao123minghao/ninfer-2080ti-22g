@@ -1018,6 +1018,15 @@ Per-request KV/context、recurrent state、sampling state 和 output ownership �
 具体 compact layout、typed extents 和 selector ABI 由对应 `include/ninfer/ops/` semantic contracts 定义；
 本架构不复制逐 Op 接口清单。
 
+**Aggregate round width 是每个 small-T 路由的一等输入。** 一轮 decode 的 aggregate activation width 是
+`C × (1 + draft)`（`C` = 本轮 active rows，draft = 本轮 MTP 窗口，无 MTP 时为 0），而不是单个请求的
+`1 + draft`。任何以 `cols`/`T` 上界形式存在的「小 T 特化」都必须覆盖这个 aggregate extent；上界若按
+`1 + draft` 写死，并发轮就会越过它并落到为 prefill 设计的 tile 上。TP2 shard 的三族（attention input
+projection、GDN input projection、q5 residual projection）曾经把该上界写成 `6`，于是 C=2/MTP3（八列）
+的轮宽直接落进 32×64 / 64×16 MMA tile，q5 decode GEMM 每次 launch 贵 3.3×，见 `history.md` §23。
+修改任何此类上界时三族必须一起改（只改一族只会把台阶挪到别处），并且上界要由实测交叉点确定，
+而不是直接取 `kMaximumConcurrency × (1 + max draft)`。
+
 ### 8.7 Result resolution and commit
 
 Graph replay 后只回传 compact per-row result，例如 ordinary sampled token，不能回传 logits 或逐层状态。

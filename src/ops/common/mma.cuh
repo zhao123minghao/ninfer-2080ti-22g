@@ -82,6 +82,29 @@ __device__ __forceinline__ unsigned bf162_to_f162(unsigned b) {
     return *reinterpret_cast<const unsigned*>(&h);
 }
 
+// Scalar form of the widening above, for the element-wise staging paths.
+__device__ __forceinline__ half bf16_to_f16(__nv_bfloat16 v) {
+    return __float2half_rn(__bfloat162float(v));
+}
+
+// Convert one 16-byte KV vector (8x BF16) to the 8x FP16 values the KV cache stores.
+//
+// Every K/V write goes through this, because the cache is fp16 while the K/V activations are
+// bf16. Doing it here rather than at every read is what makes the cache's element type the
+// tensor-core operand type: the attention kernels stage cache vectors into shared memory and
+// feed them straight to the mma, where the same bf16 -> fp16 widening would otherwise run once
+// per staged element per key-tile walk. The widening itself is exact across fp16's normal range
+// (bf16 carries 8 significand bits, fp16 carries 11), so the operands are bit-identical either
+// way -- only the number of times the conversion executes changes.
+__device__ __forceinline__ int4 bf16x8_to_f16x8(int4 raw) {
+    int4 out;
+    out.x = static_cast<int>(bf162_to_f162(static_cast<unsigned>(raw.x)));
+    out.y = static_cast<int>(bf162_to_f162(static_cast<unsigned>(raw.y)));
+    out.z = static_cast<int>(bf162_to_f162(static_cast<unsigned>(raw.z)));
+    out.w = static_cast<int>(bf162_to_f162(static_cast<unsigned>(raw.w)));
+    return out;
+}
+
 // Turing-native FP16 MMA: 16x8x8
 __device__ __forceinline__ void mma_f16_m16n8k8(float& c0, float& c1, float& c2, float& c3,
                                                 unsigned a0, unsigned a1, unsigned b0) {
@@ -99,12 +122,10 @@ __device__ __forceinline__ void mma_s8_m8n8k16(int& c0, int& c1, unsigned a0, un
                  : "r"(a0), "r"(b0));
 }
 
-__device__ __forceinline__ float bf16_low_to_float(unsigned packed) {
-    return __uint_as_float(packed << 16);
-}
-__device__ __forceinline__ float bf16_high_to_float(unsigned packed) {
-    return __uint_as_float(packed & 0xffff0000U);
-}
+// Defined below; mma_bf16's Turing route restages its bf16 fragments into fp16 and runs this.
+__device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
+                                        unsigned a1, unsigned a2, unsigned a3, unsigned b0,
+                                        unsigned b1);
 
 __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float& c3, unsigned a0,
                                          unsigned a1, unsigned a2, unsigned a3, unsigned b0,
@@ -114,63 +135,20 @@ __device__ __forceinline__ void mma_bf16(float& c0, float& c1, float& c2, float&
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-// Turing has no bf16 tensor core: this is the fork's warp-shuffle FP32
-// emulation of the m16n8k16 bf16 tile, validated against the FP64 oracle.
+// Turing has no bf16 tensor core, but it does have fp16 ones, and both operands here are bf16
+// values already sitting in registers. A bf16 -> fp16 conversion is lossless across fp16's whole
+// normal range (bf16 carries 8 significand bits, fp16 carries 11), so restaging the fragments and
+// running the native m16n8k8 fp16 tensor core twice produces exactly the same products as
+// decoding those bf16 values into fp32 did; only the accumulation association changes. The
+// m16n8k16 A/B fragment layouts are identical for .bf16 and .f16, so this is a pure register
+// restaging with no shuffles: ~20 issued instructions per tile against the emulation's ~160.
+//
+// Range: this target's grouped-int weights dequantize to |w| <= 1.6 over all 439 quantized
+// tensors, and fp16's normal range reaches 65504, so no operand can saturate. The route is
+// checked against a naive FP64 oracle in tests/ops/test_mma_bf16_sm75.cpp.
 #elif defined(NINFER_SM75)
-    const int lane    = threadIdx.x & 31;
-    const int r       = lane >> 2;
-    const int t       = lane & 3;
-    const int base_a  = 4 * r;
-    const int base_b0 = 8 * t;
-    const int base_b1 = 8 * t + 4;
-
-    float sum0 = 0.0f;
-    float sum1 = 0.0f;
-    float sum2 = 0.0f;
-    float sum3 = 0.0f;
-
-#pragma unroll
-    for (int k_idx = 0; k_idx < 4; ++k_idx) {
-        const unsigned reg_a0 = __shfl_sync(0xffffffff, a0, base_a + k_idx);
-        const unsigned reg_a1 = __shfl_sync(0xffffffff, a1, base_a + k_idx);
-        const unsigned reg_a2 = __shfl_sync(0xffffffff, a2, base_a + k_idx);
-        const unsigned reg_a3 = __shfl_sync(0xffffffff, a3, base_a + k_idx);
-
-        const unsigned reg_b0_n0 = __shfl_sync(0xffffffff, b0, base_b0 + k_idx);
-        const unsigned reg_b1_n0 = __shfl_sync(0xffffffff, b1, base_b0 + k_idx);
-        const unsigned reg_b0_n1 = __shfl_sync(0xffffffff, b0, base_b1 + k_idx);
-        const unsigned reg_b1_n1 = __shfl_sync(0xffffffff, b1, base_b1 + k_idx);
-
-        const float a_r_k0  = bf16_low_to_float(reg_a0);
-        const float a_r_k1  = bf16_high_to_float(reg_a0);
-        const float a_r8_k0 = bf16_low_to_float(reg_a1);
-        const float a_r8_k1 = bf16_high_to_float(reg_a1);
-
-        const float a_r_k8  = bf16_low_to_float(reg_a2);
-        const float a_r_k9  = bf16_high_to_float(reg_a2);
-        const float a_r8_k8 = bf16_low_to_float(reg_a3);
-        const float a_r8_k9 = bf16_high_to_float(reg_a3);
-
-        const float b_n0_k0 = bf16_low_to_float(reg_b0_n0);
-        const float b_n0_k1 = bf16_high_to_float(reg_b0_n0);
-        const float b_n0_k8 = bf16_low_to_float(reg_b1_n0);
-        const float b_n0_k9 = bf16_high_to_float(reg_b1_n0);
-
-        const float b_n1_k0 = bf16_low_to_float(reg_b0_n1);
-        const float b_n1_k1 = bf16_high_to_float(reg_b0_n1);
-        const float b_n1_k8 = bf16_low_to_float(reg_b1_n1);
-        const float b_n1_k9 = bf16_high_to_float(reg_b1_n1);
-
-        sum0 += a_r_k0  * b_n0_k0 + a_r_k1  * b_n0_k1 + a_r_k8  * b_n0_k8 + a_r_k9  * b_n0_k9;
-        sum1 += a_r_k0  * b_n1_k0 + a_r_k1  * b_n1_k1 + a_r_k8  * b_n1_k8 + a_r_k9  * b_n1_k9;
-        sum2 += a_r8_k0 * b_n0_k0 + a_r8_k1 * b_n0_k1 + a_r8_k8 * b_n0_k8 + a_r8_k9 * b_n0_k9;
-        sum3 += a_r8_k0 * b_n1_k0 + a_r8_k1 * b_n1_k1 + a_r8_k8 * b_n1_k8 + a_r8_k9 * b_n1_k9;
-    }
-
-    c0 += sum0;
-    c1 += sum1;
-    c2 += sum2;
-    c3 += sum3;
+    mma_f16(c0, c1, c2, c3, bf162_to_f162(a0), bf162_to_f162(a1), bf162_to_f162(a2),
+            bf162_to_f162(a3), bf162_to_f162(b0), bf162_to_f162(b1));
 #else
     (void)a0;
     (void)a1;
@@ -186,14 +164,22 @@ __device__ __forceinline__ void mma_f16(float& c0, float& c1, float& c2, float& 
                                         unsigned a1, unsigned a2, unsigned a3, unsigned b0,
                                         unsigned b1) {
 // m16n8k16 f16 is sm_80+; Turing has m16n8k8, so decompose into two.
+//
+// The seam is the K axis, and the two halves must be paired with their own fragments: for a
+// PTX-standard m16n8k16 A fragment a0/a1 hold the k0..k7 half at rows r/r+8 and a2/a3 hold the
+// k8..k15 half, while an m16n8k8 A fragment's two registers are exactly (rows 0..7, k0..7) and
+// (rows 8..15, k0..7). So the k0..7 product takes (a0, a1) with the b0 half of B and the k8..15
+// product takes (a2, a3) with b1. Verified with a standalone fragment probe against a naive
+// per-element reference on sm_75: the pairing below reproduces the reference exactly
+// (max |diff| 0) whereas the crossed (a0, a2)/(a1, a3) pairing differs by O(value).
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #elif defined(NINFER_SM75)
-    mma_f16_m16n8k8(c0, c1, c2, c3, a0, a2, b0);
-    mma_f16_m16n8k8(c0, c1, c2, c3, a1, a3, b1);
+    mma_f16_m16n8k8(c0, c1, c2, c3, a0, a1, b0);
+    mma_f16_m16n8k8(c0, c1, c2, c3, a2, a3, b1);
 #else
     (void)a0;
     (void)a1;
@@ -262,18 +248,26 @@ __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, f
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-// Turing has no tf32 tensor core: warp-shuffle FP32 emulation of m16n8k8.
+// Turing has no tf32 tensor core: repack the fragment onto the fp16 one, which it does have.
 #elif defined(NINFER_SM75)
-    // On SM75 (Turing), TF32 Tensor Cores are unavailable.
-    // We compute the exact m16n8k8 row.col FP32 tile via warp shuffles + SIMT FMAs.
+    // Both formats carry a 10-bit mantissa, so routing the tf32 fragment through the fp16 m16n8k8
+    // MMA keeps the operand precision the Ampere/Ada builds get from mma.tf32, while replacing
+    // 32 SHFL + 16 FFMA with 6 SHFL + 1 HMMA. Turing's operand magnitudes were measured on the
+    // shipped 27B model (history.md 18.3): max|A| = 1.0 and max|B| = 55, i.e. about 1190x inside
+    // fp16's normal range, so overflow is not reachable. C's element map is identical in both
+    // fragment forms; the repack below is verified against the previous emulation by
+    // .scratch/tf32_f16/repack_probe.cu (worst |diff| 1.8e-3 on |C| ~ 7 = fp16 operand rounding).
+    //
     // Thread T (r = T / 4 in [0..7], t = T % 4 in [0..3]):
-    // Target C registers: c0 = C(r, 2t), c1 = C(r, 2t+1), c2 = C(r+8, 2t), c3 = C(r+8, 2t+1)
+    // C: c0 = C(r, 2t), c1 = C(r, 2t+1), c2 = C(r+8, 2t), c3 = C(r+8, 2t+1)
+    // tf32 A: a0 = A(r, t), a1 = A(r+8, t), a2 = A(r, t+4), a3 = A(r+8, t+4)
+    // tf32 B: lane (tb = T / 8, j = T % 8) holds B(j, 2tb), B(j+4, 2tb) for j < 4 and
+    //         B(j-4, 2tb+1), B(j, 2tb+1) for j >= 4
+    // fp16 A: vec0 = {A(r, 2t), A(r, 2t+1)}, vec1 = {A(r+8, 2t), A(r+8, 2t+1)}
+    // fp16 B: vec0 = {B(2t, r), B(2t+1, r)}
     const int lane    = threadIdx.x & 31;
     const int r       = lane >> 2;
     const int t       = lane & 3;
-    const int base_a  = 4 * r;
-    const int base_b0 = 8 * t;
-    const int base_b1 = 8 * t + 4;
 
     const float fa0 = __uint_as_float(a0);
     const float fa1 = __uint_as_float(a1);
@@ -282,33 +276,34 @@ __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, f
     const float fb0 = __uint_as_float(b0);
     const float fb1 = __uint_as_float(b1);
 
-    float sum0 = 0.0f;
-    float sum1 = 0.0f;
-    float sum2 = 0.0f;
-    float sum3 = 0.0f;
+    const int a_src  = 4 * r + 2 * (t & 1);
+    const bool a_hi  = (t >= 2);
+    const __half2 a_pack0 = __floats2half2_rn(fa0, fa2);
+    const __half2 a_pack1 = __floats2half2_rn(fa1, fa3);
+    const unsigned a_pack0_bits = *reinterpret_cast<const unsigned*>(&a_pack0);
+    const unsigned a_pack1_bits = *reinterpret_cast<const unsigned*>(&a_pack1);
+    const unsigned a_src0       = __shfl_sync(0xffffffffu, a_pack0_bits, a_src);
+    const unsigned a_src1       = __shfl_sync(0xffffffffu, a_pack0_bits, a_src + 1);
+    const unsigned a_src2       = __shfl_sync(0xffffffffu, a_pack1_bits, a_src);
+    const unsigned a_src3       = __shfl_sync(0xffffffffu, a_pack1_bits, a_src + 1);
+    const unsigned a_selector = a_hi ? 0x7632u : 0x5410u;
+    const unsigned a_f0_bits  = __byte_perm(a_src0, a_src1, a_selector);
+    const unsigned a_f1_bits  = __byte_perm(a_src2, a_src3, a_selector);
 
-#pragma unroll
-    for (int k_idx = 0; k_idx < 4; ++k_idx) {
-        const float a_r_k   = __shfl_sync(0xffffffff, fa0, base_a + k_idx);
-        const float a_r8_k  = __shfl_sync(0xffffffff, fa1, base_a + k_idx);
-        const float a_r_k4  = __shfl_sync(0xffffffff, fa2, base_a + k_idx);
-        const float a_r8_k4 = __shfl_sync(0xffffffff, fa3, base_a + k_idx);
+    const int b_src   = 8 * (r >> 1) + (r & 1) * 4 + 2 * (t & 1);
+    const bool b_hi   = (t >= 2);
+    const __half2 b_pack = __floats2half2_rn(fb0, fb1);
+    const unsigned b_pack_bits = *reinterpret_cast<const unsigned*>(&b_pack);
+    const unsigned b_src0      = __shfl_sync(0xffffffffu, b_pack_bits, b_src);
+    const unsigned b_src1      = __shfl_sync(0xffffffffu, b_pack_bits, b_src + 1);
+    const unsigned b_selector = b_hi ? 0x7632u : 0x5410u;
+    const unsigned b_f0_bits  = __byte_perm(b_src0, b_src1, b_selector);
 
-        const float b_n0_k  = __shfl_sync(0xffffffff, fb0, base_b0 + k_idx);
-        const float b_n0_k4 = __shfl_sync(0xffffffff, fb1, base_b0 + k_idx);
-        const float b_n1_k  = __shfl_sync(0xffffffff, fb0, base_b1 + k_idx);
-        const float b_n1_k4 = __shfl_sync(0xffffffff, fb1, base_b1 + k_idx);
-
-        sum0 += a_r_k  * b_n0_k  + a_r_k4  * b_n0_k4;
-        sum1 += a_r_k  * b_n1_k  + a_r_k4  * b_n1_k4;
-        sum2 += a_r8_k * b_n0_k  + a_r8_k4 * b_n0_k4;
-        sum3 += a_r8_k * b_n1_k  + a_r8_k4 * b_n1_k4;
-    }
-
-    c0 += sum0;
-    c1 += sum1;
-    c2 += sum2;
-    c3 += sum3;
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+        : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+        : "r"(a_f0_bits), "r"(a_f1_bits), "r"(b_f0_bits));
 #else
     (void)a0;
     (void)a1;

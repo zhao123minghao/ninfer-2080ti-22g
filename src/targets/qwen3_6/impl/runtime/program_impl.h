@@ -306,8 +306,16 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             throw;
         }
         CUDA_CHECK(cudaSetDevice(previous));
-        (void)ops::enable_peer_access(execution);
-        peer_events.emplace(execution);
+        // The staged peer route's pinned host staging is sized once, here, for the largest payload
+        // any collective in this program can present: a row-parallel all-reduce carries
+        // [hidden, tokens] BF16 with `tokens <= prefill_chunk`, and the prefill hidden step buffer
+        // is exactly [hidden, effective_prefill_chunk]. The vocabulary and proposal gathers move
+        // half a vocabulary per rank, which is smaller. Declaring the bound here rather than
+        // letting the first large prefill grow a default is what keeps the staging address stable
+        // for graphs already captured against it (history.md 5.4).
+        const std::size_t peer_staging_bytes = plan.persistent.prefill_hidden.region.bytes;
+        (void)ops::enable_peer_access(execution, peer_staging_bytes);
+        peer_events.emplace(execution, peer_staging_bytes);
         if (plan.use_cuda_graph) {
             // Created once, here, for the same reason PeerEvents is: cudaEventCreate is not
             // capturable, and the fork/join pair must outlive every capture.
@@ -2872,7 +2880,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.effective_max_context = effective_max_context;
     out.yarn_mscale           = yarn_mscale;
     out.kv_capacity           = kv_capacity;
-    out.kv_cache = kv_dtype == DType::BF16 ? KvCacheStorage::BFloat16 : KvCacheStorage::Int8Group64;
+    out.kv_cache = kv_dtype == DType::FP16 ? KvCacheStorage::Float16 : KvCacheStorage::Int8Group64;
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

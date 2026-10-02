@@ -669,7 +669,8 @@ void Variant::gdn_input_projection(const std::array<Tensor, 2>& hidden,
         ops::gdn_input_proj_column_parallel(hidden,
                                             pair_of(split[0]->query_key, split[1]->query_key),
                                             pair_of(split[0]->value_z, split[1]->value_z), qkv,
-                                            output_gate_flat, ec);
+                                            output_gate_flat, ops::LinearPolicy::A16Only,
+                                            workspace, ec);
         return;
     }
     const auto fused =

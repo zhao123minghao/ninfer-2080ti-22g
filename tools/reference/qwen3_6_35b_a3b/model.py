@@ -43,7 +43,7 @@ class RefModel:
         device: str | torch.device = "cuda",
         memory_bytes: int | None = None,
         headroom_bytes: int = 2 << 30,
-        kv_dtype: str = "bf16",
+        kv_dtype: str = "fp16",
         prefill_chunk: int = CFG.prefill_chunk,
         mtp_draft_tokens: int = 0,
         draft_head: bool = False,

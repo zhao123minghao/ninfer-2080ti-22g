@@ -36,7 +36,8 @@ struct ServeOptions {
     std::uint32_t max_concurrency          = 1;
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;
-    std::uint32_t prefill_chunk            = 1024;
+    // Mirrors EngineOptions' default; see the note there for the measurement behind it.
+    std::uint32_t prefill_chunk            = 8192;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
@@ -49,7 +50,7 @@ struct ServeOptions {
     // Resolved device ids, one per tp rank. Always populated by parse_serve_options() (from
     // --devices, or synthesized as {device} when --devices is omitted).
     std::vector<int> devices;
-    KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache                = KvCacheStorage::Float16;
     SpeculativeOptions speculative;
     bool enable_vision      = false;
     bool use_cuda_graph     = true;

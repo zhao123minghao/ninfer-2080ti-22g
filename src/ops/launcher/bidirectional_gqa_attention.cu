@@ -119,8 +119,8 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
                     static_cast<const std::int32_t*>(context_lengths.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __nv_bfloat16*>(context.v_pages.data),
+                    static_cast<const half*>(context.k_pages.data),
+                    static_cast<const half*>(context.v_pages.data),
                     static_cast<const std::int32_t*>(context.block_tables.data),
                     context.k_pages.ne[2], context.block_tables.ne[0],
                     context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,
@@ -167,8 +167,7 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
                 throw std::invalid_argument("bidirectional_gqa_attention: inconsistent plan");
             }
             constexpr int KeyBlock = 32;
-            constexpr std::size_t SmemBytes =
-                2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
+            constexpr std::size_t SmemBytes = 2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(half);
             const dim3 direct_grid(kBidirectionalGqaKVHeads, 1, q.ne[3]);
             bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, true>
                 <<<direct_grid, Warps * 32, SmemBytes, stream>>>(
@@ -178,8 +177,8 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
                     static_cast<const std::int32_t*>(context_lengths.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __nv_bfloat16*>(context.v_pages.data),
+                    static_cast<const half*>(context.k_pages.data),
+                    static_cast<const half*>(context.v_pages.data),
                     static_cast<const std::int32_t*>(context.block_tables.data),
                     context.k_pages.ne[2], context.block_tables.ne[0],
                     context.block_tables.ne[0] * kPagedKVPageSize, 1, scale,
@@ -195,8 +194,7 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
         }
 
         const auto launch_split = [&]<int KeyBlock>() {
-            constexpr std::size_t SmemBytes =
-                2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(__nv_bfloat16);
+            constexpr std::size_t SmemBytes = 2u * KeyBlock * kBidirectionalGqaHeadDim * sizeof(half);
             const dim3 partial_grid(kBidirectionalGqaKVHeads, plan.split_capacity, q.ne[3]);
             bidirectional_gqa_split_partial_kernel<Tokens, Warps, KeyBlock, false>
                 <<<partial_grid, Warps * 32, SmemBytes, stream>>>(
@@ -206,8 +204,8 @@ void bidirectional_gqa_attention_launch(const Tensor& q, const Tensor& query_k,
                     static_cast<const std::int32_t*>(context_lengths.data),
                     static_cast<const std::int32_t*>(valid_columns.data),
                     static_cast<const std::int32_t*>(table_rows.data),
-                    static_cast<const __nv_bfloat16*>(context.k_pages.data),
-                    static_cast<const __nv_bfloat16*>(context.v_pages.data),
+                    static_cast<const half*>(context.k_pages.data),
+                    static_cast<const half*>(context.v_pages.data),
                     static_cast<const std::int32_t*>(context.block_tables.data),
                     context.k_pages.ne[2], context.block_tables.ne[0],
                     context.block_tables.ne[0] * kPagedKVPageSize, plan.split_capacity, scale,

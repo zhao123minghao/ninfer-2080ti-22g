@@ -72,7 +72,7 @@ def estimate_fixed_bytes(
     if not text and not mtp:
         return 0
     kv_layers = (CFG.full_layers if text else 0) + (1 if mtp else 0)
-    if kv_dtype == "bf16":
+    if kv_dtype == "fp16":
         kv_per_layer_token = 2 * CFG.kv_heads * CFG.head_dim * 2
     elif kv_dtype == "int8":
         kv_per_layer_token = 2 * CFG.kv_heads * (
@@ -112,7 +112,7 @@ class WeightStore:
         device: torch.device | str,
         *,
         capacity: int,
-        kv_dtype: str = "bf16",
+        kv_dtype: str = "fp16",
         text: bool = True,
         mtp: bool = False,
         draft_head: bool = False,

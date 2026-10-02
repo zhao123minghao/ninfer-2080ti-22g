@@ -28,7 +28,11 @@
 
 namespace ninfer::ops {
 
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+// Volta (sm_70) and Turing (sm_75) both have mma.sync.m8n8k4, neither has ldmatrix, and both
+// carry a 96 KiB/SM shared budget with a 64 KiB per-block ceiling -- so this file, and the
+// tensor-core kernels sized against it, apply to either target unchanged. ptxas assembles the
+// instruction for both (verified with a standalone shape probe).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
 
 // --- Fragment addressing -------------------------------------------------------------
 
@@ -154,6 +158,6 @@ __device__ __forceinline__ void volta_softmax_to_half2(half2 (&p)[4], const floa
     }
 }
 
-#endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+#endif // !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700 || __CUDA_ARCH__ == 750
 
 } // namespace ninfer::ops

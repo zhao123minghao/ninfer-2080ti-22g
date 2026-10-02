@@ -1,5 +1,16 @@
 #pragma once
 
+// sm_75 has no async-copy hardware, so ops::cp_async there is a synchronous load+store (see
+// ops/common/memory.cuh). A `#pragma unroll 1` staging loop then makes every iteration wait for
+// its own global round-trip. Letting these loops unroll lets the compiler batch the loads behind
+// one latency. On sm_80+ the copy really is asynchronous and batching the issue buys nothing, so
+// the original hint is kept there.
+#if defined(NINFER_SM75)
+#define NINFER_STAGE_UNROLL
+#else
+#define NINFER_STAGE_UNROLL _Pragma("unroll 1")
+#endif
+
 // Closed Q4/Q5 RowSplit grouped-MMA mechanism. Semantic Ops own the exact job
 // set, route plan, workspace, and fixed instantiations.
 
@@ -117,7 +128,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
 
     auto stage_load_x = [&](int stage, int kt) {
         const int k0 = kt * BK;
-#pragma unroll 1
+        NINFER_STAGE_UNROLL
         for (int c = tid; c < BN * (BK / 8); c += Cfg::THREADS) {
             const int tl       = c / (BK / 8);
             const int kg8      = c - tl * (BK / 8);
@@ -137,7 +148,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
 
     auto stage_load_quant = [&](int stage, int kt) {
         const int g = (kt * BK) >> 6;
-#pragma unroll 1
+        NINFER_STAGE_UNROLL
         for (int c = tid; c < BM * 2; c += Cfg::THREADS) {
             const int row  = c >> 1;
             const int half = c & 1;
@@ -154,7 +165,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
             }
         }
         if constexpr (Codec == RowSplitGroupedMmaCodec::Q5) {
-#pragma unroll 1
+            NINFER_STAGE_UNROLL
             for (int row = tid; row < BM; row += Cfg::THREADS) {
                 const int grow = m0 + row;
                 auto* dst      = &Hr[stage][row * 8];
@@ -170,7 +181,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
             }
         } else if constexpr (Codec == RowSplitGroupedMmaCodec::Mixed) {
             if (job.q5) {
-#pragma unroll 1
+                NINFER_STAGE_UNROLL
                 for (int row = tid; row < BM; row += Cfg::THREADS) {
                     const int grow = m0 + row;
                     auto* dst      = &Hr[stage][row * 8];
@@ -186,7 +197,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void rowsplit_groupe
                 }
             }
         }
-#pragma unroll 1
+        NINFER_STAGE_UNROLL
         for (int row = tid; row < BM; row += Cfg::THREADS) {
             const int grow = m0 + row;
             auto* dst      = &Sr[stage][row * SB];

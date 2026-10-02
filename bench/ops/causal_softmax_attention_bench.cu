@@ -39,7 +39,7 @@ constexpr double kRtx5090DramGBs    = 1792.0;
 
 enum class Entry : std::uint8_t { Append, Cached, Both };
 enum class GeometryChoice : std::uint8_t { H24Kv4, H16Kv2, H12Kv2, All };
-enum class KvChoice : std::uint8_t { Bf16, Int8, All };
+enum class KvChoice : std::uint8_t { F16, Int8, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
 enum class CacheState : std::uint8_t { Cold, Warm };
@@ -98,7 +98,7 @@ struct Result {
                  "usage: ninfer_causal_softmax_attention_bench "
                  "[--entry append|cached|both] "
                  "[--geometry d256-h24-kv4|d256-h16-kv2|d256-h12-kv2|all] "
-                 "[--kv-dtype bf16|int8|all] [--batch B,...] [--tokens W,...] "
+                 "[--kv-dtype fp16|int8|all] [--batch B,...] [--tokens W,...] "
                  "[--context L,...] [--row-contexts L0,...] [--valid-columns V0,...] "
                  "[--table-rows R0,...] "
                  "[--execution eager|graph|both] [--cache cold|warm|both] "
@@ -169,14 +169,14 @@ Options parse_options(int argc, char** argv) {
                 usage("--geometry expects d256-h24-kv4, d256-h16-kv2, d256-h12-kv2, or all");
         } else if (argument == "--kv-dtype") {
             const std::string_view value(next("--kv-dtype requires a value"));
-            if (value == "bf16")
-                options.kv = KvChoice::Bf16;
+            if (value == "fp16")
+                options.kv = KvChoice::F16;
             else if (value == "int8")
                 options.kv = KvChoice::Int8;
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, or all");
+                usage("--kv-dtype expects fp16, int8, or all");
         } else if (argument == "--tokens") {
             options.tokens = parse_list(next("--tokens requires a value"), 1, 262144, "--tokens");
         } else if (argument == "--batch") {
@@ -502,7 +502,7 @@ private:
 
 const char* entry_name(Entry entry) { return entry == Entry::Append ? "append" : "cached"; }
 
-const char* dtype_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "int8"; }
+const char* dtype_name(DType dtype) { return dtype == DType::FP16 ? "fp16" : "int8"; }
 
 const char* execution_name(Execution execution) {
     return execution == Execution::Eager ? "eager" : "graph";
@@ -524,8 +524,8 @@ std::string profile_name(std::span<const std::int32_t> values) {
 }
 
 double cache_vector_bytes(DType dtype) {
-    return dtype == DType::BF16
-               ? static_cast<double>(kHeadDim * dtype_size(DType::BF16))
+    return dtype == DType::FP16
+               ? static_cast<double>(kHeadDim * dtype_size(DType::FP16))
                : static_cast<double>(kHeadDim * dtype_size(DType::I8) +
                                      (kHeadDim / kKvGroup) * dtype_size(DType::FP16));
 }
@@ -662,9 +662,9 @@ std::vector<Geometry> selected_geometries(GeometryChoice choice) {
 }
 
 std::vector<DType> selected_dtypes(KvChoice choice) {
-    if (choice == KvChoice::Bf16) { return {DType::BF16}; }
+    if (choice == KvChoice::F16) { return {DType::FP16}; }
     if (choice == KvChoice::Int8) { return {DType::I8}; }
-    return {DType::BF16, DType::I8};
+    return {DType::FP16, DType::I8};
 }
 
 struct RowProfile {

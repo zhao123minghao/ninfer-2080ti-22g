@@ -386,7 +386,7 @@ int run_fused_case(const ExecutionContext& ec, QType qtype,
     // T sweep: T=1 (decode edge), small-T/MMA frontiers, T=128 (W4A4/A8 route under the permissive
     // policy), T=1024 (a multiple of 256 -- the sole route into the NVFP4 W4A4 TMA kernel, and the
     // shard's own TMA descriptor per the w4a4.cu/w4a4_tma.cu changes).
-    const std::vector<std::int32_t> tokens_sweep{1, 2, 5, 8, 17, 32, 48, 128, 1024};
+    const std::vector<std::int32_t> tokens_sweep{1, 2, 5, 8, 12, 17, 32, 48, 128, 1024};
 
     for (const std::int32_t tokens : tokens_sweep) {
         std::vector<float> activation(static_cast<std::size_t>(kInputRows) * tokens);
@@ -669,7 +669,8 @@ int run_split_storage_case(const ExecutionContext& ec, std::uint32_t seed) {
                                           Tensor(split_z[1]->data(), DType::BF16, {kShardValueRows, tokens})};
 
         retire_staging(ec);
-        ops::gdn_input_proj_column_parallel(x, qk_weight, vz_weight, qkv_out, z_out, ec);
+        ops::gdn_input_proj_column_parallel(x, qk_weight, vz_weight, qkv_out, z_out,
+                                            ops::LinearPolicy::A16Only, {nullptr, nullptr}, ec);
         synchronize_both(ec);
 
         std::array<std::vector<double>, 2> observed_qkv;
@@ -1241,7 +1242,10 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
+    // This suite signs its split forms locally rather than through the collectives, so the declared
+    // peer-staging bound only has to keep the startup transport probe meaningful.
+    constexpr std::size_t kPeerStagingBytes = 1u << 20;
+    const bool peer_access = ops::enable_peer_access(ec, kPeerStagingBytes);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (CUDA stages the device-to-device copies through "
@@ -1249,12 +1253,15 @@ int main() {
               << '\n';
 
     failures += verify_split_rejections(ec);
+    // The Q4/Q5 split-storage form runs before the NVFP4 and FP8 fused cases: those two need an
+    // sm_120a device for their A4/A8 policies, and a machine without one would otherwise abort
+    // before this form -- the one the sm_75 product target actually executes -- is ever exercised.
+    failures += run_split_storage_case(ec, 43u);
     failures += run_fused_case(
         ec, QType::NVFP4, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4}, 41u);
     failures += run_fused_case(
         ec, QType::FP8_E4M3FN_ROW_BF16S, {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA8},
         45u);
-    failures += run_split_storage_case(ec, 43u);
     failures += run_gating_case(ec, 51u);
     failures += run_gating_fused_case(ec, 53u, 48);
 

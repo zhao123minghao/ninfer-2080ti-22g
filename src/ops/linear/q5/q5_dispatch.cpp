@@ -1,5 +1,7 @@
 #include "ops/linear/q5/q5_dispatch.h"
 
+#include "ops/linear/f16/f16_materialized_gemm.h"
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -27,6 +29,20 @@ namespace {
 //
 // Returns nullptr when (n, k) is not a registered shard extent, so the caller falls through to the
 // tp1 table and its error message.
+//
+// Exact column tiles for the 5..7 column windows. A decode round is (1 + draft) columns wide, so
+// draft 4..6 land here, and both the four- and eight-column tiles round those widths up: a C4 tile
+// needs two column slices at T=5..7 and a C8 tile charges a whole extra row of columns. Measured at
+// T=5 on the 85k acceptance workload, the eight-column instantiation cost 189.7us/launch against
+// 96.6us/launch for four columns at T=4 -- 1.96x the work for 1.25x the columns.
+Q5Launch select_q5_exact_column_tile(std::int32_t t) {
+    switch (t) {
+    case 5: return launch_q5_simt_r8_c5;
+    case 6: return launch_q5_simt_r8_c6;
+    case 7: return launch_q5_simt_r8_c7;
+    default: return nullptr;
+    }
+}
 Q5Launch select_q5_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     const bool column_shard = k == 5120 && (n == 512 ||   // 1024  / 2
                                             n == 3072 ||  // 6144  / 2
@@ -37,8 +53,9 @@ Q5Launch select_q5_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
     // No C8 step: C4 is the faster tile per column on sm_75, and C8 cannot split finer than eight
     // columns, so it charges full width for a partial one. See the measurement note in
     // q4_dispatch.cpp.
+    if (const Q5Launch exact = select_q5_exact_column_tile(t); exact != nullptr) { return exact; }
     if (t <= 24) { return launch_q5_simt_r8_c4; }
-    return launch_q5_mma_r64_c128;
+    return launch_q5_mma_r64_c64;
 }
 
 // The tp1 table, exactly as it was: returns nullptr rather than throwing so the caller
@@ -50,6 +67,9 @@ Q5Launch select_q5_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
         switch (n) {
         case 1024:
             if (t <= 4) { return launch_q5_simt_r8_c4; }
+            if (const Q5Launch exact = select_q5_exact_column_tile(t); exact != nullptr) {
+                return exact;
+            }
             if (t <= 16) { return launch_q5_simt_r8_c8; }
             return launch_q5_mma_r64_c128;
         case 6144:
@@ -61,6 +81,9 @@ Q5Launch select_q5_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
         case 7168:
             if (t == 1) { return launch_q5_gemv_r16_s2_x; }
             if (t <= 6) { return launch_q5_simt_split4_exact; }
+            if (const Q5Launch exact = select_q5_exact_column_tile(t); exact != nullptr) {
+                return exact;
+            }
             if (t <= 16) { return launch_q5_simt_r8_c4; }
             return launch_q5_mma_r64_c128;
         default:
@@ -129,7 +152,9 @@ Q5Launch select_q5_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
 bool q5_launch_needs_volta_fallback(Q5Launch launch) noexcept {
     return launch != launch_q5_gemv_r16_s2_x && launch != launch_q5_simt_split4_exact &&
            launch != launch_q5_simt_split2_exact && launch != launch_q5_simt_r8_c4 &&
-           launch != launch_q5_simt_r8_c8 && launch != launch_q5_simt_r4_c16;
+           launch != launch_q5_simt_r8_c5 && launch != launch_q5_simt_r8_c6 &&
+           launch != launch_q5_simt_r8_c7 && launch != launch_q5_simt_r8_c8 &&
+           launch != launch_q5_simt_r4_c16;
 }
 #endif
 
@@ -173,8 +198,18 @@ Q5Launch select_q5_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 }
 
 void q5_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 cudaStream_t stream) {
-    const Q5Launch launch = select_q5_launch(w.n, w.k, x.ne[1], policy);
+                 WorkspaceArena* workspace, cudaStream_t stream) {
+    const std::int32_t t = x.ne[1];
+    // See q4_dispatch.cpp: the registered MMA route dequantizes and restages bf16 fragments into
+    // fp16 inside the K loop, and materializing the weight once as fp16 removes both. Prefill only.
+    if (workspace != nullptr) {
+        const std::int32_t slice = f16_materialized_slice_rows(w, t, *workspace);
+        if (slice > 0) {
+            launch_f16_materialized_gemm(x, w, out, slice, *workspace, stream);
+            return;
+        }
+    }
+    const Q5Launch launch = select_q5_launch(w.n, w.k, t, policy);
     launch(x, w, out, stream);
 }
 

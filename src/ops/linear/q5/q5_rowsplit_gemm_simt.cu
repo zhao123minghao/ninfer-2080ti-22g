@@ -151,6 +151,21 @@ void launch_q5_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStr
     launch_simt_route<8>(x, w, out, stream);
 }
 
+// Exact tiles for the 5..7 column windows: an MTP/MTP2 round is (1 + draft) columns wide, so draft
+// 4..6 produce them, and both the four- and eight-column tiles round those widths up (a C4 tile
+// needs two column slices, a C8 tile charges a whole extra row of columns).
+void launch_q5_simt_r8_c5(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_simt_route<5>(x, w, out, stream);
+}
+
+void launch_q5_simt_r8_c6(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_simt_route<6>(x, w, out, stream);
+}
+
+void launch_q5_simt_r8_c7(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    launch_simt_route<7>(x, w, out, stream);
+}
+
 void launch_q5_simt_r4_c16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_simt_route<8, 2>(x, w, out, stream);
 }

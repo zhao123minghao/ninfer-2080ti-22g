@@ -177,8 +177,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .plane_order           = PagedKVPlaneOrder::HeadMajor,
                 .planes =
                     {
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::BF16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        {DType::FP16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        {DType::FP16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
                     },
             };
             dflash.full = qwen3_6::PagedKVCacheLayout{
@@ -187,7 +187,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .max_context = plan.capacity,
                 .kv_heads    = DFlashConfig::kv_heads,
                 .head_dim    = DFlashConfig::head_dim,
-                .dtype       = DType::BF16,
+                .dtype       = DType::FP16,
                 .quant_group = 0,
             };
             dflash.prefill_features = add_tensor(
@@ -813,8 +813,8 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype       = options.kv_cache == KvCacheStorage::Float16 ? DType::FP16 : DType::I8,
+        .kv_quant_group = options.kv_cache == KvCacheStorage::Float16 ? 0 : qwen3_6::kKvQuantGroup,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .rope_mode      = options.rope_mode,

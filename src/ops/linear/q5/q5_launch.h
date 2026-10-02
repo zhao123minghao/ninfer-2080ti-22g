@@ -29,6 +29,9 @@ void launch_q5_volta_mma(const Tensor& x, const Weight& w, Tensor& out, bool add
 void launch_q5_gemv_r16_s2_x(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q5_simt_r8_c4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q5_simt_r8_c8(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q5_simt_r8_c5(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q5_simt_r8_c6(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
+void launch_q5_simt_r8_c7(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q5_simt_r4_c16(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_q5_simt_split2_exact(const Tensor& x, const Weight& w, Tensor& out,
                                  cudaStream_t stream);

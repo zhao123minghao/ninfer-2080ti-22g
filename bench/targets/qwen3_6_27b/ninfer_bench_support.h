@@ -62,7 +62,7 @@ struct BenchOptions {
     int warmup      = kDefaultWarmup;
     std::optional<std::uint32_t> max_context;
     std::uint32_t prefill_chunk    = kDefaultPrefillChunk;
-    KvCacheStorage kv_cache        = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache        = KvCacheStorage::Float16;
     std::uint32_t mtp_draft_tokens = 0;
     ProposalHead proposal_head     = ProposalHead::Full;
     int device                     = 0;
@@ -117,7 +117,7 @@ struct BenchEnvironment {
 
     std::uint32_t max_context                      = 0;
     std::uint32_t prefill_chunk                    = kDefaultPrefillChunk;
-    KvCacheStorage kv_cache                        = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache                        = KvCacheStorage::Float16;
     std::uint32_t mtp_draft_tokens                 = 0;
     ProposalHead proposal_head                     = ProposalHead::Full;
     bool use_cuda_graph                            = true;

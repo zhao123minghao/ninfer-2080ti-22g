@@ -33,9 +33,9 @@
 // registered contract, and the parity leg holds the split output no further from the tp1 output
 // than the contract allows either of them to sit from the oracle. Parity is NOT bit-exact and
 // cannot be: the split-KV decode route stores its per-split partial accumulators in BF16, and
-// the tp2 geometry's DecodeSplitScale of 2 (which keeps each device's 170-SM board full at half
-// the KV heads) makes the split count, and hence the partition of the reduction, differ from
-// tp1's. The observed numbers are printed by NINFER_OP_REPORT_STATS=1.
+// the tp2 geometry's DecodeSplitScale of 2 doubles the split count (`Geometry::DecodeSplits` is
+// `DecodeSplitScale * <a base the target's SM count sets>`), so the partition of the reduction
+// differs from tp1's. The observed numbers are printed by NINFER_OP_REPORT_STATS=1.
 //
 // Every case REQUIRES two CUDA devices driven from ONE process; with fewer than two visible
 // devices the suite reports the repository's skip code (77) instead of failing.
@@ -139,11 +139,11 @@ HostCache slice_cache_heads(const HostCache& source, int rank) {
     const std::int32_t begin = local_kv_head_begin(rank);
     const std::int32_t count = kLocalGeometry.kv_heads;
     HostCache result{kLocalGeometry, source.dtype, source.max_context, source.logical_capacity};
-    if (source.dtype == DType::BF16) {
-        result.k_bf16 =
-            slice_head_major(source.k_bf16, kHeadDim, source.logical_capacity, begin, count);
-        result.v_bf16 =
-            slice_head_major(source.v_bf16, kHeadDim, source.logical_capacity, begin, count);
+    if (source.dtype == DType::FP16) {
+        result.k_f16 =
+            slice_head_major(source.k_f16, kHeadDim, source.logical_capacity, begin, count);
+        result.v_f16 =
+            slice_head_major(source.v_f16, kHeadDim, source.logical_capacity, begin, count);
         return result;
     }
     result.k_i8  = slice_head_major(source.k_i8, kHeadDim, source.logical_capacity, begin, count);
@@ -388,8 +388,8 @@ std::vector<double> slice_output_heads(const std::vector<double>& global_value, 
 // tp1 side), so by the triangle inequality their difference is bounded by TWICE that criterion.
 // This factor is that bound, not a fitted tolerance -- and it is needed, because the split does
 // not reproduce tp1's arithmetic bit for bit: the split-KV decode route rounds its per-split
-// partial accumulators to BF16 and the tp2 geometry's DecodeSplitScale=2 changes the number of
-// splits, hence the partition of the reduction.
+// partial accumulators to BF16 and the tp2 geometry's DecodeSplitScale=2 doubles the split count,
+// hence the partition of the reduction.
 constexpr double kParityBound = 2.0;
 
 ReductionCriterion scaled(const ReductionCriterion& criterion, double factor) {
@@ -533,8 +533,8 @@ int run_case(DType dtype, const HeadLocalCase& test_case, bool sampled_prefill_o
     // Distinctness: if the two devices' pools carried the same bytes, every head-mapping check
     // below would be vacuous. make_cache generates per-head-distinct data; assert it.
     if (dtype == DType::BF16) {
-        if (local_initial[0].k_bf16 == local_initial[1].k_bf16 ||
-            local_initial[0].v_bf16 == local_initial[1].v_bf16) {
+        if (local_initial[0].k_f16 == local_initial[1].k_f16 ||
+            local_initial[0].v_f16 == local_initial[1].v_f16) {
             std::cerr << label << ": the two devices' KV pools are byte-identical, so head "
                                  "mapping is untested\n";
             ++failures;
@@ -916,7 +916,7 @@ int main(int argc, char** argv) {
         {"gqa_attention_cached", 6, 61, 512, MappingPattern::Identity, 1203u},
         {"gqa_attention_cached", 17, 31, 48, MappingPattern::Identity, 1204u},
     };
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    for (const DType dtype : {DType::FP16, DType::I8}) {
         for (const HeadLocalCase& test_case : cases) { failures += run_case(dtype, test_case); }
         // W in (6,16] with B>1 is the only route into GqaAttentionRoute::ChunkedSmallT for a
         // 12-head geometry; W<=6 with B>1 is SmallT with MultiBatch=true.

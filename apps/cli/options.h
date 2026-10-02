@@ -26,7 +26,8 @@ struct Options {
     double yarn_factor           = 4.0;
     std::uint32_t yarn_origin    = 262144;
     KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
-    std::uint32_t prefill_chunk  = 1024;
+    // Mirrors EngineOptions' default; see the note there for the measurement behind it.
+    std::uint32_t prefill_chunk  = 8192;
     int device                   = 0;
     int tp                       = 1;
     // Resolved device ids, one per tp rank. Always populated by parse_options() (from --devices,
@@ -34,7 +35,7 @@ struct Options {
     // EngineOptions::devices.
     std::vector<int> devices;
 
-    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache = KvCacheStorage::Float16;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     bool use_cuda_graph = true;

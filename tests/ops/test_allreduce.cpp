@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -75,6 +76,36 @@ void retire_staging(const ExecutionContext& ec) {
         set_device(ec, rank);
         cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
     }
+}
+
+// The pinned staging the staged peer route uses is allocated once, at the declared bound, and
+// never moved: a captured CUDA Graph bakes its address into the D2H/H2D copy nodes, so relocating
+// it would leave every replayed collective reading freed host memory (history.md 5.4). A
+// collective that presents a larger payload must therefore report an error. This case pins that
+// behaviour, which is the only thing standing between an undersized declaration and silent
+// memory corruption.
+int run_oversize_rejection_case(const ExecutionContext& ec, const ops::PeerEvents& events,
+                                std::size_t declared_bytes) {
+    const std::size_t bytes = declared_bytes + sizeof(std::uint16_t);
+    const auto elements     = static_cast<std::int32_t>(bytes / sizeof(std::uint16_t));
+
+    set_device(ec, 0);
+    GuardedDeviceBuffer buffer_0(bytes), staging_0(bytes);
+    set_device(ec, 1);
+    GuardedDeviceBuffer buffer_1(bytes), staging_1(bytes);
+
+    const std::array<Tensor, 2> buffer{Tensor(buffer_0.data(), DType::BF16, {elements, 1}),
+                                       Tensor(buffer_1.data(), DType::BF16, {elements, 1})};
+    const std::array<Tensor, 2> staging{Tensor(staging_0.data(), DType::BF16, {elements, 1}),
+                                        Tensor(staging_1.data(), DType::BF16, {elements, 1})};
+    try {
+        ops::allreduce_sum(buffer, staging, ec, events);
+    } catch (const std::exception& error) {
+        std::cout << "oversize payload rejected: " << error.what() << '\n';
+        return 0;
+    }
+    std::cerr << "allreduce accepted a payload above the declared staging bound\n";
+    return 1;
 }
 
 // `ne0` is the contiguous dimension and `ne1` the outer one, so a 1-D buffer passes ne1 == 1 and
@@ -382,12 +413,17 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
+    // Widest payload this suite presents: the [5120, 1024] row gather, 512 rows x 5120 row length
+    // x 2 B = 5 MiB. The pinned staging is sized for the declared bound once and never moved, so
+    // the bound has to cover every case below; run_oversize_rejection_case() pins that a payload
+    // above it is refused rather than relocated.
+    constexpr std::size_t kPeerStagingBytes = 8u << 20;
+    const bool peer_access = ops::enable_peer_access(ec, kPeerStagingBytes);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (explicit pinned host staging)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, kPeerStagingBytes);
 
     int failures = 0;
     // Real decode shape first: 5120 is the hidden dimension all-reduced 128 times per token.
@@ -407,6 +443,7 @@ int main() {
 
     failures += run_chained_case(ec, events);
     failures += run_microbenchmark(ec, events);
+    failures += run_oversize_rejection_case(ec, events, kPeerStagingBytes);
 
     std::cout << (failures ? "FAIL" : "OK") << " allreduce\n";
     return failures ? 1 : 0;

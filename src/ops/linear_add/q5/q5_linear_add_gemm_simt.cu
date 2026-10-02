@@ -75,9 +75,17 @@ void q5_linear_add_split2_exact_launch(const Tensor& x, const Weight& w, Tensor&
 // parameter (unlike split2's compile-time Cols switch above), so a single instantiation covers
 // any T. AddResidual reuses the exact accumulate-before-store pattern split2 already validated.
 // See the V100 performance summary.
-void q5_linear_add_simt_wide_t_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                      cudaStream_t stream) {
-    constexpr int kColsPerTile  = 8;
+//
+// Also the tp2 row-parallel shard's decode leaf (T == 1 at K = 3072 / 8704), where it replaces the
+// 16x-wasteful MmaResidualR64C16 tile. Tile width follows the same rule ops::linear's own q5 SIMT
+// table uses (q5_rowsplit_gemm_simt.cu): four columns for the T<=4 regime -- one whole four-column
+// tile, the smallest the schedule has -- and eight for the wider T this fallback was written for.
+// At T == 1 a four-column tile costs half the wasted per-tile MMA/issue overhead of an eight-column
+// one, and the two extents never overlap, so the split costs the original T=14..16 caller nothing.
+template <int ColsPerTile>
+void launch_simt_residual(const Tensor& x, const Weight& w, Tensor& residual_out,
+                          cudaStream_t stream) {
+    constexpr int kColsPerTile  = ColsPerTile;
     constexpr int kRowsPerBlock = 8;
     constexpr int kStages       = 2;
     constexpr int kThreads      = kRowsPerBlock * 32;
@@ -90,21 +98,46 @@ void q5_linear_add_simt_wide_t_launch(const Tensor& x, const Weight& w, Tensor& 
     // full_slabs>0 enables the staged/vectorized prefetch path instead of routing every group
     // through the scalar tail (direct global reads). Every offset q5_simt_consume_slab derives
     // from x0 (xslab = slab*1024 elems, c*256 elems, lane*8 elems) is a multiple of 16 bytes in
-    // bf16 units, and k (6144 or 17408, this op's only two supported shapes) is itself a
-    // multiple of 1024, so a single runtime check on x.data's own alignment is sufficient to
-    // guarantee every subsequent load_vec<uint4> stays 16-byte aligned -- see
-    // q5_rowsplit_gemm_simt.cuh's q5_simt_consume_slab. Falls back to the always-correct
-    // full_slabs=0 scalar tail if that check fails.
-    const bool staged_safe = (k % 1024) == 0 &&
+    // bf16 units, so a single runtime check on x.data's own alignment is sufficient to guarantee
+    // every subsequent load_vec<uint4> stays 16-byte aligned -- see
+    // q5_rowsplit_gemm_simt.cuh's q5_simt_consume_slab. What remains past full_slabs*1024 is
+    // swept by the always-correct scalar tail, so K need not be a multiple of 1024 (the tp2
+    // row-parallel shard halves, 3072 and 8704, are exactly that case). Falls back to the
+    // all-scalar full_slabs=0 path if that alignment check fails. This is the same predicate
+    // ops::linear's own q5 SIMT launcher uses (q5_rowsplit_gemm_simt.cu's launch_simt), which is
+    // what the shard's residual-free rank already runs.
+    const bool staged_safe = (k % 8) == 0 &&
                              (reinterpret_cast<std::uintptr_t>(x.data) % 16) == 0;
     const std::int32_t full_slabs = staged_safe ? (k / 1024) : 0;
     q5_rowsplit_gemm_simt_kernel<Q5RowSplitSimtSchedule, kColsPerTile, kRowsPerBlock, kStages,
-                                 false, 0, true><<<grid, kThreads, 0, stream>>>(
+                                 false, 0, true, 1><<<grid, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
         static_cast<__nv_bfloat16*>(residual_out.data), nullptr, rows, out_ld, k, cols,
         w.padded_shape[1], full_slabs);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void q5_linear_add_simt_wide_t_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
+                                      cudaStream_t stream) {
+    // Exact tile widths for the 5..7 column windows. Those widths are reachable: a round is
+    // (1 + draft) columns wide, so draft 4..6 lands here, and before this switch they were served
+    // by the eight-column tile -- a whole extra tile row charged for a partial one. Measured on the
+    // 85k acceptance workload at T=5 (`--draft-tokens 4`), the selected instantiation was
+    // kColsPerTile=8 and cost 189.7us/launch against 96.6us/launch for kColsPerTile=4 at T=4, i.e.
+    // 1.96x the work for 1.25x the columns (history.md and todo.md's column-tile note). At T=8 and
+    // above the eight-column tile is exact again, and T<=4 keeps its four-column tile.
+    switch (x.ne[1]) {
+    case 5: launch_simt_residual<5>(x, w, residual_out, stream); return;
+    case 6: launch_simt_residual<6>(x, w, residual_out, stream); return;
+    case 7: launch_simt_residual<7>(x, w, residual_out, stream); return;
+    default: break;
+    }
+    if (x.ne[1] <= 4) {
+        launch_simt_residual<4>(x, w, residual_out, stream);
+        return;
+    }
+    launch_simt_residual<8>(x, w, residual_out, stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -24,8 +24,14 @@ inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 
+// KV cache element format. `Float16` is the unquantized choice: fp16 is the tensor-core
+// operand format on every supported target (Volta/Turing mma.sync takes fp16 operands, and the
+// Ampere+ kernels restage their bf16 fragments into fp16 as well), so storing fp16 means the
+// attention kernels read the cache straight into their operands instead of converting every
+// staged element on every key-tile walk. The K/V activations arrive as bf16 and are widened
+// once, at the cache write. `Int8Group64` trades group-64 INT8 codes for half the bytes.
 enum class KvCacheStorage : std::uint8_t {
-    BFloat16,
+    Float16,
     Int8Group64,
 };
 
@@ -117,8 +123,14 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
-    KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Prefill scheduling granularity. Every chunk re-materializes each layer's fp16 weights and
+    // re-reads the whole already-cached prefix in the prefill attention, so the per-token cost of
+    // both falls as 1/chunk: at 8192 against 1024, the 32K prefill measures 845.6 -> 912.8 tok/s
+    // and the 85k prefill 667.3 -> 722.5, with a bit-identical acceptance rate (todo.md 8.1).
+    // Larger is not better: 16384 measures the same as 8192, and a single chunk covering a 32K
+    // prompt exceeds the runtime reservation and is rejected at startup.
+    std::uint32_t prefill_chunk        = 8192;
+    KvCacheStorage kv_cache            = KvCacheStorage::Float16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;
@@ -466,7 +478,7 @@ struct MemorySummary {
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
     std::uint32_t kv_capacity_page_groups     = 0;
     std::uint32_t kv_capacity_max_page_groups = 0;
-    KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
+    KvCacheStorage kv_cache                   = KvCacheStorage::Float16;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;

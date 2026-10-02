@@ -39,7 +39,7 @@ constexpr double kRtx5090DramGBs      = 1792.0;
 
 enum class Mode : std::uint8_t { Full, Prefix, All };
 enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
-enum class KvChoice : std::uint8_t { Bf16, Int8, All };
+enum class KvChoice : std::uint8_t { F16, Int8, All };
 enum class LayoutChoice : std::uint8_t { Paged, Cyclic, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
 enum class CacheMode : std::uint8_t { Cold, Warm, Both };
@@ -86,7 +86,7 @@ struct Result {
     std::fprintf(stderr,
                  "error: %s\n"
                  "usage: ninfer_kv_cache_append_bench [--mode full|prefix|all] "
-                 "[--full-geometry d256-kv4|d256-kv2|all] [--kv-dtype bf16|int8|all] "
+                 "[--full-geometry d256-kv4|d256-kv2|all] [--kv-dtype fp16|int8|all] "
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
                  "[--context L] [--execution eager|graph|both] [--cache cold|warm|both] "
                  "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
@@ -153,14 +153,14 @@ Options parse_options(int argc, char** argv) {
                 usage("--full-geometry expects d256-kv4, d256-kv2, or all");
         } else if (argument == "--kv-dtype") {
             const std::string_view value(next("--kv-dtype requires a value"));
-            if (value == "bf16")
-                options.kv = KvChoice::Bf16;
+            if (value == "fp16")
+                options.kv = KvChoice::F16;
             else if (value == "int8")
                 options.kv = KvChoice::Int8;
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, or all");
+                usage("--kv-dtype expects fp16, int8, or all");
         } else if (argument == "--layout") {
             const std::string_view value(next("--layout requires a value"));
             if (value == "paged")
@@ -332,23 +332,23 @@ PagedKVBatchLayerView make_prefix_paged_view(DeviceBuffer& k, DeviceBuffer& v,
                                              DeviceBuffer& block_tables) {
     return {
         .k_pages = Tensor(
-            k.p, DType::BF16,
+            k.p, DType::FP16,
             {kPrefixHeadDim, kPagedKVPageSize, kRingCapacity / kPagedKVPageSize, kPrefixKvHeads}),
         .v_pages = Tensor(
-            v.p, DType::BF16,
+            v.p, DType::FP16,
             {kPrefixHeadDim, kPagedKVPageSize, kRingCapacity / kPagedKVPageSize, kPrefixKvHeads}),
         .block_tables = Tensor(block_tables.p, DType::I32, {kRingCapacity / kPagedKVPageSize, 1}),
         .head_dim     = kPrefixHeadDim,
         .num_kv_heads = kPrefixKvHeads,
-        .dtype        = DType::BF16,
+        .dtype        = DType::FP16,
         .quant_group  = 0,
     };
 }
 
 CyclicKVCacheLayerView make_prefix_cyclic_view(DeviceBuffer& k, DeviceBuffer& v) {
     return {
-        .k        = Tensor(k.p, DType::BF16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads, 1}),
-        .v        = Tensor(v.p, DType::BF16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads, 1}),
+        .k        = Tensor(k.p, DType::FP16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads, 1}),
+        .v        = Tensor(v.p, DType::FP16, {kPrefixHeadDim, kRingCapacity, kPrefixKvHeads, 1}),
         .capacity = kRingCapacity,
         .padded_capacity = kRingCapacity,
         .num_kv_heads    = kPrefixKvHeads,
@@ -432,7 +432,7 @@ private:
 
 const char* mode_name(Mode mode) { return mode == Mode::Full ? "full" : "prefix"; }
 
-const char* dtype_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "int8"; }
+const char* dtype_name(DType dtype) { return dtype == DType::FP16 ? "fp16" : "int8"; }
 
 const char* execution_name(Execution execution) {
     return execution == Execution::Eager ? "eager" : "graph";
@@ -441,8 +441,8 @@ const char* execution_name(Execution execution) {
 const char* cache_name(CacheState cache) { return cache == CacheState::Cold ? "cold" : "warm"; }
 
 double full_vector_bytes(DType dtype) {
-    return dtype == DType::BF16
-               ? static_cast<double>(kFullHeadDim * dtype_size(DType::BF16))
+    return dtype == DType::FP16
+               ? static_cast<double>(kFullHeadDim * dtype_size(DType::FP16))
                : static_cast<double>(kFullHeadDim * dtype_size(DType::I8) +
                                      (kFullHeadDim / kKvGroup) * dtype_size(DType::FP16));
 }
@@ -540,9 +540,9 @@ std::vector<FullGeometry> selected_geometries(FullGeometryChoice choice) {
 }
 
 std::vector<DType> selected_dtypes(KvChoice choice) {
-    if (choice == KvChoice::Bf16) return {DType::BF16};
+    if (choice == KvChoice::F16) return {DType::FP16};
     if (choice == KvChoice::Int8) return {DType::I8};
-    return {DType::BF16, DType::I8};
+    return {DType::FP16, DType::I8};
 }
 
 template <class Case>
@@ -643,7 +643,7 @@ int main(int argc, char** argv) {
                     for (const std::int32_t committed : options.counts) {
                         if (committed > tokens) { continue; }
                         PrefixCase data(tokens, committed, cyclic);
-                        collect_case(data, Mode::Prefix, "d128-kv8", DType::BF16,
+                        collect_case(data, Mode::Prefix, "d128-kv8", DType::FP16,
                                      cyclic ? "cyclic" : "paged", tokens, committed,
                                      prefix_useful_bytes(committed), options, flush, stream,
                                      results);

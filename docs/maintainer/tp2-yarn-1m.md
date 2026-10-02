@@ -52,9 +52,12 @@ changes the cost, not the code shape.
 That is a measured property of that pair, not a platform rule, and startup tests it instead of
 inferring it. Whenever both directions advertise peer access, the direct route is enabled and then
 required to copy exact payloads through the collectives' own UVA D2D form at every size they move --
-up to and including the full 64 MiB host-staging cap -- plus a sliced walk covering every mapping of
-that buffer. Only a fully exact probe selects it; otherwise both directions are disabled and the
-staged route is validated and used. A Linux IOMMU `DMA`/`DMA-FQ` domain is reported in the diagnostic
+bracketing the payload range up to and including the largest collective the engine can present --
+plus a sliced walk covering every mapping of that buffer. Only a fully exact probe selects it;
+otherwise both directions are disabled and the staged route is validated and used. The staged route's
+pinned slots are sized once, for that same declared bound, and never moved: a captured graph bakes
+their address into its copy nodes, so a collective larger than the declared bound reports an error
+instead of relocating storage an already-instantiated graph still points at. A Linux IOMMU `DMA`/`DMA-FQ` domain is reported in the diagnostic
 but is not by itself disqualifying: reading the domain string as a verdict retired a working link. On
 the RTX 2080 Ti pair this checkout is developed against, both cards report `DMA-FQ`,
 `cudaDeviceEnablePeerAccess` succeeds, every probe is exact, and one 10 KiB collective costs 7.3 us

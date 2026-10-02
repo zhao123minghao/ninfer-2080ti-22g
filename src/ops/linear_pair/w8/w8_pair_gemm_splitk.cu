@@ -106,6 +106,25 @@ void launch_medium(const Tensor& x, const Weight& first_weight, const Weight& se
             static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, output, x.ne[1]);
 }
 
+// Cover a column range wider than the largest medium tile by tiling the columns. Each slice is its
+// own launch of the widest tile the arch can stage, so the last (narrower) slice just leaves the
+// trailing warps with no columns to compute. The kernels address the output through the view's own
+// leading dimension, so a column-sliced view writes the parent's columns.
+template <int TileCols, int KSplits, int NGroups, int MinBlocks>
+void launch_medium_tiled(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
+                         Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
+    for (std::int32_t offset = 0; offset < x.ne[1]; offset += TileCols) {
+        const std::int32_t remaining = x.ne[1] - offset;
+        const std::int32_t count     = remaining < TileCols ? remaining : TileCols;
+        Tensor x_slice               = x.slice(1, offset, count);
+        Tensor first_slice           = first_out.slice(1, offset, count);
+        Tensor second_slice          = second_out.slice(1, offset, count);
+        launch_medium<TileCols, KSplits, NGroups, MinBlocks>(x_slice, first_weight, second_weight,
+                                                            first_slice, second_slice, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
 } // namespace
 
 void w8_pair_splitk_exact_t_launch(const Tensor& x, const Weight& first_weight,
@@ -202,27 +221,29 @@ void w8_pair_splitk_medium_launch(W8PairScheduleId schedule, const Tensor& x,
             return;
         }
         break;
+    // 160 is the widest tile this kernel can stage on Turing: the activation staging is
+    // KSplits * TileCols * 128 bytes (2 * 160 * 128 = 40,960) plus 16 * kGroupK = 2 KiB of code
+    // staging, i.e. 43,008 B of the 48 KiB static budget. 192 columns would already need 50,176 B,
+    // so a tail wider than 160 cannot be one launch. It was previously dispatched to the 160-column
+    // tile anyway, which is narrower than its own range and left columns [160, T) unwritten.
     case W8PairScheduleId::DualSplitKMediumC192:
         if (x.ne[1] <= 192) {
-            launch_medium<160, 2, 2, 2>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
+            launch_medium_tiled<160, 2, 2, 2>(x, first_weight, second_weight, first_out, second_out,
+                                              stream);
             return;
         }
         break;
     case W8PairScheduleId::DualSplitKMediumC224:
         if (x.ne[1] <= 224) {
-            launch_medium<160, 2, 2, 2>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
+            launch_medium_tiled<160, 2, 2, 2>(x, first_weight, second_weight, first_out, second_out,
+                                              stream);
             return;
         }
         break;
     case W8PairScheduleId::DualSplitKMediumC256:
         if (x.ne[1] <= 256) {
-            launch_medium<160, 2, 2, 2>(x, first_weight, second_weight, first_out, second_out,
-                                        stream);
-            CUDA_CHECK(cudaGetLastError());
+            launch_medium_tiled<160, 2, 2, 2>(x, first_weight, second_weight, first_out, second_out,
+                                              stream);
             return;
         }
         break;

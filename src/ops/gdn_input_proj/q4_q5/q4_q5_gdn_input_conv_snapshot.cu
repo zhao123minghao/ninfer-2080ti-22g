@@ -28,8 +28,8 @@ constexpr int kQkRows      = kQueryRows + kKeyRows;
 constexpr int kChannels    = kQkRows + kValueRows;
 constexpr int kValueOffset = kQkRows;
 
-using Q4ScheduleC4 = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
-using Q4ScheduleC8 = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
+using Q4ScheduleC4 = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 3>;
+using Q4ScheduleC8 = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 3>;
 
 enum class PdlOrder {
     Q4ThenQ5,

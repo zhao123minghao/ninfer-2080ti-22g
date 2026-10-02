@@ -66,25 +66,25 @@ q36::DecoderStateSpec decoder_spec(ninfer::DType dtype, bool mtp) {
 }
 
 void test_decoder_layout() {
-    ninfer::LayoutBuilder bf16_builder;
-    const q36::DecoderStateLayout bf16 =
-        q36::plan_decoder_state(bf16_builder, decoder_spec(ninfer::DType::BF16, false));
-    (void)bf16_builder.finish(256);
-    expect(bf16.text_kv.pool.planes.size() == 4, "BF16 Text KV has K/V planes per layer");
-    expect(bf16.text_kv.pool.spec.page_group_count == 5 &&
-               bf16.text_kv.pool.spec.logical_page_capacity == 3 &&
-               bf16.text_kv.pool.spec.table_rows == 1,
+    ninfer::LayoutBuilder fp16_builder;
+    const q36::DecoderStateLayout fp16 =
+        q36::plan_decoder_state(fp16_builder, decoder_spec(ninfer::DType::FP16, false));
+    (void)fp16_builder.finish(256);
+    expect(fp16.text_kv.pool.planes.size() == 4, "FP16 Text KV has K/V planes per layer");
+    expect(fp16.text_kv.pool.spec.page_group_count == 5 &&
+               fp16.text_kv.pool.spec.logical_page_capacity == 3 &&
+               fp16.text_kv.pool.spec.table_rows == 1,
            "Text KV separates five physical pages from three logical pages");
-    expect(std::all_of(bf16.text_kv.pool.planes.begin(), bf16.text_kv.pool.planes.end(),
+    expect(std::all_of(fp16.text_kv.pool.planes.begin(), fp16.text_kv.pool.planes.end(),
                        [](const ninfer::PagedKVPlaneLayout& plane) {
-                           return plane.spec.dtype == ninfer::DType::BF16;
+                           return plane.spec.dtype == ninfer::DType::FP16;
                        }),
-           "BF16 KV has no scale planes");
-    expect(!bf16.mtp_kv.has_value(), "disabled MTP omits KV storage");
-    expect(bf16.linear_attention.conv.size() == 3 && bf16.linear_attention.recurrent.size() == 3,
+           "FP16 KV has no scale planes");
+    expect(!fp16.mtp_kv.has_value(), "disabled MTP omits KV storage");
+    expect(fp16.linear_attention.conv.size() == 3 && fp16.linear_attention.recurrent.size() == 3,
            "Linear Attention layer storage");
-    expect(bf16.linear_attention.spec.slot_count == 4, "Linear Attention slot geometry");
-    expect(bf16.kv_payload_bytes() == bf16.text_kv.payload_bytes(), "BF16 KV payload accounting");
+    expect(fp16.linear_attention.spec.slot_count == 4, "Linear Attention slot geometry");
+    expect(fp16.kv_payload_bytes() == fp16.text_kv.payload_bytes(), "FP16 KV payload accounting");
 
     ninfer::LayoutBuilder int8_builder;
     const q36::DecoderStateLayout int8 =

@@ -24,6 +24,20 @@ int q5_a16_conformance() {
     failures += ninfer::test::linear_add::run_shape(
         "Q5_A16 LinearAdd", WeightFormat::Q5G64F16S,
         ShapeCase{5120, 17408, 409U, kK17408RouteStarts, kK17408RouteInteriors});
+
+    // TP2 row-parallel shard extents: o_proj / gdn output (6144 -> 3072) and mlp down
+    // (17408 -> 8704), each with K halved. Only the shard reaches these geometries, and its
+    // small-T edge is the widest decode round the engine forms -- concurrency * (1 + draft), not
+    // the single-request 1 + draft -- so a single-request sweep never visits the concurrency
+    // widths (7..12) that used to fall through to the prefill MMA tile.
+    constexpr std::array<std::int32_t, 5> kShardRouteStarts{2, 13, 33, 49, 129};
+    constexpr std::array<std::int32_t, 7> kShardRouteInteriors{1, 6, 8, 12, 24, 40, 256};
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd shard", WeightFormat::Q5G64F16S,
+        ShapeCase{5120, 3072, 809U, kShardRouteStarts, kShardRouteInteriors});
+    failures += ninfer::test::linear_add::run_shape(
+        "Q5_A16 LinearAdd shard", WeightFormat::Q5G64F16S,
+        ShapeCase{5120, 8704, 811U, kShardRouteStarts, kShardRouteInteriors});
     return failures;
 }
 

@@ -112,7 +112,7 @@ template <int kKVHeads>
 __global__ void volta_flash_append_kv_kernel(
         const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
         const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ table_rows,
-        __nv_bfloat16* __restrict__ k_pages, __nv_bfloat16* __restrict__ v_pages,
+        half* __restrict__ k_pages, half* __restrict__ v_pages,
         const std::int32_t* __restrict__ block_tables, int logical_pages, int width) {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
@@ -126,8 +126,8 @@ __global__ void volta_flash_append_kv_kernel(
     const std::int64_t src =
         static_cast<std::int64_t>(d) + kHeadDim * (h + static_cast<std::int64_t>(kKVHeads) * t);
 
-    k_pages[dst] = k[src];
-    v_pages[dst] = v[src];
+    k_pages[dst] = bf16_to_f16(k[src]);
+    v_pages[dst] = bf16_to_f16(v[src]);
 }
 
 __device__ __forceinline__ float volta_flash_warp_max(float value) {
@@ -197,12 +197,12 @@ __launch_bounds__(256) __global__ void volta_flash_append_kv_i8_kernel(
     }
 }
 
-// Paged BF16 -> contiguous FP16, one launch per layer over the whole visible key
+// Paged FP16 -> contiguous FP16, one launch per layer over the whole visible key
 // range. ~50 MB of traffic per layer at 12K against the seconds the chunked route
 // spends re-walking the key range; see the cost note in the plan.
 template <int kKVHeads>
 __global__ void volta_flash_gather_kv_kernel(
-        const __nv_bfloat16* __restrict__ k_pages, const __nv_bfloat16* __restrict__ v_pages,
+        const half* __restrict__ k_pages, const half* __restrict__ v_pages,
         const std::int32_t* __restrict__ block_tables, const std::int32_t* __restrict__ table_rows,
         int logical_pages, half* __restrict__ k_out, half* __restrict__ v_out, int n_kv,
         int n_kv_padded) {
@@ -225,8 +225,8 @@ __global__ void volta_flash_gather_kv_kernel(
     const std::int32_t* block_table = select_block_table(block_tables, table_rows, logical_pages);
     const std::int64_t src = paged_kv_element_offset<kHeadDim, kKVHeads>(block_table, h, key, d);
 
-    k_out[dst] = __float2half(__bfloat162float(k_pages[src]));
-    v_out[dst] = __float2half(__bfloat162float(v_pages[src]));
+    k_out[dst] = k_pages[src];
+    v_out[dst] = v_pages[src];
 }
 
 // Paged INT8-G64 -> contiguous FP16. Dequantizing once here preserves the
@@ -483,8 +483,8 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     } else {
         volta_flash_append_kv_kernel<kKVHeads><<<dim3(width, kKVHeads), kHeadDim, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-            position_ptr, rows, static_cast<__nv_bfloat16*>(cache.k_pages.data),
-            static_cast<__nv_bfloat16*>(cache.v_pages.data), block_tables, logical_pages, width);
+            position_ptr, rows, static_cast<half*>(cache.k_pages.data),
+            static_cast<half*>(cache.v_pages.data), block_tables, logical_pages, width);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -503,10 +503,10 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     } else {
         volta_flash_gather_kv_kernel<kKVHeads>
             <<<dim3(n_kv_alloc, kKVHeads), kHeadDim, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(cache.k_pages.data),
-                static_cast<const __nv_bfloat16*>(cache.v_pages.data), block_tables, rows,
-                logical_pages, static_cast<half*>(k_gathered.data),
-                static_cast<half*>(v_gathered.data), n_kv_total, n_kv_alloc);
+                static_cast<const half*>(cache.k_pages.data),
+                static_cast<const half*>(cache.v_pages.data), block_tables, rows, logical_pages,
+                static_cast<half*>(k_gathered.data), static_cast<half*>(v_gathered.data), n_kv_total,
+                n_kv_alloc);
     }
     CUDA_CHECK(cudaGetLastError());
 

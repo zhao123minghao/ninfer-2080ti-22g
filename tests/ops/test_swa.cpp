@@ -4,6 +4,8 @@
 #include "core/cyclic_kv_cache.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -55,6 +57,17 @@ std::size_t context_index(int d, int kv_head, int slot) {
 std::vector<std::uint16_t> bf16_bits(const std::vector<float>& values) {
     std::vector<std::uint16_t> bits(values.size());
     for (std::size_t i = 0; i < values.size(); ++i) bits[i] = f32_to_bf16(values[i]);
+    return bits;
+}
+
+// The sliding-window context cache stores fp16: a bf16-rounded context value widens into fp16
+// (exact over fp16's normal range), which is what the cache write does for a real activation.
+std::vector<std::uint16_t> cache_f16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        const __half widened = __float2half_rn(bf16_to_f32(f32_to_bf16(values[i])));
+        bits[i]              = *reinterpret_cast<const std::uint16_t*>(&widened);
+    }
     return bits;
 }
 
@@ -116,8 +129,8 @@ void swa_oracle(const std::vector<float>& q, const std::vector<float>& query_k,
 
 CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, int lane_capacity = 1) {
     return {
-        .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
-        .v               = Tensor(v.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
+        .k               = Tensor(k.p, DType::FP16, {kD, kWindow, kKVHeads, lane_capacity}),
+        .v               = Tensor(v.p, DType::FP16, {kD, kWindow, kKVHeads, lane_capacity}),
         .capacity        = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKVHeads,
@@ -181,8 +194,8 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     const auto q_expected         = bf16_bits(q);
     const auto query_k_expected   = bf16_bits(query_k);
     const auto query_v_expected   = bf16_bits(query_v);
-    const auto context_k_expected = bf16_bits(context_k);
-    const auto context_v_expected = bf16_bits(context_v);
+    const auto context_k_expected = cache_f16_bits(context_k);
+    const auto context_v_expected = cache_f16_bits(context_v);
 
     DeviceBuffer d_q         = to_device(q_expected);
     DeviceBuffer d_query_k   = to_device(query_k_expected);
@@ -273,8 +286,8 @@ int run_batch_case() {
     DeviceBuffer d_q         = to_device(bf16_bits(q));
     DeviceBuffer d_query_k   = to_device(bf16_bits(query_k));
     DeviceBuffer d_query_v   = to_device(bf16_bits(query_v));
-    DeviceBuffer d_context_k = to_device(bf16_bits(context_k));
-    DeviceBuffer d_context_v = to_device(bf16_bits(context_v));
+    DeviceBuffer d_context_k = to_device(cache_f16_bits(context_k));
+    DeviceBuffer d_context_v = to_device(cache_f16_bits(context_v));
     DeviceBuffer d_positions = to_device_i32(positions);
     DeviceBuffer d_valid     = to_device(valid);
     DeviceBuffer d_lanes     = to_device(lanes);

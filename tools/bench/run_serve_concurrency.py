@@ -138,6 +138,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=8192,
         help="per-request output budget for decode-saturation (default: 8192)",
     )
+    parser.add_argument(
+        "--draft-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="override the MTP draft window selected by --mode (default: from --mode)",
+    )
     parser.add_argument("--max-context", type=int, default=262144)
     parser.add_argument(
         "--kv-capacity",
@@ -146,6 +153,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="shared Main KV capacity passed to ninfer-serve (default: 262144)",
     )
     parser.add_argument("--prefill-chunk", type=int, default=1024)
+    parser.add_argument(
+        "--kv-dtype",
+        choices=("fp16", "int8"),
+        default="fp16",
+        help="KV cache storage passed to ninfer-serve (default: fp16)",
+    )
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
@@ -223,6 +236,13 @@ def build_points(
             backend, draft_tokens = corpus.SPECULATIVE_MODES[mode_name]
             if backend == "dflash" and target != "qwen3_6_35b_a3b":
                 raise corpus.CampaignError("DFlash measurements require the 35B-A3B target")
+            if args.draft_tokens is not None:
+                if backend != "mtp":
+                    raise corpus.CampaignError("--draft-tokens requires an mtp --mode")
+                if args.draft_tokens < 1:
+                    raise corpus.CampaignError("--draft-tokens must be positive")
+                draft_tokens = args.draft_tokens
+                mode_name = f"mtp{draft_tokens}"
             for suite in args.suite:
                 for concurrency in args.concurrency:
                     points.append(
@@ -336,7 +356,7 @@ def server_command(
         "--request-log-jsonl",
         str(server_log),
         "--kv-dtype",
-        "int8",
+        args.kv_dtype,
         "--no-prefix-reuse",
     ]
     if args.tp != 1:
@@ -388,7 +408,7 @@ def validate_server_start(
         "pending_timeout_ms": PENDING_TIMEOUT_MS,
         "prefill_chunk": args.prefill_chunk,
         "log_stats_interval_ms": STATS_INTERVAL_MS,
-        "kv_cache": "int8-group64",
+        "kv_cache": "fp16" if args.kv_dtype == "fp16" else "int8-group64",
         "cuda_graph": True,
         "prefix_reuse": False,
         "speculative_backend": point.speculative_backend,
@@ -1069,7 +1089,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"# {point.key}: {len(jobs)} request(s), "
                 f"order={workload_order_label(point)}"
             )
-            print(shlex.join(server_command(serve, point, log_path, args)))
+            print(" ".join(shlex.quote(part) for part in server_command(serve, point, log_path, args)))
         return 0
 
     reports: list[dict[str, Any]] = []

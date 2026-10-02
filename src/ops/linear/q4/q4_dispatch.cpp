@@ -1,5 +1,7 @@
 #include "ops/linear/q4/q4_dispatch.h"
 
+#include "ops/linear/f16/f16_materialized_gemm.h"
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -10,6 +12,18 @@ namespace {
 // and a shard uses the family's generic runtime-dimension launchers rather than the parent's
 // compile-time exact instantiations (Q4's draft-head small-T table is exact in both N and K).
 // Returns nullptr when (n, k) is not a registered shard extent.
+//
+// Exact column tiles for the 5..7 column windows. A decode round is (1 + draft) columns wide, so
+// draft 4..6 land here; the four-column tile then emits two column blocks (grid.y = ceil(5/4)) and
+// the eight-column tile pays a full row of columns for a partial one.
+Q4Launch select_q4_exact_column_tile(std::int32_t t) {
+    switch (t) {
+    case 5: return launch_q4_simt_r8_c5;
+    case 6: return launch_q4_simt_r8_c6;
+    case 7: return launch_q4_simt_r8_c7;
+    default: return nullptr;
+    }
+}
 Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     const bool column_shard = (k == 5120 && (n == 512 ||    // 1024  / 2
                                              n == 2048 ||   // 4096  / 2 (gdn/query_key)
@@ -27,8 +41,9 @@ Q4Launch select_q4_tp2_shard_launch(std::int32_t n, std::int32_t k, std::int32_t
     // spend 2.2x a T=4 round per GEMM call instead of the 1.5x its extra columns justify, and it is
     // why draft-5 measured 1.8x the wall time for 10% more tokens per round. Several C4 column
     // slices are cheaper than one C8 tile at every width in this band.
+    if (const Q4Launch exact = select_q4_exact_column_tile(t); exact != nullptr) { return exact; }
     if (t <= 16) { return launch_q4_simt_r8_c4; }
-    return launch_q4_mma_r64_c128;
+    return launch_q4_mma_r64_c64;
 }
 
 // The tp1 table, exactly as it was: returns nullptr rather than throwing so the caller
@@ -46,15 +61,24 @@ Q4Launch select_q4_a16_registered(std::int32_t n, std::int32_t k, std::int32_t t
         case 4096:
             if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
             if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (const Q4Launch exact = select_q4_exact_column_tile(t); exact != nullptr) {
+                return exact;
+            }
             if (t <= 16) { return launch_q4_simt_r8_c8; }
             return launch_q4_mma_r64_c128;
         case 6144:
             if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
+            if (const Q4Launch exact = select_q4_exact_column_tile(t); exact != nullptr) {
+                return exact;
+            }
             if (t <= 7) { return launch_q4_simt_r8_c4; }
             if (t <= 16) { return launch_q4_simt_r8_c8; }
             return launch_q4_mma_r64_c128;
         case 7168:
             if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
+            if (const Q4Launch exact = select_q4_exact_column_tile(t); exact != nullptr) {
+                return exact;
+            }
             if (t <= 7) { return launch_q4_simt_r8_c4; }
             if (t == 8) { return launch_q4_simt_r8_c8; }
             if (t <= 15) { return launch_q4_simt_r8_c4; }
@@ -171,6 +195,21 @@ constexpr std::int32_t kVoltaMmaMaxT = 64;
 void q4_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  WorkspaceArena* workspace, cudaStream_t stream) {
     const std::int32_t t = x.ne[1];
+    // Turing has no bf16 tensor core, so the registered MMA route both dequantizes and restages
+    // bf16 fragments into fp16 inside the K loop; at the identical tile shape those two account for
+    // 464 of the kernel's 793 instructions per K tile (history.md 3.9). Materializing the weight once
+    // as fp16 and running a conversion-free fp16 GEMM is worth about 2.4x on this operator. Prefill
+    // only -- at the decode widths the SIMT routes carry neither cost, so the copy would dominate.
+    if (workspace != nullptr) {
+        // Same contract as the Volta split-K route below: degrade rather than trust the caller to
+        // have sized the arena for a requirement that changed underneath it. The slice width is
+        // picked from the free space so this route uses as few launches as the arena allows.
+        const std::int32_t slice = f16_materialized_slice_rows(w, t, *workspace);
+        if (slice > 0) {
+            launch_f16_materialized_gemm(x, w, out, slice, *workspace, stream);
+            return;
+        }
+    }
 #ifdef NINFER_VOLTA_BUILD
     // Quadpair-split-N maps T to the 8-row axis instead of the 32-row one, so it is the right
     // geometry exactly where the companion kernel pads its A rows away. Needs no workspace at

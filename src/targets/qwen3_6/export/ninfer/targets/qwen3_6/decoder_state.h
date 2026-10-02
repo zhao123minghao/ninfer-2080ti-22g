@@ -18,7 +18,7 @@ struct DecoderStateSpec {
     std::uint32_t capacity                  = 0;
     std::int32_t kv_heads                   = 0;
     std::int32_t attention_head_dim         = 0;
-    DType kv_dtype                          = DType::BF16;
+    DType kv_dtype                          = DType::FP16;
     std::int32_t kv_quant_group             = 0;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;

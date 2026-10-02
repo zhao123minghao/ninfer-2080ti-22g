@@ -150,9 +150,12 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
 
     // The shard shape has no tuned small-T exact kernel (q4_q5_gdn_input_independent_launch
     // is compile-time-exact to the tp1 parent's 4096/12288 row counts -- see the file's own
-    // kQkRows/kValueRows constants). The shard always routes through the grouped-MMA kernel, which
-    // is already row-count-generic (reads shapes from the Weight/Tensor arguments at runtime, see
-    // launch_slice below) -- the same fall-off attn_input_proj's Q4/Q5 shard takes at small T.
+    // kQkRows/kValueRows constants), so the shard carries its own halved-extent instantiations of
+    // the same two GEMVs (q4_q5_gdn_input_independent_shard_launch). The plan resolves to the
+    // row-count-generic grouped-MMA schedule, and execute_plan diverts cols == 1 to those GEMVs:
+    // T == 1 is the decode leaf, where the grouped-MMA route's 64x128 tile pays a whole tile for
+    // one real column -- the same fall-off attn_input_proj's Q4/Q5 shard takes at small T. Every
+    // wider T keeps the grouped MMA.
     if (supported_shard_shape(problem)) { return {Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128}; }
 
     for (const RouteSpec& route : kRoutes) {
@@ -266,9 +269,26 @@ void q4_q5_gdn_input_execute_plan(const Q4Q5GdnInputPlan& plan, const Tensor& x,
         q4_q5_gdn_input_independent_launch(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;
     }
-    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128:
-        q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, stream);
+    case Q4Q5GdnInputScheduleId::GroupedMixedMmaR64C128: {
+        // The non-Volta shard route. The small-T edge is the widest decode round this build admits
+        // -- concurrency * (1 + draft), not the single-request 1 + draft: with two active requests
+        // and three drafts a round is eight columns, and the 64x128 grouped tile then pays a whole
+        // tile per real column (measured 3x per call on the decode round, history.md 22.3). Above
+        // the edge the shard's own fused split-output GEMV/SIMT kernels exist at the halved
+        // extents, so small T takes them and every wider T keeps the row-generic grouped MMA. Only
+        // the shard reaches this schedule on a non-Volta build (the tp1 parent owns cols 1..16
+        // through IndependentDirectFixed above).
+        if (problem.cols <= 12) {
+            Tensor qk    = qkv.slice(0, 0, problem.qk_rows);
+            Tensor value = qkv.slice(0, problem.qk_rows, problem.z_rows);
+            q4_q5_gdn_input_independent_shard_launch(x, qk_weight, value_z_weight, qk, value, z,
+                                                     stream);
+            return;
+        }
+        q4_q5_gdn_input_grouped_mma_launch(x, qk_weight, value_z_weight, qkv, z, &workspace,
+                                           stream);
         return;
+    }
     case Q4Q5GdnInputScheduleId::CutlassSm70TensorCore:
 #ifdef NINFER_VOLTA_BUILD
         q4_q5_gdn_input_cutlass_sm70_launch(x, qk_weight, value_z_weight, qkv, z, workspace,

@@ -144,7 +144,7 @@ def load_ninfer_csv(path: str) -> dict[tuple[int, int], dict[str, str]]:
             if (
                 row["entry"] != "append"
                 or row["geometry"] != "d256-h24-kv4"
-                or row["kv_dtype"] != "bf16"
+                or row["kv_dtype"] != "fp16"
             ):
                 continue
             key = (int(row["T"]), int(row["context"]))

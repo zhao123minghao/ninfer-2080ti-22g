@@ -59,8 +59,8 @@ namespace ninfer::ops {
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput>
 __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial_kernel(
-    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
-    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, half* cache_k,
+    half* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
@@ -96,11 +96,10 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
-    // Declared fp16 (not bf16): Volta's mma.sync.m8n8k4 only accepts fp16 operands. K/V
-    // are cp.async'd here as raw bf16 bytes (matching the bf16 KV cache/input) and then
-    // converted in place to fp16 immediately after staging -- see the conversion passes
-    // below. Q is converted inline at the point of load, since it's read scalar-wise
-    // rather than via cp.async.
+    // Declared fp16, which is what the mma.sync.m8n8k4 operands must be and what the KV cache
+    // stores, so staged cache vectors and the new keys copied in from `input.k`/`input.v` (bf16,
+    // widened on the way in) land here ready for the mma with no in-place pass. Q is converted
+    // inline at the point of load, since it's read scalar-wise rather than via cp.async.
     // Padded row stride -- see the identical note in gqa_attention_decode_i8_tc_volta.cuh. The
     // mma feed reads down a column of these tiles, so an unpadded 512-byte row stride puts every
     // row on the same shared-memory bank and serializes the load ~21 ways. Worth 2.56x on the
@@ -232,8 +231,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                 physical_page      = __shfl_sync(FullMask, physical_page, 0);
                 const std::int64_t cache_off =
                     gqa_cache_index<Geometry>(physical_page, kv_head, d, p_tok & kPagedKVPageMask);
-                store_vec(&cache_k[cache_off], load_vec<int4>(&input.k[new_off]));
-                store_vec(&cache_v[cache_off], load_vec<int4>(&input.v[new_off]));
+                store_vec(&cache_k[cache_off], bf16x8_to_f16x8(load_vec<int4>(&input.k[new_off])));
+                store_vec(&cache_v[cache_off], bf16x8_to_f16x8(load_vec<int4>(&input.v[new_off])));
             }
         }
         __syncthreads();
@@ -297,7 +296,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                 const int key_l      = chunk / (D / 8);
                 const int d          = (chunk - key_l * (D / 8)) * 8;
                 const int key = k0 + key_l;
-                half* k_dst   = &k_s[key_l * SmemStride + d]; // raw bf16 bytes; converted below
+                half* k_dst   = &k_s[key_l * SmemStride + d]; // cache/new-key element type
                 half* v_dst   = &v_s[key_l * SmemStride + d];
                 if (key >= split_start && key < split_end) {
                     if constexpr (CacheInput::writes_cache) {
@@ -305,9 +304,11 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                         const bool from_new =
                             new_token >= 0 && new_token < valid_tokens && key >= first_pos;
                         if (from_new) {
+                            // The new keys are bf16 activations; widen them as they pass through,
+                            // matching what the cache write above stored for them.
                             const std::int64_t off = gqa_kv_new_index<Geometry>(kv_head, d, new_token);
-                            ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
-                            ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                            store_vec(k_dst, bf16x8_to_f16x8(load_vec<int4>(&input.k[off])));
+                            store_vec(v_dst, bf16x8_to_f16x8(load_vec<int4>(&input.v[off])));
                         } else {
                             const std::int64_t off = gqa_cache_index<Geometry>(
                                 physical_page, kv_head, d, key & kPagedKVPageMask);
@@ -327,25 +328,6 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
             }
             ninfer::ops::cp_commit();
             ninfer::ops::cp_wait<0>();
-            __syncthreads();
-
-            // cp.async above copied raw bf16 bytes into k_s/v_s (declared fp16 for the mma
-            // primitives below). Convert those bytes to real fp16 in place: each element is
-            // read and overwritten only by its own owning thread (idx is unique per thread
-            // per grid-stride step), so there's no cross-thread hazard to guard against here
-            // -- only the __syncthreads() after the loop, which ensures every thread's
-            // conversion has landed before any thread starts reading k_s/v_s as fp16 below.
-            // Walks the D real elements of each row and maps them through the padded stride, so
-            // the pad columns -- which the staging copy never wrote and the mma never reads --
-            // are left alone rather than converted from uninitialised shared memory.
-            for (int idx = tid; idx < Bc * D; idx += Threads) {
-                const int row  = idx / D;
-                const int off  = row * SmemStride + (idx - row * D);
-                const float kf = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(k_s)[off]);
-                const float vf = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(v_s)[off]);
-                k_s[off]       = __float2half(kf);
-                v_s[off]       = __float2half(vf);
-            }
             __syncthreads();
 
             // Bc=16 keys are staged together, but QK^T/softmax/PV operate on 8-key

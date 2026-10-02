@@ -16,13 +16,20 @@
 // hard-coded while 262,144 was the domain -- and the test asserts that arithmetic itself, so the
 // case cannot quietly become vacuous if the split policy is retuned.
 //
-//   Gqa27 (24|4, DecodeSplits 85), window 400,001 -> 75 pages per split
-//   Gqa27Tp2 (12|2, DecodeSplits 170), window 700,001 -> 66 pages per split
-//   Gqa27 (24|4), windows 1,048,575 and 1,048,576 -> 194 pages per split
+// The split count is READ from `Geometry::DecodeSplits` rather than transcribed, because that value
+// is target-dependent (`68 * DecodeSplitScale` on this sm_75 build, `85 *` and `560 *` on the
+// others). A transcription is a second authority that a retune leaves behind: with this build's
+// policy the three cases below land at 93, 82 and 242 page ids per split, against 75, 66 and 194
+// for the sm_120a values, and the run prints the count it actually asserted.
+//
+//   Gqa27 (24|4), window 400,001
+//   Gqa27Tp2 (12|2), window 700,001
+//   Gqa27 (24|4), windows 1,048,575 and 1,048,576
 //
 // That last pair is the DECLARED DOMAIN's own boundary (b-1 and b), where the derived staging bound
-// is exactly tight: the span is 386 x 32 = 12,352 keys = 193 whole pages, so 194 ids covers it with
-// one page of slack and no more. Both run against one cache, so the pair costs one pool.
+// is exactly tight under either policy: the span is 482 x 32 = 15,424 keys = 241 whole pages, so
+// 242 ids covers it with one page of slack and no more. Both run against one cache, so the pair
+// costs one pool.
 //
 // Both KV dtypes run for the tp1 geometry because they are two independent kernels with their own
 // staging arrays; the head-local tp2 geometry runs INT8, which is the 1M deployment's KV format.
@@ -40,6 +47,7 @@
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/gqa_attention.h"
 #include "ops/gqa_attention_fixture.h"
+#include "ops/kernel/gqa_attention_geometry.cuh"
 #include "ops/op_tester.h"
 
 #include <cuda_runtime.h>
@@ -47,6 +55,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -71,9 +80,25 @@ std::int32_t pages_per_split(std::int32_t window, std::int32_t decode_splits,
     return (span + kPagedKVPageSize - 1) / kPagedKVPageSize + 1;
 }
 
+// The registered geometry's own split count, keyed off the head counts the case names. Reading it
+// here rather than passing it alongside the geometry keeps the two from being paired wrongly, and
+// makes this translation unit depend on the policy's header.
+std::int32_t registered_decode_splits(const Geometry& geometry) {
+    if (geometry.q_heads == ops::Gqa27Geometry::QHeads &&
+        geometry.kv_heads == ops::Gqa27Geometry::KVHeads) {
+        return ops::Gqa27Geometry::DecodeSplits;
+    }
+    if (geometry.q_heads == ops::Gqa27Tp2Geometry::QHeads &&
+        geometry.kv_heads == ops::Gqa27Tp2Geometry::KVHeads) {
+        return ops::Gqa27Tp2Geometry::DecodeSplits;
+    }
+    std::cerr << "no registered GQA geometry has " << geometry.q_heads << "|" << geometry.kv_heads
+              << " heads\n";
+    std::exit(2);
+}
+
 struct LongCase {
     Geometry geometry;
-    std::int32_t decode_splits; // Geometry::DecodeSplits for `geometry`
     DType dtype;
     // Query-token absolute positions, each run against the SAME cache; window == base + 1. A list
     // rather than one value so the domain boundary can be checked at b-1 AND b without paying for
@@ -90,7 +115,7 @@ std::size_t device_cache_bytes(const LongCase& test_case) {
     const std::size_t elements =
         positions * static_cast<std::size_t>(kHeadDim) * static_cast<std::size_t>(
                                                              test_case.geometry.kv_heads);
-    if (test_case.dtype == DType::BF16) { return 2 * elements * sizeof(std::uint16_t); }
+    if (test_case.dtype == DType::FP16) { return 2 * elements * sizeof(std::uint16_t); }
     const std::size_t scales =
         positions * static_cast<std::size_t>(kQuantGroups) *
         static_cast<std::size_t>(test_case.geometry.kv_heads) * sizeof(std::uint16_t);
@@ -164,6 +189,7 @@ std::vector<double> long_reference(const std::vector<float>& q, const HostCache&
 
 int run_long_case(const LongCase& test_case) {
     const Geometry& geometry = test_case.geometry;
+    const std::int32_t decode_splits = registered_decode_splits(geometry);
     const std::int32_t max_context = test_case.bases.back() + 4;
     const std::string case_name =
         std::string(geometry.name) + " " + cache_name(test_case.dtype);
@@ -172,9 +198,8 @@ int run_long_case(const LongCase& test_case) {
     // 262,144 was the declared domain -- otherwise it proves nothing about the raised bound.
     for (const std::int32_t base : test_case.bases) {
         const std::int32_t window = base + 1;
-        const std::int32_t staged =
-            std::max(pages_per_split(window, test_case.decode_splits, 32),
-                     pages_per_split(window, test_case.decode_splits, 64));
+        const std::int32_t staged = std::max(pages_per_split(window, decode_splits, 32),
+                                             pages_per_split(window, decode_splits, 64));
         if (staged <= 64) {
             std::cerr << case_name << " window " << window
                       << ": does not exceed the old 64-page staging bound (" << staged
@@ -207,9 +232,8 @@ int run_long_case(const LongCase& test_case) {
     int failures = 0;
     for (const std::int32_t base : test_case.bases) {
         const std::int32_t window = base + 1;
-        const std::int32_t staged =
-            std::max(pages_per_split(window, test_case.decode_splits, 32),
-                     pages_per_split(window, test_case.decode_splits, 64));
+        const std::int32_t staged = std::max(pages_per_split(window, decode_splits, 32),
+                                             pages_per_split(window, decode_splits, 64));
         const std::string label = "gqa_attention_cached long " + case_name + " window " +
                                   std::to_string(window);
 
@@ -316,15 +340,15 @@ int main() {
     }
 
     const LongCase cases[] = {
-        {{"qwen3_6_27b", 24, 4}, 85, DType::I8, {400000}, 901u},
-        {{"qwen3_6_27b", 24, 4}, 85, DType::BF16, {400000}, 902u},
-        {{"qwen3_6_27b_tp2", 12, 2}, 170, DType::I8, {700000}, 903u},
+        {{"qwen3_6_27b", 24, 4}, DType::I8, {400000}, 901u},
+        {{"qwen3_6_27b", 24, 4}, DType::FP16, {400000}, 902u},
+        {{"qwen3_6_27b_tp2", 12, 2}, DType::I8, {700000}, 903u},
         // The declared domain's own boundary, b-1 and b (windows 1,048,575 and 1,048,576), which is
         // where the derived staging bound is tightest: the span is 386 x 32 = 12,352 keys = exactly
         // 193 pages, so 194 ids covers it with one page of slack and no more. INT8 is the format
         // the 1M deployment uses; the pages are ~2.2 GiB plus 67 MiB of scales, and the case skips
         // itself if the device cannot hold them.
-        {{"qwen3_6_27b", 24, 4}, 85, DType::I8, {1048574, 1048575}, 904u},
+        {{"qwen3_6_27b", 24, 4}, DType::I8, {1048574, 1048575}, 904u},
     };
 
     int failures = 0;

@@ -19,7 +19,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 - active request 一旦 admission，其声明范围内的 prefill、decode 和 speculative temporary growth
   都有 completion capacity guarantee；
 - 一个 GPU execution unit 期间，page mappings 和 logical valid frontiers 保持稳定；
-- BF16、INT8-G64 以及 target 定义的其他固定 bytes-per-token layouts 使用同一管理语义；
+- FP16、INT8-G64 以及 target 定义的其他固定 bytes-per-token layouts 使用同一管理语义；
 - common allocator 不理解 GQA、MHA、MLA、MTP 或 DFlash 等模型语义；
 - single-sequence prefill/cached consumers 和 batched ordinary/MTP/DFlash decode consumers 都直接消费
   paged KV，不要求任何 sequence 的 growing KV 物理连续；
@@ -357,7 +357,7 @@ Attention input metadata。
 对一个 cache family 的 `layers=L`、KV heads `H`、head dimension `D`：
 
 ```text
-BF16 bytes/token
+FP16 bytes/token
     = 2(K,V) * L * H * D * 2
 
 INT8-G64 bytes/token
@@ -582,7 +582,7 @@ Linear Attention/backend state 是否存在才决定该 frontier 能否复用。
 - 一个 page 足以覆盖一个 aligned 64-key span；
 - 128-token aligned prefill interval 只跨两个 pages；
 - 128 Ki context 只需 2048 entries，native 256 Ki context 只需 4096 entries；
-- 最大的 27B Main Text BF16 pool 每个 page-group 为 4 MiB，单 allocation 的尾页 slack 小于 4 MiB；
+- 最大的 27B Main Text FP16 pool 每个 page-group 为 4 MiB，单 allocation 的尾页 slack 小于 4 MiB；
 - block-table metadata 相对 KV payload 可忽略，同时 32-key tile 不跨 page、64-key tile 与 page 对齐。
 
 ### 7.3 Backend page sizes
@@ -598,18 +598,18 @@ blocks；其 Full pool 使用 §4.3 的 head-major page-run order。两者保留
 
 | Pool layout | KV storage | bytes/token | page-group payload | worst tail slack |
 |---|---|---:|---:|---:|
-| 27B Main Text | BF16 | 65536 | 4.0000 MiB | 3.9375 MiB |
+| 27B Main Text | FP16 | 65536 | 4.0000 MiB | 3.9375 MiB |
 | 27B Main Text | INT8-G64 | 33792 | 2.0625 MiB | 2.0303 MiB |
-| 35B-A3B Main Text | BF16 | 20480 | 1.2500 MiB | 1.2305 MiB |
+| 35B-A3B Main Text | FP16 | 20480 | 1.2500 MiB | 1.2305 MiB |
 | 35B-A3B Main Text | INT8-G64 | 10560 | 0.6445 MiB | 0.6345 MiB |
-| 27B MTP | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
+| 27B MTP | FP16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 | 27B MTP | INT8-G64 | 2112 | 0.1289 MiB | 0.1269 MiB |
-| 35B-A3B MTP | BF16 | 2048 | 0.1250 MiB | 0.1230 MiB |
+| 35B-A3B MTP | FP16 | 2048 | 0.1250 MiB | 0.1230 MiB |
 | 35B-A3B MTP | INT8-G64 | 1056 | 0.0645 MiB | 0.0634 MiB |
-| 35B-A3B DFlash Full | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
+| 35B-A3B DFlash Full | FP16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 
-27B Main Text BF16 的 4 MiB page group 分布在全部 full-attention planes。单层单个 K 或 V plane
-每个 page ID 对应的 aggregate bytes 为 128 KiB；35B-A3B Main Text BF16 对应 64 KiB。Consumer 始终
+27B Main Text FP16 的 4 MiB page group 分布在全部 full-attention planes。单层单个 K 或 V plane
+每个 page ID 对应的 aggregate bytes 为 128 KiB；35B-A3B Main Text FP16 对应 64 KiB。Consumer 始终
 看到一个 pool-specific typed plane view，而不是跨模型机制的 composite payload。
 
 假设 page ID 为 32-bit，128 Ki context 的单个 block-table row 为 8 KiB。即使
@@ -848,10 +848,10 @@ storage。当前 registered target 对每个 local layer 固定为：
 ```text
 capacity        = 4096
 padded_capacity = 4096
-K/V dtype       = BF16
+K/V dtype       = FP16
 K/V shape       = [128, 4096, 8] = [D, padded_capacity, Hkv]
 
-nb[0] = sizeof(BF16)
+nb[0] = sizeof(FP16)
 nb[1] = D * nb[0]
 nb[2] = padded_capacity * nb[1]
 
@@ -958,7 +958,7 @@ PagedKVLayerView
 ├── block_table       I32 Tensor [Nlogical]
 ├── head_dim          D
 ├── num_kv_heads      Hkv
-├── dtype             BF16 or I8
+├── dtype             FP16 or I8
 └── quant_group       0 or 64
 ```
 
@@ -1065,7 +1065,7 @@ storage/view boundary。
 |---|---|---|
 | `gqa_attention` | writable `PagedKVBatchLayerView` + `table_rows[B]` | 为 `B` 条独立 sequences append valid K/V columns，并执行一次 ragged causal Attention |
 | `gqa_attention_cached` | read-only `PagedKVLayerView` | 只读已经 populated 的 paged cache |
-| `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 INT8-G64 encode |
+| `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 activation 经 bf16→fp16 加宽写入或 INT8-G64 encode |
 | `kv_cache_append_prefix` growing entry | writable `PagedKVBatchLayerView` + counts/table rows | 只写每行 device count 选择的 exact prefix |
 | `bidirectional_gqa_attention` | read-only `PagedKVBatchLayerView` + table rows | batched 读取 DFlash Full pool；query K/V 仍是 transient Tensor |
 | `kv_cache_append_prefix` cyclic entry | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
@@ -1111,7 +1111,7 @@ Wrapper 必须验证：
 - physical page count、head geometry、dtype 和 optional scale planes 一致；
 - single view 的 block table 是 contiguous I32 `[Nlogical]`；batch view 的 table matrix 是 contiguous
   I32 `[Nlogical,C]`，row selectors 是 contiguous I32 `[B]`；
-- BF16 cache 不携带 scale planes，INT8-G64 cache 的 scale shape 和 strides 完整；
+- FP16 cache 不携带 scale planes，INT8-G64 cache 的 scale shape 和 strides 完整；
 - causal `max_visible_keys <= Nlogical*P`；
 - DFlash `max_context <= Nlogical*P`；
 - input/output Tensor domain 与当前 entry 的已注册 geometry 一致。
@@ -1140,10 +1140,10 @@ geometry 和 codec 编译期专用。Page/head bases 在 CTA 或 tile 粒度计�
 机械地留在每次 scalar/vector access 上。
 
 不得实现一个在 inner loop 中解释 arbitrary page size、arbitrary layout 或 cache-kind variant 的通用
-runtime accessor。可以共享 shift/mask、page-base calculation 和 INT8 codec 等窄 primitive，但 BF16、
+runtime accessor。可以共享 shift/mask、page-base calculation 和 INT8 codec 等窄 primitive，但 FP16、
 INT8、causal prefill、causal small-T 和 DFlash context 保留各自可独立优化的 kernel body。
 
-### 17.2 Causal small-T BF16
+### 17.2 Causal small-T FP16
 
 现有 small-T partial/reduce 分解保持不变：
 
@@ -1161,7 +1161,7 @@ reduce grid:  (Q head, D chunk, query token)
 5. 不让其他 split依赖本 split的 cache write；
 6. partial accumulator、softmax statistics 和 reducer layout 不因 paging 改变。
 
-当前 BF16 key tile 为32 keys，`P=64`恰好包含两个 tiles。Route planner必须避免保留会产生任意
+当前 FP16 key tile 为32 keys，`P=64`恰好包含两个 tiles。Route planner必须避免保留会产生任意
 `split_start` 的 `ceil(window/active_splits)` 分割。正常路径按完整32-key tiles分配；极短 context 若为
 增加并行度拆分一个 tile，sub-page span 的 start/end 也必须落在 page-local有效范围内。任何 vectorized
 global load 都不得跨两个 physical pages。
@@ -1196,7 +1196,7 @@ fill current K/V rows into cache
 Fill kernel按每个 logical token选择 page。一个 execution unit可以从 page中间开始并跨任意数量pages；
 不要求 prefill chunk、retained frontier或positions[0] page-aligned。
 
-Attention key loop继续从logical position 0遍历到当前query可见上界。当前 BF16和INT8 prefill的
+Attention key loop继续从logical position 0遍历到当前query可见上界。当前 FP16和INT8 prefill的
 key tile均为64，因而一个完整key tile正好对应一个physical page：
 
 ```text
@@ -1213,7 +1213,7 @@ Cached prompt route使用相同page-aware key traversal，但不执行fill。
 
 Full append和device-count prefix append都直接写最终physical pages，不建立连续staging cache。
 
-- BF16 copy：一个 `(token, kv_head)` work unit查询一次page并协作复制完整D；
+- FP16 write：一个 `(token, kv_head)` work unit查询一次page，把 bf16 activation 加宽为 fp16 后协作写入完整D；
 - INT8 encode：同一work unit复用page ID写code与scale；
 - sequential positions允许一个CTA处理多个tokens，但跨page时必须重新取得page ID；
 - device-count prefix route先读取一次合法count，再只调度或mask `[0,count)`；
@@ -1289,7 +1289,7 @@ positions和represented cache values计算结果，不复制production page trav
 - current retained frontier 位于 page 中间并在同一 tail page 继续 append；
 - rewrite-checkpoint restore 截断 fragmented mapping、释放 trailing pages 并从 exact checkpoint
   继续；
-- BF16 append bit-exact；
+- FP16 append 与 bf16→fp16 加宽 oracle 一致；
 - INT8-G64 code和FP16 scale bits与独立codec oracle一致；
 - cached-only route不修改任意cache plane；
 - prefix append的count为0、page边界前后和full count；
@@ -1311,9 +1311,9 @@ positions和represented cache values计算结果，不复制production page trav
 
 | Format | K+V payload per KV head per page |
 |---|---:|
-| D256 BF16 | 64 KiB |
+| D256 FP16 | 64 KiB |
 | D256 INT8-G64 incl. scales | 33 KiB |
-| D128 BF16 | 32 KiB |
+| D128 FP16 | 32 KiB |
 
 因此page-table payload本身不是主要带宽成本。需要实测防止的是重复lookup、跨页vector load、TLB/cache
 locality下降、split imbalance和原有`cp.async`/MMA overlap被破坏。性能 qualification 只评估和调整
@@ -1336,7 +1336,7 @@ reference/candidate 成对交替测量，结合重复分布和绝对 latency；�
 
 性能证据覆盖实际 route，而不是所有参数的笛卡尔积：
 
-- 两个 exact target 的 BF16/INT8-G64 causal decode `B=1,2,4,8`、`T=1` 和代表性 verify small-T；
+- 两个 exact target 的 FP16/INT8-G64 causal decode `B=1,2,4,8`、`T=1` 和代表性 verify small-T；
 - causal prefill/cached-only 的一个普通 chunk 和一个长 chunk，并包含 non-aligned prefix base；
 - standalone append 的 small-T 与一个 prefill-sized chunk；
 - DFlash full-context 的 `T=1` 和完整 proposal block，覆盖普通与长 context；
@@ -1384,7 +1384,7 @@ lookup、TLB、split、staging或reduction，再调整对应 route；不能通�
 初始 paged storage migration 已在 RTX 5090、CUDA 13.1、`sm_120a` 上完成准入。下列冻结
 contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前并发吞吐数据：
 
-- causal matrix 覆盖两个 registered geometries、BF16/INT8-G64、append/cached、`T=1/4/16`、
+- causal matrix 覆盖两个 registered geometries、FP16/INT8-G64、append/cached、`T=1/4/16`、
   `L=2K/8K`、identity/fragmented mapping 和 CUDA Graph cold-cache execution；对临界 case 使用
   reference/candidate 交替重复，未出现可重复的 3% 以上回退；
 - causal prefill、standalone append 和 DFlash full-context 分别通过 3%、5% 和 3% gate；
@@ -1432,7 +1432,7 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 
 以下内容属于 route-specific implementation profile，可以在不改变 storage contract 时测量和调整：
 
-- BF16/INT8 route 的 warps per CTA、split count、keys per split 和 32/64-key route interval；
+- FP16/INT8 route 的 warps per CTA、split count、keys per split 和 32/64-key route interval；
 - block-table entry 在 register/shared memory 中的广播方式；
 - append kernel 每个 CTA 处理的 tokens/heads；
 - allocator 优先选择连续 free IDs 的 heuristic；

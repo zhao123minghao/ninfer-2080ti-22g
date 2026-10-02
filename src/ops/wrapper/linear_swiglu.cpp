@@ -270,11 +270,11 @@ void q4_column_parallel_rank(const Tensor& x, const Weight& w, Tensor& out,
     auto scope                  = workspace->scope();
     const Tensor materialized   = workspace->alloc(DType::BF16, {w.n, x.ne[1]}, 256);
     Tensor projected            = materialized;
-    if (w.qtype == QType::GGML_K) {
-        linear(x, w, projected, LinearPolicy::A16Only, *workspace, stream);
-    } else {
-        linear(x, w, projected, stream);
-    }
+    // Forward the arena unconditionally: the Q4 prefill route materializes the weight and the
+    // activation as fp16 into it (see ops/linear/f16/f16_materialized_gemm.h). This used to be
+    // GGML_K-only, which left the Q4 shard on the no-workspace overload and therefore without that
+    // route.
+    linear(x, w, projected, LinearPolicy::A16Only, *workspace, stream);
     const std::int32_t intermediate = w.n / 2;
     silu_mul(projected.slice(0, 0, intermediate), projected.slice(0, intermediate, intermediate),
             out, stream);

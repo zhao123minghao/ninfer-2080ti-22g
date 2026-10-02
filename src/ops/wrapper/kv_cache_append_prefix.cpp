@@ -69,7 +69,7 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
 
 void validate_paged_cache(const PagedKVBatchLayerView& cache,
                           KVCacheAppendPrefixExecutionEnvelope envelope) {
-    if (cache.dtype != DType::BF16 || cache.quant_group != 0 || cache.num_kv_heads != kKVHeads ||
+    if (cache.dtype != DType::FP16 || cache.quant_group != 0 || cache.num_kv_heads != kKVHeads ||
         cache.head_dim != kHeadDim || cache.k_pages.ne[2] <= 0 ||
         cache.k_pages.ne[2] != cache.v_pages.ne[2] || cache.block_tables.ne[0] <= 0 ||
         envelope.max_count >
@@ -77,7 +77,7 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
         throw std::invalid_argument("kv_cache_append_prefix: invalid paged cache");
     }
     const std::int32_t physical_pages = cache.k_pages.ne[2];
-    if (cache.k_pages.dtype != DType::BF16 || cache.v_pages.dtype != DType::BF16 ||
+    if (cache.k_pages.dtype != DType::FP16 || cache.v_pages.dtype != DType::FP16 ||
         cache.k_pages.ne[0] != kHeadDim || cache.k_pages.ne[1] != kPagedKVPageSize ||
         cache.k_pages.ne[3] != kKVHeads || cache.v_pages.ne[0] != kHeadDim ||
         cache.v_pages.ne[1] != kPagedKVPageSize || cache.v_pages.ne[2] != physical_pages ||
@@ -103,7 +103,7 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache");
     }
     const auto padded = static_cast<std::int32_t>(cache.padded_capacity);
-    if (cache.k.dtype != DType::BF16 || cache.v.dtype != DType::BF16 || cache.k.ne[0] != kHeadDim ||
+    if (cache.k.dtype != DType::FP16 || cache.v.dtype != DType::FP16 || cache.k.ne[0] != kHeadDim ||
         cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.v.ne[0] != kHeadDim ||
         cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
         cache.v.ne[3] != cache.lane_capacity || cache.lane_capacity <= 0 ||

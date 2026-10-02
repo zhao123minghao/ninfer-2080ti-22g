@@ -21,7 +21,11 @@ namespace {
 
 namespace frontend = ninfer::targets::qwen3_6::frontend_internal;
 
+enum class PromptMode { Plain, CodeChat, UserChat };
+
 struct Options {
+    PromptMode mode = PromptMode::Plain;
+    bool enable_thinking = false;
     std::size_t chat_tokens = 0;
     std::size_t output_tokens = 1024;
     std::vector<std::filesystem::path> files;
@@ -41,15 +45,22 @@ Options parse_options(int argc, char** argv) {
     bool output_override = false;
     for (int i = 3; i < argc; ++i) {
         const std::string_view argument(argv[i]);
-        if (argument == "--code-chat" || argument == "--output-tokens") {
+        if (argument == "--code-chat" || argument == "--user-chat" ||
+            argument == "--output-tokens") {
             if (++i == argc) { throw std::invalid_argument(std::string(argument) + " needs a value"); }
             const auto count = positive_count(argv[i], argument.data());
             if (argument == "--code-chat") {
+                options.mode = PromptMode::CodeChat;
+                options.chat_tokens = count;
+            } else if (argument == "--user-chat") {
+                options.mode = PromptMode::UserChat;
                 options.chat_tokens = count;
             } else {
                 options.output_tokens = count;
                 output_override = true;
             }
+        } else if (argument == "--thinking") {
+            options.enable_thinking = true;
         } else if (argument.starts_with("--")) {
             throw std::invalid_argument("unknown option: " + std::string(argument));
         } else {
@@ -57,7 +68,7 @@ Options parse_options(int argc, char** argv) {
         }
     }
     if (options.files.empty()) { throw std::invalid_argument("list at least one source file"); }
-    if (output_override && options.chat_tokens == 0) {
+    if (output_override && options.mode != PromptMode::CodeChat) {
         throw std::invalid_argument("--output-tokens requires --code-chat");
     }
     return options;
@@ -109,7 +120,8 @@ std::vector<int> code_chat(const frontend::Tokenizer& tokenizer,
         "lock. Include the necessary standard headers. This is a fixed-budget coding response: "
         "use at most " + std::to_string(options.output_tokens) +
         " output tokens, spending most of them on the implementation and example."));
-    const auto rendered = chat_template.render({system, user}, {.enable_thinking = false});
+    const auto rendered = chat_template.render({system, user},
+                                               {.enable_thinking = options.enable_thinking});
     const auto at = rendered.text.find(marker);
     if (at == std::string::npos ||
         rendered.text.find(marker, at + marker.size()) != std::string::npos) {
@@ -165,7 +177,52 @@ std::vector<int> code_chat(const frontend::Tokenizer& tokenizer,
               << " prefix_tokens=" << prefix_tokens << " code_tokens=" << body_tokens
               << " suffix_tokens=" << suffix.size()
               << " requested_output_tokens=" << options.output_tokens
-              << " thinking=false task=bounded-blocking-task-queue\n";
+              << " thinking=" << (options.enable_thinking ? "true" : "false")
+              << " task=bounded-blocking-task-queue\n";
+    return result;
+}
+
+std::vector<int> user_chat(const frontend::Tokenizer& tokenizer,
+                           const frontend::CompiledChatTemplate& chat_template,
+                           const Options& options) {
+    constexpr std::string_view marker = "__NINFER_USER_TEXT_BODY_18D792A6__";
+    if (options.files.size() != 1) {
+        throw std::invalid_argument("--user-chat expects exactly one text file");
+    }
+    frontend::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(frontend::ChatPart::text_part("\n\n" + std::string(marker) + "\n\n"));
+    const auto rendered = chat_template.render({user},
+                                               {.enable_thinking = options.enable_thinking});
+    const auto at = rendered.text.find(marker);
+    if (at == std::string::npos ||
+        rendered.text.find(marker, at + marker.size()) != std::string::npos) {
+        throw std::runtime_error("chat template did not preserve the unique body marker");
+    }
+
+    auto result = tokenizer.encode(std::string_view(rendered.text).substr(0, at));
+    const auto suffix = tokenizer.encode(
+        std::string_view(rendered.text).substr(at + marker.size()));
+    if (result.size() + suffix.size() >= options.chat_tokens) {
+        throw std::invalid_argument("--user-chat budget is too small for the template");
+    }
+    const std::size_t prefix_tokens = result.size();
+    const std::size_t body_budget = options.chat_tokens - prefix_tokens - suffix.size();
+    const std::string text = read_file(options.files.front());
+    const auto body = tokenizer.encode(text, {.parse_added_tokens = false});
+    if (body.size() < body_budget) {
+        throw std::invalid_argument("text file provides only " + std::to_string(body.size()) +
+                                    " body tokens; need " + std::to_string(body_budget));
+    }
+    result.insert(result.end(), body.begin(), body.begin() + body_budget);
+    result.insert(result.end(), suffix.begin(), suffix.end());
+    if (result.size() != options.chat_tokens) {
+        throw std::logic_error("user-chat prompt length does not match its exact budget");
+    }
+    std::cout << "mode=user-chat prompt_tokens=" << result.size()
+              << " prefix_tokens=" << prefix_tokens << " body_tokens=" << body_budget
+              << " suffix_tokens=" << suffix.size()
+              << " thinking=" << (options.enable_thinking ? "true" : "false") << '\n';
     return result;
 }
 
@@ -184,8 +241,12 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         std::cerr << "usage: ninfer_v100_corpus ARTIFACT OUTPUT.ids TEXT_FILE...\n"
                      "       ninfer_v100_corpus ARTIFACT OUTPUT.ids --code-chat 85000 "
-                     "[--output-tokens 1024] CPP_OR_CUDA_FILE...\n"
+                     "[--output-tokens 1024] [--thinking] CPP_OR_CUDA_FILE...\n"
+                     "       ninfer_v100_corpus ARTIFACT OUTPUT.ids --user-chat 85000 "
+                     "TEXT_FILE [--thinking]\n"
                      "Code-chat preserves the complete task and template at an exact prompt length.\n"
+                     "User-chat wraps one text file in the artifact chat template at an exact length.\n"
+                     "--thinking retains the model's thinking generation prefix.\n"
                      "--output-tokens states the fixed response budget in the task; configure both\n"
                      "inference engines with that same generation budget and pass these raw IDs.\n";
         return 2;
@@ -200,12 +261,16 @@ int main(int argc, char** argv) {
         const frontend::Tokenizer tokenizer({
             resource("frontend/tokenizer.json"), resource("frontend/tokenizer_config.json"),
             resource("frontend/generation_config.json")});
-        if (options.chat_tokens != 0) {
+        if (options.mode == PromptMode::Plain) {
+            write_ids(argv[2], plain_corpus(tokenizer, options));
+        } else {
             const auto chat_template = frontend::CompiledChatTemplate::resolve(
                 resource("frontend/chat_template.jinja"));
-            write_ids(argv[2], code_chat(tokenizer, chat_template, options));
-        } else {
-            write_ids(argv[2], plain_corpus(tokenizer, options));
+            if (options.mode == PromptMode::CodeChat) {
+                write_ids(argv[2], code_chat(tokenizer, chat_template, options));
+            } else {
+                write_ids(argv[2], user_chat(tokenizer, chat_template, options));
+            }
         }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -53,7 +53,7 @@ constexpr std::uint16_t kOutputCanary = 0x7fc1u;
 // Both were fitted at the short windows the conformance suite runs (<= ~1025 visible keys), and
 // their relative-L2 terms sit only about 1.9x above the unavoidable BF16 OUTPUT STORAGE floor for
 // those cases. That headroom is real but small, and a route with a longer reduction chain can
-// consume it without being wrong: the 85-way split-KV decode route at a 400k-1M window measures
+// consume it without being wrong: the split-KV decode route at a 400k-1M window measures
 // 2.84e-3 to 3.18e-3 against an INT8 limit of 3.15e-3. The long-window suite therefore judges
 // relative-L2 against a floor it MEASURES per case rather than against these constants -- see
 // long_window_attention_criterion below. These two are unchanged and remain the registered
@@ -82,8 +82,8 @@ constexpr ReductionCriterion kAttentionInt8Criterion{
 // a relative-L2 of roughly 2^-9/sqrt(3) ~ 1.1e-3, and for the concrete long-window outputs it
 // measures ~1.66e-3. That floor does NOT grow with the window -- relative-L2 is a ratio and the
 // storage error is relative, which is why the measured long-window numbers are flat in N
-// (3.18e-3 at 400k, 2.96e-3 at 1M). What the long window costs is the REDUCTION: an 85-way split
-// with ~12k keys per split accumulates more FP32 rounding than the <= 1025-key cases the
+// (3.18e-3 at 400k, 2.96e-3 at 1M). What the long window costs is the REDUCTION: a split-KV
+// reduction with ~12k keys per split accumulates more FP32 rounding than the <= 1025-key cases the
 // registered constants were fitted at, and the registered ~1.9x headroom over the floor is not
 // enough to absorb it.
 //
@@ -301,20 +301,6 @@ inline std::vector<float> make_bf16_values(std::size_t count, std::uint32_t seed
     return values;
 }
 
-inline std::vector<std::uint16_t> to_bf16_bits(const std::vector<float>& values) {
-    std::vector<std::uint16_t> bits(values.size());
-    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_bf16(values[i]); }
-    return bits;
-}
-
-inline std::vector<double> bf16_bits_to_double(const std::vector<std::uint16_t>& bits) {
-    std::vector<double> values(bits.size());
-    for (std::size_t i = 0; i < bits.size(); ++i) {
-        values[i] = static_cast<double>(bf16_to_f32(bits[i]));
-    }
-    return values;
-}
-
 inline std::uint16_t f32_to_f16_bits(float value) {
     std::uint32_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
@@ -369,6 +355,30 @@ inline float f16_bits_to_f32(std::uint16_t bits) {
     return negative ? -magnitude : magnitude;
 }
 
+// Public activations and the Op's output are BF16: this encodes those tensors' words.
+inline std::vector<std::uint16_t> to_bf16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_bf16(values[i]); }
+    return bits;
+}
+
+// The cache stores fp16, so a logical K/V value -- an already bf16-rounded activation, which
+// widens into fp16 exactly over its normal range -- is encoded with the fp16 codec here.
+inline std::vector<std::uint16_t> to_f16_bits(const std::vector<float>& values) {
+    std::vector<std::uint16_t> bits(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) { bits[i] = f32_to_f16_bits(values[i]); }
+    return bits;
+}
+
+// The Op's own output is BF16; this decodes those output bits.
+inline std::vector<double> bf16_bits_to_double(const std::vector<std::uint16_t>& bits) {
+    std::vector<double> values(bits.size());
+    for (std::size_t i = 0; i < bits.size(); ++i) {
+        values[i] = static_cast<double>(bf16_to_f32(bits[i]));
+    }
+    return values;
+}
+
 inline std::int32_t round_even_to_i32(float value) {
     const float lower_f  = std::floor(value);
     const float fraction = value - lower_f;
@@ -383,8 +393,8 @@ struct HostCache {
     DType dtype;
     std::int32_t max_context;
     std::int32_t logical_capacity;
-    std::vector<std::uint16_t> k_bf16;
-    std::vector<std::uint16_t> v_bf16;
+    std::vector<std::uint16_t> k_f16;
+    std::vector<std::uint16_t> v_f16;
     std::vector<std::int8_t> k_i8;
     std::vector<std::int8_t> v_i8;
     std::vector<std::uint16_t> k_scale;
@@ -422,9 +432,9 @@ inline HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t 
     std::vector<float> logical_v        = make_bf16_values(elements, seed + 1u, -1.0f, 1.0f);
 
     HostCache cache{geometry, dtype, max_context, logical_capacity};
-    if (dtype == DType::BF16) {
-        cache.k_bf16 = to_bf16_bits(logical_k);
-        cache.v_bf16 = to_bf16_bits(logical_v);
+    if (dtype == DType::FP16) {
+        cache.k_f16 = to_f16_bits(logical_k);
+        cache.v_f16 = to_f16_bits(logical_v);
         return cache;
     }
 
@@ -448,19 +458,25 @@ inline HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t 
     return cache;
 }
 
+// The append takes bf16 K/V activations, so a cache word is that bf16 value widened to fp16
+// (exact over fp16's normal range) -- the same order the kernel performs.
+inline std::uint16_t cache_bits_from_activation(float value) {
+    return f32_to_f16_bits(bf16_to_f32(f32_to_bf16(value)));
+}
+
 inline void append_cache(HostCache& cache, const std::vector<float>& k, const std::vector<float>& v,
                   const std::vector<std::int32_t>& positions) {
     const Geometry& geometry = cache.geometry;
     for (std::int32_t token = 0; token < static_cast<std::int32_t>(positions.size()); ++token) {
         const std::int32_t position = positions[static_cast<std::size_t>(token)];
         for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
-            if (cache.dtype == DType::BF16) {
+            if (cache.dtype == DType::FP16) {
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
                     const std::size_t source = kv_input_index(geometry, head, d, token);
                     const std::size_t target =
                         cache_index(geometry, cache.logical_capacity, head, position, d);
-                    cache.k_bf16[target] = f32_to_bf16(k[source]);
-                    cache.v_bf16[target] = f32_to_bf16(v[source]);
+                    cache.k_f16[target] = cache_bits_from_activation(k[source]);
+                    cache.v_f16[target] = cache_bits_from_activation(v[source]);
                 }
                 continue;
             }
@@ -482,8 +498,8 @@ inline void append_cache(HostCache& cache, const std::vector<float>& k, const st
 inline double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int32_t position,
                    std::int32_t d) {
     const std::size_t code = cache_index(cache.geometry, cache.logical_capacity, head, position, d);
-    if (cache.dtype == DType::BF16) {
-        return static_cast<double>(bf16_to_f32(key ? cache.k_bf16[code] : cache.v_bf16[code]));
+    if (cache.dtype == DType::FP16) {
+        return static_cast<double>(f16_bits_to_f32(key ? cache.k_f16[code] : cache.v_f16[code]));
     }
 
     const std::size_t scale =
@@ -564,20 +580,20 @@ public:
           scale_elements_(static_cast<std::size_t>(kQuantGroups) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
           k_(code_elements_ *
-             (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
+             (dtype_ == DType::FP16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
           v_(code_elements_ *
-             (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
+             (dtype_ == DType::FP16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
           k_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
           v_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
           block_table_(block_table_host_.size() * sizeof(std::int32_t)) {
         block_table_.copy_from_host(block_table_host_.data(),
                                     block_table_host_.size() * sizeof(std::int32_t));
-        if (dtype_ == DType::BF16) {
+        if (dtype_ == DType::FP16) {
             const auto k_physical =
-                scatter_paged(cache.k_bf16, kHeadDim, geometry_, logical_capacity_,
+                scatter_paged(cache.k_f16, kHeadDim, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             const auto v_physical =
-                scatter_paged(cache.v_bf16, kHeadDim, geometry_, logical_capacity_,
+                scatter_paged(cache.v_f16, kHeadDim, geometry_, logical_capacity_,
                               block_table_host_, physical_pages_);
             k_.copy_from_host(k_physical.data(), k_physical.size() * sizeof(std::uint16_t));
             v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::uint16_t));
@@ -640,12 +656,12 @@ public:
 
     HostCache snapshot() const {
         HostCache cache{geometry_, dtype_, max_context_, logical_capacity_};
-        if (dtype_ == DType::BF16) {
+        if (dtype_ == DType::FP16) {
             const auto k_physical = copy_from_guarded<std::uint16_t>(k_, code_elements_);
             const auto v_physical = copy_from_guarded<std::uint16_t>(v_, code_elements_);
-            cache.k_bf16          = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
+            cache.k_f16          = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
                                                                 logical_capacity_, block_table_host_);
-            cache.v_bf16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
+            cache.v_f16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
                                                                 logical_capacity_, block_table_host_);
         } else {
             const auto k_physical  = copy_from_guarded<std::int8_t>(k_, code_elements_);
@@ -712,9 +728,9 @@ public:
           scale_elements_(static_cast<std::size_t>(kQuantGroups) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
           k_(code_elements_ *
-             (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
+             (dtype_ == DType::FP16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
           v_(code_elements_ *
-             (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
+             (dtype_ == DType::FP16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
           k_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
           v_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
           block_tables_(block_tables_host_.size() * sizeof(std::int32_t)) {
@@ -766,10 +782,10 @@ public:
             return 1;
         }
         int failures = 0;
-        if (dtype_ == DType::BF16) {
+        if (dtype_ == DType::FP16) {
             std::vector<std::uint16_t> expected_k(code_elements_, 0);
             std::vector<std::uint16_t> expected_v(code_elements_, 0);
-            scatter_bf16_rows(expected, expected_k, expected_v);
+            scatter_cache_rows(expected, expected_k, expected_v);
             failures +=
                 verify_exact((label + " cache-k").c_str(),
                              copy_from_guarded<std::uint16_t>(k_, code_elements_), expected_k);
@@ -826,20 +842,20 @@ private:
                                              static_cast<std::size_t>(logical_pages_));
     }
 
-    void scatter_bf16_rows(std::span<const HostCache> rows, std::vector<std::uint16_t>& k,
+    void scatter_cache_rows(std::span<const HostCache> rows, std::vector<std::uint16_t>& k,
                            std::vector<std::uint16_t>& v) const {
         for (std::size_t row = 0; row < rows_; ++row) {
             const std::span<const std::int32_t> table = row_table(row);
-            scatter_paged_into(rows[row].k_bf16, kHeadDim, geometry_, logical_capacity_, table, k);
-            scatter_paged_into(rows[row].v_bf16, kHeadDim, geometry_, logical_capacity_, table, v);
+            scatter_paged_into(rows[row].k_f16, kHeadDim, geometry_, logical_capacity_, table, k);
+            scatter_paged_into(rows[row].v_f16, kHeadDim, geometry_, logical_capacity_, table, v);
         }
     }
 
     void upload_rows(std::span<const HostCache> rows) {
-        if (dtype_ == DType::BF16) {
+        if (dtype_ == DType::FP16) {
             std::vector<std::uint16_t> physical_k(code_elements_, 0);
             std::vector<std::uint16_t> physical_v(code_elements_, 0);
-            scatter_bf16_rows(rows, physical_k, physical_v);
+            scatter_cache_rows(rows, physical_k, physical_v);
             k_.copy_from_host(physical_k.data(), physical_k.size() * sizeof(std::uint16_t));
             v_.copy_from_host(physical_v.data(), physical_v.size() * sizeof(std::uint16_t));
             return;
@@ -883,9 +899,9 @@ private:
 
 inline int verify_cache(const std::string& label, const HostCache& got, const HostCache& expected) {
     int failures = 0;
-    if (expected.dtype == DType::BF16) {
-        failures += verify_exact((label + " cache-k").c_str(), got.k_bf16, expected.k_bf16);
-        failures += verify_exact((label + " cache-v").c_str(), got.v_bf16, expected.v_bf16);
+    if (expected.dtype == DType::FP16) {
+        failures += verify_exact((label + " cache-k").c_str(), got.k_f16, expected.k_f16);
+        failures += verify_exact((label + " cache-v").c_str(), got.v_f16, expected.v_f16);
     } else {
         failures += verify_exact((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);
         failures += verify_exact((label + " cache-v-code").c_str(), got.v_i8, expected.v_i8);
@@ -911,10 +927,10 @@ inline int verify_positions(const std::string& label, const GuardedDeviceBuffer&
     return failures;
 }
 
-inline const char* cache_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "int8-g64"; }
+inline const char* cache_name(DType dtype) { return dtype == DType::FP16 ? "fp16" : "int8-g64"; }
 
 inline ReductionCriterion attention_criterion(DType dtype) {
-    return dtype == DType::BF16 ? kAttentionBf16Criterion : kAttentionInt8Criterion;
+    return dtype == DType::FP16 ? kAttentionBf16Criterion : kAttentionInt8Criterion;
 }
 
 inline ReductionCriterion long_window_attention_criterion(DType dtype, double storage_floor) {

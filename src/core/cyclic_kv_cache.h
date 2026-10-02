@@ -12,7 +12,9 @@
 namespace ninfer {
 
 /**
- * Fixed cyclic BF16 K/V storage with absolute-position addressing.
+ * Fixed cyclic fp16 K/V storage with absolute-position addressing. The element type matches
+ * the paged KV cache: both hold the tensor-core operand format, widened from the bf16 K/V
+ * activations at the append.
  *
  * A logical absolute position p resides in physical slot p % capacity. The view deliberately
  * carries no mutable frontier: callers supply the live absolute interval to the consuming Op.

@@ -1,5 +1,16 @@
 #pragma once
 
+// sm_75 has no async-copy hardware, so ops::cp_async there is a synchronous load+store (see
+// ops/common/memory.cuh). A `#pragma unroll 1` staging loop then makes every iteration wait for
+// its own global round-trip. Letting these loops unroll lets the compiler batch the loads behind
+// one latency. On sm_80+ the copy really is asynchronous and batching the issue buys nothing, so
+// the original hint is kept there.
+#if defined(NINFER_SM75)
+#define NINFER_STAGE_UNROLL
+#else
+#define NINFER_STAGE_UNROLL _Pragma("unroll 1")
+#endif
+
 // Q5G64 RowSplit x BF16 Tensor Core GEMM.
 //
 // out[Rows, Cols] = W[Rows, K] * x[K, Cols]
@@ -179,7 +190,7 @@ void q5_rowsplit_gemm_mma_kernel(
 
     auto stage_activation = [&](int stage, int k_tile) {
         const int k0 = k_tile * BK;
-#pragma unroll 1
+        NINFER_STAGE_UNROLL
         for (int item = tid; item < BN * (BK / 8); item += Schedule::kThreads) {
             const int local_col = item / (BK / 8);
             const int k8        = item - local_col * (BK / 8);
@@ -202,7 +213,7 @@ void q5_rowsplit_gemm_mma_kernel(
 
     auto stage_quant = [&](int stage, int k_tile) {
         const int group0 = (k_tile * BK) / Q5RowSplitStorage::kGroupK;
-#pragma unroll 1
+        NINFER_STAGE_UNROLL
         for (int item = tid; item < BM * GPB * 2; item += Schedule::kThreads) {
             const int row_group = item >> 1;
             const int half      = item & 1;
@@ -228,7 +239,7 @@ void q5_rowsplit_gemm_mma_kernel(
             }
         }
 
-#pragma unroll 1
+        NINFER_STAGE_UNROLL
         for (int row_group = tid; row_group < BM * GPB; row_group += Schedule::kThreads) {
             const int local_row = row_group / GPB;
             const int group     = row_group - local_row * GPB;
@@ -249,7 +260,7 @@ void q5_rowsplit_gemm_mma_kernel(
             }
         }
 
-#pragma unroll 1
+        NINFER_STAGE_UNROLL
         for (int row_group = tid; row_group < BM * GPB; row_group += Schedule::kThreads) {
             const int local_row   = row_group / GPB;
             const int group       = row_group - local_row * GPB;

@@ -299,11 +299,14 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
                                     const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
                                     const ExecutionContext& ec);
 
-/** Q4G64_F16S/Q5G64_F16S split-storage two-weight form. */
+/** Q4G64_F16S/Q5G64_F16S split-storage two-weight form. `workspace` may be null on a rank, in
+ * which case that rank keeps the route that needs no transient storage. */
 void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
                                     const std::array<Weight, 2>& query_key_weight,
                                     const std::array<Weight, 2>& value_z_weight,
                                     const std::array<Tensor, 2>& qkv, const std::array<Tensor, 2>& z,
+                                    LinearPolicy policy,
+                                    const std::array<WorkspaceArena*, 2>& workspace,
                                     const ExecutionContext& ec);
 
 // --- Tensor-parallel split forms of the fused projection+conv1d+SiLU pair (tp == 2) -------------

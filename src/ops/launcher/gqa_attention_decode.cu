@@ -106,12 +106,18 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
     // The Volta tensor-core kernel always splits the head dim 4 ways (DimSplit=4, enforced
     // by its own static_assert), independent of the Ampere+ dispatch table's per-TokenTile
     // WarpsPerCta choice -- see gqa_attention_prefill_volta.cuh's file comment for why.
+    //
+    // Narrow widths deliberately stay here. Routing T=1 to the SIMT body was measured 5.6%
+    // SLOWER on the 85k acceptance workload (48.6 -> 46.1 tok/s, history.md E): the SIMT body
+    // re-reads the whole key range once per row (no shared K/V staging), so its 6-row draft
+    // pass moves 6x the KV bytes per launch, and at 85k tokens that working set no longer fits
+    // the L2 the way it does at short context.
     constexpr int kBlock = 128;
     gqa_attention_small_t_tc_volta_partial_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
                                                   CacheInput><<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), input,
-        static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
-        static_cast<__nv_bfloat16*>(cache_v.data),
+        static_cast<const std::int32_t*>(pos.data), static_cast<half*>(cache_k.data),
+        static_cast<half*>(cache_v.data),
         static_cast<const std::int32_t*>(cache.block_tables.data),
         invocation.valid_columns == nullptr
             ? nullptr
@@ -124,12 +130,12 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
         static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
 #else
     constexpr int kBlock = 32 * WarpsPerCta;
-    // bf16 kernel uses only static smem (no dynamic staging).
+    // The fp16-operand kernel uses only static smem (no dynamic staging).
     gqa_attention_small_t_tc_partial_bf16_kernel<Geometry, TokenTile, WarpsPerCta, MultiBatch,
                                                  Masked, CacheInput><<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(q.data), input,
-        static_cast<const std::int32_t*>(pos.data), static_cast<__nv_bfloat16*>(cache_k.data),
-        static_cast<__nv_bfloat16*>(cache_v.data),
+        static_cast<const std::int32_t*>(pos.data), static_cast<half*>(cache_k.data),
+        static_cast<half*>(cache_v.data),
         static_cast<const std::int32_t*>(cache.block_tables.data),
         invocation.valid_columns == nullptr
             ? nullptr
@@ -335,7 +341,7 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::FP16 && cache_dtype != DType::I8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }

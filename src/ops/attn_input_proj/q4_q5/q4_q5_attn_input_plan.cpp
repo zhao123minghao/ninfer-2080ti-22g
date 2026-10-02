@@ -264,11 +264,11 @@ void q4_q5_attn_input_execute_plan(const Q4Q5AttnInputPlan& plan, const Tensor& 
         return;
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR16C64S3:
         q4_q5_attn_input_grouped_mma_r16_c64_s3_launch(x, query_key_weight, gate_value_weight, q,
-                                                       gate, k, v, stream);
+                                                       gate, k, v, &workspace, stream);
         return;
     case Q4Q5AttnInputScheduleId::GroupedHomogeneousPairMmaR32C64S4:
         q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q,
-                                                       gate, k, v, stream);
+                                                       gate, k, v, &workspace, stream);
         return;
     case Q4Q5AttnInputScheduleId::CutlassSm70TensorCore:
 #ifdef NINFER_VOLTA_BUILD
@@ -313,9 +313,21 @@ void q4_q5_attn_input_dispatch_shard(const Tensor& x, const Weight& query_key_we
     launch_q5_volta_mma(x, gate_value_weight, gate, false, 0, workspace, stream);
     launch_q5_volta_mma(x, gate_value_weight, v, false, problem.query_rows, workspace, stream);
 #else
-    (void)workspace;
+    // The decode leaf the grouped-MMA route was never meant to serve: its 32x64 tile pays ~64
+    // columns of MMA work for one real column, and the whole op collapses to a bandwidth-bound
+    // GEMV/SIMT sweep. The shard's own fused split-output kernels exist at the halved extents, so
+    // small T takes them and every wider T (prefill) keeps the row-generic grouped MMA. The range
+    // covers the plain decode round (T=1) and every decode round width this build admits, which is
+    // concurrency * (1 + draft) rather than the single-request 1 + draft: with two active requests
+    // and three drafts a round is eight columns, not four, and the original six-column edge sent
+    // that round straight to the prefill tile (measured 3x per call, history.md 22.3).
+    if (problem.cols <= 12) {
+        q4_q5_attn_input_small_t_shard_launch(x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                              stream);
+        return;
+    }
     q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(x, query_key_weight, gate_value_weight, q, gate,
-                                                   k, v, stream);
+                                                   k, v, &workspace, stream);
 #endif
 }
 

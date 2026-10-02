@@ -548,9 +548,9 @@ std::vector<T> slice_head_major(const std::vector<T>& source, std::int32_t leadi
 gqa::HostCache slice_cache_heads(const gqa::HostCache& source, int rank) {
     const std::int32_t begin = rank * kLocalAttn.kv_heads;
     gqa::HostCache result{kLocalAttn, source.dtype, source.max_context, source.logical_capacity};
-    result.k_bf16 = slice_head_major(source.k_bf16, gqa::kHeadDim, source.logical_capacity, begin,
+    result.k_f16 = slice_head_major(source.k_f16, gqa::kHeadDim, source.logical_capacity, begin,
                                      kLocalAttn.kv_heads);
-    result.v_bf16 = slice_head_major(source.v_bf16, gqa::kHeadDim, source.logical_capacity, begin,
+    result.v_f16 = slice_head_major(source.v_f16, gqa::kHeadDim, source.logical_capacity, begin,
                                      kLocalAttn.kv_heads);
     return result;
 }
@@ -657,14 +657,14 @@ int run_mtp_round(const ExecutionContext& ec, const ops::PeerEvents& events,
     // One logical KV pool; device 0 gets all 4 KV heads for the tp1 leg, rank r gets its own 2.
     const std::int32_t max_context = base_keys + tokens;
     const gqa::HostCache global_cache =
-        gqa::make_cache(kGlobalAttn, DType::BF16, max_context, seed + 13u);
+        gqa::make_cache(kGlobalAttn, DType::FP16, max_context, seed + 13u);
     const std::array<gqa::HostCache, 2> local_cache{slice_cache_heads(global_cache, 0),
                                                     slice_cache_heads(global_cache, 1)};
 
     const std::size_t attn_workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        kGlobalAttn.q_heads, DType::BF16, envelope, 1, tokens, tokens);
+        kGlobalAttn.q_heads, DType::FP16, envelope, 1, tokens, tokens);
     const std::size_t shard_attn_workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
-        kLocalAttn.q_heads, DType::BF16, envelope, 1, tokens, tokens);
+        kLocalAttn.q_heads, DType::FP16, envelope, 1, tokens, tokens);
 
     // ---------------------------------------------------------------------------------------
     // (a) tp1 reference on device 0.
@@ -2489,13 +2489,16 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
+    // Widest collective this suite presents: one column of the 131072-row draft head, 65536 rows
+    // x 2 B = 128 KiB. The pinned staging is sized for the declared bound once and never moved.
+    constexpr std::size_t kPeerStagingBytes = 1u << 20;
+    const bool peer_access = ops::enable_peer_access(ec, kPeerStagingBytes);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (CUDA stages the device-to-device copies through "
                                 "host memory)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, kPeerStagingBytes);
 
     failures += verify_rejections(ec);
     failures += verify_conv_channel_map();

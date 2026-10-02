@@ -4,6 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
 #include "ops/common/token_slices.h"
+#include "ops/linear/f16/f16_materialized_gemm.h"
 
 #include <cstdint>
 
@@ -34,12 +35,29 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
 }
 
 void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
+                  Tensor& qkv, Tensor& z, WorkspaceArena* workspace, cudaStream_t stream) {
     // value_z_weight always stacks V then Z at equal row counts (value_z_weight.n / 2),
     // true at both the tp1 parent (12288 -> 6144) and the tp2 column shard (6144 -> 3072) -- read at
     // runtime instead of the tp1-only literal so this launcher serves both shapes unchanged.
     const std::int32_t kValueRows = value_z_weight.n / 2;
     using Schedule                = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
+
+    // The fp16 materialization route replaces this grouped kernel's in-loop dequantization and
+    // bf16 -> fp16 fragment restaging (see ops/linear/f16/f16_materialized_gemm.h). The three jobs
+    // are row views of the same two packed weights, so they share one materialized buffer and one
+    // activation conversion. It declines when the call is not admitted, leaving the registered
+    // route below.
+    if (workspace != nullptr) {
+        const F16GroupedJob f16_jobs[3] = {
+            {&qk_weight, 0, qk_weight.n, static_cast<__nv_bfloat16*>(qkv.data), qkv.ne[0], 0},
+            {&value_z_weight, 0, kValueRows, static_cast<__nv_bfloat16*>(qkv.data), qkv.ne[0],
+             qk_weight.n},
+            {&value_z_weight, kValueRows, kValueRows, static_cast<__nv_bfloat16*>(z.data), z.ne[0],
+             0},
+        };
+        if (launch_f16_materialized_grouped(x, f16_jobs, 3, *workspace, stream)) { return; }
+    }
+
     const RowSplitGroupedMmaJob qk    = make_job(qk_weight, 0, qk_weight.n, qkv, 0);
     const RowSplitGroupedMmaJob value = make_job(value_z_weight, 0, kValueRows, qkv, qk_weight.n);
     const RowSplitGroupedMmaJob output_gate =
@@ -69,14 +87,15 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
-                                        cudaStream_t stream) {
+                                        WorkspaceArena* workspace, cudaStream_t stream) {
     constexpr std::int32_t kTileCols = 128;
     const bool full                  = (x.ne[1] % kTileCols) == 0;
     for_each_token_slice(x.ne[1], kTileCols, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor qkv_slice     = qkv.slice(1, offset, count);
         Tensor z_slice       = z.slice(1, offset, count);
-        launch_slice(full, x_slice, qk_weight, value_z_weight, qkv_slice, z_slice, stream);
+        launch_slice(full, x_slice, qk_weight, value_z_weight, qkv_slice, z_slice, workspace,
+                     stream);
     });
 }
 

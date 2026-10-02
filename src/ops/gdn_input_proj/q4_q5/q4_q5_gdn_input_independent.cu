@@ -22,8 +22,8 @@ constexpr std::int32_t kZRows      = 6144;
 constexpr std::int32_t kValueZRows = kValueRows + kZRows;
 constexpr std::int32_t kHidden     = 5120;
 
-using Q4GdnSimtR8C4Schedule = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 1>;
-using Q4GdnSimtR8C8Schedule = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 1>;
+using Q4GdnSimtR8C4Schedule = Q4RowSplitSimtGemmSchedule<8, 4, 16, 2, Cache::ca, 3>;
+using Q4GdnSimtR8C8Schedule = Q4RowSplitSimtGemmSchedule<8, 8, 16, 2, Cache::ca, 3>;
 
 void launch_q4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using Schedule = Q4GemvR1W8DirectSchedule;
@@ -228,6 +228,160 @@ void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight
     }
     launch_q4(x, qk_weight, qk, stream);
     launch_q5(x, value_z_weight, value, z, stream);
+}
+
+// --- tp2 column shard (qk 2048, value/z 3072 each; fused value_z parent 6144) -------------------
+//
+// The tp1 small-T launchers above are compile-time-exact to the 4096/12288 parents. The shard is
+// the same two GEMV bodies at the halved row counts: the Q4 GEMV reads `rows` from the launch and
+// writes a single output (no split seam), and the Q5 GEMV is templated on both its row count and
+// its value|z seam. Decode T=1 is the leaf this exists for -- the grouped-MMA route's 64x128 tile
+// exists for prefill widths and pays a whole tile per decode column.
+namespace {
+
+constexpr std::int32_t kShardQkRows      = 2048;
+constexpr std::int32_t kShardValueZRows  = 6144;
+constexpr std::int32_t kShardValueRows   = 3072;
+
+void launch_shard_q4_gemv(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Schedule = Q4GemvR1W8DirectSchedule;
+    const dim3 grid(static_cast<unsigned>(div_up(kShardQkRows, Schedule::kRowsPerCta)), 1u, 1u);
+    constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
+    q4_rowsplit_gemv_kernel<Schedule><<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
+        nullptr, kShardQkRows, kHidden);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_shard_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                          cudaStream_t stream) {
+    constexpr int kRowsPerBlock = 16;
+    constexpr int kBlockThreads = kRowsPerBlock * 32;
+    constexpr int kGrid         = kShardValueZRows / kRowsPerBlock;
+    q5_rowsplit_gemv_kernel<kShardValueZRows, kHidden, kRowsPerBlock, 2, true, false, true,
+                            kShardValueRows><<<kGrid, kBlockThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(value.data),
+        static_cast<__nv_bfloat16*>(z.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// T in [2,6]: the shard's own instantiations of the SIMT pair the tp1 IndependentDirectFixed route
+// uses (see launch_q4_simt / launch_q5_split4 above). Every extents argument the tp1 launchers take
+// from kQkRows/kValueZRows/kValueRows is taken from the shard's kShard* instead; the leading
+// dimensions, the runtime column count and the full_slabs argument are passed exactly as the tp1
+// forms pass them. The SIMT kernels read cols from the launch, so one instantiation per tile
+// schedule covers the whole range. The upper edge is the widest decode round this build admits --
+// concurrency * (1 + draft), not the single-request 1 + draft; see the matching note in
+// attn_input_proj's shard leaf.
+constexpr std::int32_t kShardMaxCols = 12;
+
+template <class Schedule, bool Full>
+void launch_shard_q4_simt(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    const std::int32_t cols   = x.ne[1];
+    const std::int32_t out_ld = static_cast<std::int32_t>(out.nb[1] / sizeof(__nv_bfloat16));
+    const dim3 grid(static_cast<unsigned>(div_up(kShardQkRows, Schedule::kRowsPerCta)),
+                    static_cast<unsigned>(div_up(cols, Schedule::kColsPerTile)), 1u);
+    q4_rowsplit_gemm_simt_kernel<Schedule, Full><<<grid, Schedule::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(out.data),
+        nullptr, out_ld, 0, kShardQkRows, kHidden, cols, weight.padded_shape[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_shard_q4_simt_route(const Tensor& x, const Weight& weight, Tensor& out,
+                                cudaStream_t stream) {
+    using Schedule = Q4GdnSimtR8C4Schedule;
+    const bool full = (kShardQkRows % Schedule::kRowsPerCta) == 0 &&
+                      ((kHidden / Q4RowSplitStorage::kGroupK) % Schedule::kGroupsPerStage) == 0 &&
+                      (x.ne[1] % Schedule::kColsPerTile) == 0;
+    if (full) {
+        launch_shard_q4_simt<Schedule, true>(x, weight, out, stream);
+    } else {
+        launch_shard_q4_simt<Schedule, false>(x, weight, out, stream);
+    }
+}
+
+template <int Cols>
+void launch_shard_q5_split4(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                            cudaStream_t stream) {
+    constexpr int kThreads = 4 * 32;
+    const std::int32_t out_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    // Two rows per CTA: this Op is at 92% of the L1 ceiling and x is the same column block for
+    // every output row, so one shared x decode per two rows is the whole lever (history.md §39).
+    constexpr int kRowsPerCta = 2;
+    constexpr int kGrid       = (kShardValueZRows + kRowsPerCta - 1) / kRowsPerCta;
+    const dim3 grid(static_cast<unsigned>(kGrid), 1u, 1u);
+    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, Cols, 5, kHidden, true,
+                                        kShardValueRows, Q5Split4StoreEpilogue, false, false,
+                                        kRowsPerCta><<<grid, kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(value.data),
+        static_cast<__nv_bfloat16*>(z.data), kShardValueZRows, out_ld, kHidden, Cols,
+        weight.padded_shape[1], 5);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_shard_q5_simt(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                          cudaStream_t stream) {
+    switch (x.ne[1]) {
+    case 2:
+        launch_shard_q5_split4<2>(x, weight, value, z, stream);
+        return;
+    case 3:
+        launch_shard_q5_split4<3>(x, weight, value, z, stream);
+        return;
+    case 4:
+        launch_shard_q5_split4<4>(x, weight, value, z, stream);
+        return;
+    case 5:
+        launch_shard_q5_split4<5>(x, weight, value, z, stream);
+        return;
+    case 6:
+        launch_shard_q5_split4<6>(x, weight, value, z, stream);
+        return;
+    case 7:
+        launch_shard_q5_split4<7>(x, weight, value, z, stream);
+        return;
+    case 8:
+        launch_shard_q5_split4<8>(x, weight, value, z, stream);
+        return;
+    case 9:
+        launch_shard_q5_split4<9>(x, weight, value, z, stream);
+        return;
+    case 10:
+        launch_shard_q5_split4<10>(x, weight, value, z, stream);
+        return;
+    case 11:
+        launch_shard_q5_split4<11>(x, weight, value, z, stream);
+        return;
+    case 12:
+        launch_shard_q5_split4<12>(x, weight, value, z, stream);
+        return;
+    default:
+        throw std::invalid_argument("GDN Q5 shard split4 requires T in [2,12]");
+    }
+}
+
+} // namespace
+
+void q4_q5_gdn_input_independent_shard_launch(const Tensor& x, const Weight& qk_weight,
+                                              const Weight& value_z_weight, Tensor& qk,
+                                              Tensor& value, Tensor& z, cudaStream_t stream) {
+    if (x.ne[1] == 1) {
+        launch_shard_q4_gemv(x, qk_weight, qk, stream);
+        launch_shard_q5_gemv(x, value_z_weight, value, z, stream);
+        return;
+    }
+    if (x.ne[1] <= kShardMaxCols) {
+        launch_shard_q4_simt_route(x, qk_weight, qk, stream);
+        launch_shard_q5_simt(x, value_z_weight, value, z, stream);
+        return;
+    }
+    throw std::invalid_argument("GDN Q4/Q5 shard small-T launch requires T in [1,6]");
 }
 
 } // namespace ninfer::ops::detail

@@ -364,15 +364,43 @@ the paired rows. Both rows of a pair are single runs on the same idle machine, i
 | Occupied context | `--kv-dtype` | Decode | MTP acceptance | tok/round | Round time | Prefill |
 |---:|---|---:|---:|---:|---:|---:|
 | 16,042 | `int8` | 48.50 tok/s | 42.68% | 2.25 | 46.4 ms | 386 tok/s |
-| 16,042 | `bf16` | **64.30 tok/s** | **67.74%** | **3.00** | 46.7 ms | 371 tok/s |
+| 16,042 | `fp16` | **64.30 tok/s** | **67.74%** | **3.00** | 46.7 ms | 371 tok/s |
 | 85,070 | `int8` | 39.91 tok/s | 50.00% | 2.48 | 62.1 ms | 300 tok/s |
-| 85,070 | `bf16` | **45.69 tok/s** | **62.12%** | **2.86** | 62.6 ms | 254 tok/s |
+| 85,070 | `fp16` | **45.69 tok/s** | **62.12%** | **2.86** | 62.6 ms | 254 tok/s |
+
+Both 16-bit rows above were measured while the cache still stored BF16 words and every attention
+kernel widened them to FP16 on the fly. The cache now stores the FP16 tensor-core operand directly,
+with the widening moved to the write (see [choosing the KV-cache dtype](cli.md#choosing-the-kv-cache-dtype)).
+That is not a precision change: the mma operands are bit-identical to the ones the kernels used to
+build from the same bits, so acceptance is unchanged. Re-measured on the host-staged pair
+(`--devices 0,2`, same artifact, same prompt, same flags, `--max-new 64`), the 85,070-token
+acceptance workload went from 48.70 tok/s to 50.09 / 49.97 / 49.95 tok/s (+2.7%) with the MTP
+acceptance rate, acceptance length, and per-position accept counts (20,14,7) all unchanged at
+62.12% / 2.86. One nsys profile of that run attributes it: the small-T decode attention kernel
+measures 784.1 -> 704.3 us per launch (-10.2%) over the same 950 launches, the prefill attention
+kernel -12.8%, and total kernel time across the whole run -4.4%.
+
+**That `50.09` figure is a dated step, not the current result.** On the same pair, the same
+artifact, the same prompt and the same flags, this target now measures **54.31 / 54.36 / 54.32 /
+54.26 committed decode tok/s** at instrumentally identical acceptance counters -- 22 MTP rounds,
+62.12% acceptance, 2.86 tokens/round, per-position accept counts 20/14/7. Those four runs were
+interleaved in one session with a freshly rebuilt control binary that read **53.80 tok/s** at the
+same counters, which is the pair that isolates the last change (`+0.94%`, section 39 of
+`history.md`); the counters are those of the `45.69` row in the table above, so the whole
+`fp16`-cache era reads **45.69 -> 54.3, +19%**, and none of it moved the committed token stream. The
+later changes are recorded in `history.md`; the profile behind the current bill is section 37 of
+that file, re-taken after section 39.
+
+**The `int8` rows are dated.** Re-measured at the same 85,070 occupied tokens, the same flags and
+`--max-new 64`, `int8` now reads **42.05 tok/s / 43.75% acceptance / 2.30 tok/round** while `fp16`
+reads 54.31 / 54.36 tok/s at 62.12% / 2.86. The dtype conclusion is unchanged -- `int8` is 22.4%
+slower and 18.4 acceptance points down -- and the deficit has widened rather than closed.
 
 Round time is derived as `tok/round / decode`; it is reported because it is the quantity that did
 *not* change. At both context lengths the two dtypes agree on it within one percent, in spite of
-`bf16` reading twice the KV bytes. The attention kernel is latency-bound at this width and occupancy,
+`fp16` reading twice the KV bytes. The attention kernel is latency-bound at this width and occupancy,
 not bandwidth-bound, so the halved footprint buys no time, while the `int8` staging path pays a
-dequantization the `bf16` path does not. What `int8` does cost is accuracy: 15.4 acceptance points at
+dequantization the `fp16` path does not. What `int8` does cost is accuracy: 15.4 acceptance points at
 85,070 tokens and 25.1 at 16,042, which is a 19.5% and 37% throughput penalty respectively, and it is
 larger than the round-time difference it was supposed to buy.
 
@@ -390,7 +418,7 @@ tensor-core kernel the verify width uses left the 16,042-token acceptance bit-id
   symmetric `absmax/127` scale already holds about 43 dB of SNR on a Gaussian input, and halving the
 group buys roughly 1 dB, against a deficit of 15-25 acceptance points.
 
-Consequently this checkout's default remains `bf16`, and the `int8` value is selected explicitly by
+Consequently this checkout's default remains `fp16`, and the `int8` value is selected explicitly by
 callers that need its capacity -- including the V100X2 launcher, whose own recorded measurements were
 taken with `int8`.
 
@@ -405,16 +433,16 @@ same-session A/B in which only the route differs:
 
 | Configuration | Host-staged | Direct |
 |---|---:|---:|
-| 85,070 tokens, `bf16` | 45.53 tok/s | **46.89** (46.83 / 46.86 / 46.88 / 46.99) |
+| 85,070 tokens, `fp16` | 45.53 tok/s | **46.89** (46.83 / 46.86 / 46.88 / 46.99) |
 | 85,070 tokens, `int8` | 39.95 | **41.03** (41.00 / 41.07) |
-| 16,042 tokens, `bf16` | 60.69 (61.18 / 60.20) | **63.38** (64.69 / 62.60 / 62.85) |
+| 16,042 tokens, `fp16` | 60.69 (61.18 / 60.20) | **63.38** (64.69 / 62.60 / 62.85) |
 | 16,042 tokens, `int8` | 46.28 (47.17 / 45.55 / 46.13) | **46.58** (46.58 / 46.68 / 46.47) |
 
 Prefill moves the same way, which is expected because a 4,096-token chunk's all-reduce is the
 largest payload the collectives carry: at 85,070 tokens it measures 256.55 -> 268.27 tok/s for
-`bf16` and 300.97 -> 317.46 for `int8`.
+`fp16` and 300.97 -> 317.46 for `int8`.
 
-MTP acceptance is **bit-identical** on both routes -- 62.12% and 2.86 tokens/round at 85,070 `bf16`,
+MTP acceptance is **bit-identical** on both routes -- 62.12% and 2.86 tokens/round at 85,070 `fp16`,
 50.00% and 2.48 at 85,070 `int8`. That is structural rather than incidental: both routes deliver the
 same bytes into the same staging tensor and then run the same combine, so the committed token stream
 must not move. At the operator level, the same 10 KiB decode-shaped all-reduce that
@@ -425,8 +453,128 @@ At 85,070 tokens the host-staged route reproduced its earlier value closely -- 4
 45.69 in the table above, and four direct runs spread 0.17% -- while at 16,042 tokens the same
 unchanged configuration moved from **64.30 tok/s** in the table to **60.69** in the A/B session. The
 paired comparison inside one session is therefore the durable evidence for the transport change, and
-a single absolute value at the short context is not. The current build's 85,070-token `bf16`
-acceptance result is **46.89 tok/s** at 62.12% acceptance.
+a single absolute value at the short context is not.
+
+The A/B above was measured **before the KV cache moved to FP16 storage**, and its scope is one fixed
+device pair with only the route toggled. After that change the same 85,070-token `fp16` acceptance
+workload measured **47.86 tok/s** on the direct `0,1` pair and **50.10 tok/s** on the host-staged
+`0,2` pair, both at 62.12% acceptance. Since then `0,2` has moved to **54.31 / 54.36 / 54.32 / 54.26
+tok/s** at the same acceptance counters; `0,1` was not re-measured. Those two rows differ in the card pair as well as in the
+route: `0,1` is the NVLink pair and contains this machine's slowest card, `0,2` is host-staged and
+avoids it. The route conclusion here is therefore about a fixed pair, and it does not say that the
+host-staged route is the faster one overall -- on these three cards it is not.
+
+The pair matters in both directions, and not only through the slow card. On a 32,066-token prompt
+the same build prefills at **1,220.70 tok/s** on `0,1` against **1,005.6** on `0,2` -- 21% higher on
+the NVLink pair -- while decoding within 2% of it (73.99 against 72.64 tok/s). A 4,096-token
+prefill chunk's all-reduce is the largest payload the collectives carry, so the NVLink route wins
+wherever prefill dominates; `0,2` is the better pair for long-context decode, where the slow card's
+per-launch cost is what sets the round.
+
+### External SM75 reference: `vLLM-2080Ti-Definitive`
+
+The same-hardware external point is
+[weicj/vLLM-2080Ti-Definitive](https://github.com/weicj/vLLM-2080Ti-Definitive), an SM75-focused
+vLLM fork for dual RTX 2080 Ti (and for Tesla T10/T40/T4, TITAN RTX and Quadro RTX 6000/8000).
+Same hardware, same 32K prompt and 512-token decode window, TP2, one request, prefix caching
+disabled:
+
+| Route | Prefill | Decode |
+|---|---:|---:|
+| reference `qwen27b/w8a16/mtp4-fp8kv-1x262K` | 1,393.94 tok/s | 92.47 tok/s |
+| this checkout on `0,1` | **1,220.70** | **73.99** |
+| this checkout on `0,2`, same flags | 1,005.60 (1,006.77 / 1,004.50) | 72.64 (72.63 / 72.65) |
+| remaining gap, read against `0,1` | 1.14x | 1.25x |
+
+Both checkout rows are one command -- 32,066 prompt tokens, 512 generated, `--tp 2 --max-context
+262144 --kv-dtype fp16 --spec mtp --draft-tokens 3 --lm-head-draft --greedy` -- and it reports 156
+MTP rounds and 75.64% acceptance at every point. The pair is stated because the earlier iteration of
+this table read `1,124.96 / 59.81` with no card pair or cache dtype recorded: only `0,1` sits near
+that prefill value (`0,2` is 11% below it), so that row was most likely taken there, and read that
+way the remaining gap has narrowed from 1.24x to **1.14x** on prefill and from 1.55x to **1.25x** on
+decode. The rows are single runs or pairs of runs, not campaigns.
+
+This is an order-of-magnitude reference, not a like-for-like comparison: the reference row runs FP8
+weights, an FP8 KV cache and a four-token draft window, while this checkout runs Q4/Q5/W8 weights, an
+FP16 KV cache and three drafts. It is not a quality comparison either. The two headline figures its
+README publishes for DFlash2 are explicitly qualified there as synthetic inputs with high
+speculative-hit rates, so the MTP/4 row above is the comparable one.
+
+Two things were taken from that stack, and both are recorded here as evaluated rather than assumed:
+
+- **The prefill accumulation form.** Under `__CUDA_ARCH__ == 750`, the Marlin files that fork
+  vendors use two `m16n8k8.f16.f16.f16.f16` MMAs per K step with a segment-wise fp32 reduction.
+  (Those files are upstream vLLM/Marlin code -- the fork's own contribution there is lowering the
+  Turing gates on the Python side so the routes run on `sm_75` at all.) That form -- fp16
+  accumulation inside a segment, fp32 reduction across segments -- is what this checkout adopted for
+  its prefill GEMM, measured at **+11.8%** on the then-current 32K prefill probe. It changes the
+  accumulation order only; the weight and activation operands are bit-identical to the
+  FP32-accumulation route. Its vendored CUTLASS `m8n8k16.s8` dispatch independently corroborates the
+  int8 tensor-core decomposition this checkout uses for the `int8` KV path and for QK^T.
+- **A GDN alternative, evaluated and not pursued.** The companion
+  [weicj/FlashQLA-SM70-SM75](https://github.com/weicj/FlashQLA-SM70-SM75) forward-only GDN kernel is
+  a concrete alternative to this checkout's chunked WY/UT formulation, and it reports a per-stage
+  gain of 2.08-2.1x. At GDN's measured share of a whole request that works out to roughly **+7.17%
+  prefill and +0.61% decode**, so it is recorded as not a lever at this scale rather than pursued.
+
+## Concurrent decode on the Turing target
+
+A decode round is formed over every active request, so a round's width is
+`concurrency × (1 + draft)` and not the single-request `1 + draft`. Three TP2-sharded operator
+families -- attention input projection, GDN input projection, and the q5 residual projection -- had
+their "small-T" specialization edge written as the single-request figure `6`. Every wider round
+therefore fell through to the prefill tiling: a 32×64 tile or a 64×16 MMA tile pays a whole tile
+per real column. `nsys` on the same two-request workload shows the flip directly -- `q5`
+per-round call counts are unchanged (≈106 vs ≈107) while the selected kernel changes from
+`q5_rowsplit_gemm_simt_kernel` (91 µs/launch) to `q5_rowsplit_gemm_mma_kernel` (305 µs/launch,
+**3.3×**), and `rowsplit_grouped_mma_kernel` rises from 64 to 1920 launches. Attention was never
+involved: the C=2 decode attention kernel is still
+`gqa_attention_small_t_tc_volta_partial_kernel<TokenTile=4, MultiBatch=1>`. The three edges now
+cover the concurrency widths, and round time is linear in the batch width at
+**≈10.5 ms per column**:
+
+| Draft | Concurrency | Columns | Round | Aggregate decode | Speedup |
+|---|---:|---:|---:|---:|---:|
+| MTP3 | 1 | 4 | 41.8 ms | 54.6 tok/s | 1.00× |
+| MTP3 | 2 | 8 | 83.1 ms | **55.4 tok/s** | 1.01× |
+| MTP3 | 3 | 12 | 126.3 ms | **56.5 tok/s** | 1.03× |
+| MTP3 | 4 | 16 | 160.1 ms | 61.8 tok/s | 1.13× |
+| MTP3 | 6 | 24 | 218.9 ms | **65.2 tok/s** | 1.19× |
+| off | 1 | 1 | 28.6 ms | 34.9 tok/s | 1.00× |
+| off | 2 | 2 | 33.0 ms | 60.6 tok/s | 1.74× |
+| off | 3 | 3 | 38.7 ms | **77.6 tok/s** | 2.22× |
+
+Before the fix the same measurement gave MTP3 rounds of 125.2 ms at C=2 and 143.2 ms at C=3, i.e.
+37.6 and 49.6 aggregate tok/s. The `MTP off` rows are unchanged point for point
+(28.62/28.63, 32.97/32.98, 38.66/38.68 ms) because their column counts never crossed the old edge;
+they are the control that shows the comparison was run in one environment. Acceptance is
+bit-identical at MTP3 C=1 (drafted 2658, accepted 1160, 43.64%), and the wider concurrency points
+move only within implementation-profile noise (C=3 accepts exactly the same 3548 tokens).
+
+**Concurrency no longer costs throughput.** From four to twelve columns the aggregate stays at
+54.6-56.5 tok/s, which is the single-request rate: a longer round buys proportionally more committed
+tokens and costs proportionally more time. The 16- and 24-column rows read higher (61.8 and 65.2)
+partly because the acceptance measured on those batch compositions is itself higher (48.9% and 46.4%
+against 43.6% at C=1-3), so they must not be read as batching being intrinsically faster. Where
+aggregate throughput does rise on this target is shorter draft windows, not more requests --
+`MTP off` at C=3 (77.6) and MTP1 at C=2 (81.6) both beat every MTP3 width. The quantity that decides
+this is **per-column token yield**: at 43.6% acceptance a verify column returns 0.44 committed
+tokens, while a plain decode column returns one.
+
+Method: `tools/bench/run_serve_concurrency.py --suite decode-saturation --mode mtp3 --mode mtp0
+--concurrency 1 --concurrency 2 --concurrency 3 --decode-tokens 2048 --max-context 16384
+--kv-capacity auto --kv-dtype fp16 --tp 2 --devices 0,2 --device 0`, the same 335-token prompt at
+every point, one server process per point, counting only complete intervals whose decode batch
+equals the configured concurrency. Kernel-level evidence and the refuted alternative explanations
+are recorded in `history.md` §22-23.
+
+The edge those three families now use (small-T specialization through 12 columns) was checked at the
+same column count rather than extrapolated: forcing 16 and 24 columns back onto the SIMT
+specialization costs **6.4%** (170.40 vs 160.13 ms) and **22.5%** (268.06 vs 218.91 ms) against the
+MMA routes, so the partition is measured, not chosen for symmetry. Round time stays linear across
+the whole range — 4/8/12/16/24 columns at 41.8 / 83.1 / 126.3 / 160.1 / 218.9 ms, i.e. 10.4 down to
+9.1 ms per column as the fixed per-round cost amortizes. Note that this last figure must not be read
+across column counts; only same-width A/B separates a route from an amortization effect.
 
 ## Inherited RTX 5090 campaigns
 
@@ -849,7 +997,7 @@ of final response on agentic tasks -- sits far above all three break-even points
 - **Different KV dtypes.** vLLM FP8, NInfer INT8. That affects both the memory rows and attention
   bandwidth, so it is present in both the prefill and the decode columns.
 - **Different prefill chunking, unswept.** vLLM `--max-num-batched-tokens 16768` against NInfer
-  `--prefill-chunk 1024`, the value the 1M configuration ships with. Neither was swept.
+  `--prefill-chunk 1024`, the value that 1M comparison was run with. Neither was swept.
 - **No vLLM MTP-off row.** Speculative decoding is fixed at launch and turning it off needs a
   restart with a different `--speculative-config`; that run was not made. vLLM's 653k and 700k rows
   are therefore MTP-off *behaviour* at MTP-on *cost*, which is worse than a true MTP-off run would

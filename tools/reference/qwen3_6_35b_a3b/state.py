@@ -15,10 +15,10 @@ class KVCache:
         layers: int,
         capacity: int,
         device: torch.device,
-        dtype: str = "bf16",
+        dtype: str = "fp16",
     ):
-        if dtype not in {"bf16", "int8"}:
-            raise ValueError(f"kv dtype must be bf16/int8, got {dtype!r}")
+        if dtype not in {"fp16", "int8"}:
+            raise ValueError(f"kv dtype must be fp16/int8, got {dtype!r}")
         if capacity <= 0:
             raise ValueError("KV capacity must be positive")
         self.layers = layers
@@ -35,7 +35,7 @@ class KVCache:
         if layer in self._k:
             return
         shape = (self.capacity, CFG.kv_heads, CFG.head_dim)
-        if self.dtype == "bf16":
+        if self.dtype == "fp16":
             self._k[layer] = torch.empty(
                 shape, device=self.device, dtype=torch.bfloat16
             )
@@ -86,7 +86,7 @@ class KVCache:
         if start < 0 or end > self.capacity or v.shape != k.shape:
             raise ValueError("KV write range or shape mismatch")
         self._allocate(layer)
-        if self.dtype == "bf16":
+        if self.dtype == "fp16":
             self._k[layer][start:end].copy_(k)
             self._v[layer][start:end].copy_(v)
         else:
@@ -100,7 +100,7 @@ class KVCache:
     def read(self, layer: int, end: int) -> tuple[torch.Tensor, torch.Tensor]:
         if end < 0 or end > self.capacity or layer not in self._k:
             raise ValueError("KV read range or layer mismatch")
-        if self.dtype == "bf16":
+        if self.dtype == "fp16":
             return self._k[layer][:end], self._v[layer][:end]
         return (
             self._dequantize(self._k[layer][:end], self._ks[layer][:end]),

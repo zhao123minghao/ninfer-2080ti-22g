@@ -1,6 +1,8 @@
 #include "ninfer/ops/kv_cache_append_prefix.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
+
 #include <cuda_runtime.h>
 
 #include <array>
@@ -49,14 +51,30 @@ std::size_t paged_cache_index(int d, int head, int position,
                      static_cast<std::size_t>(kPhysicalPages) * static_cast<std::size_t>(head)));
 }
 
+// The op's K/V inputs are bf16 activations and the cache stores fp16, so the append is a
+// widening conversion. These words are arbitrary finite bf16 values whose significand (7 bits)
+// and exponent both fit fp16's normal range, which makes the widening exactly value-preserving --
+// the property the cache comparison then checks.
 std::vector<std::uint16_t> patterned_bits(std::size_t count, std::uint32_t seed) {
     std::vector<std::uint16_t> bits(count);
     std::uint32_t state = seed;
     for (auto& bit : bits) {
         state = state * 1664525u + 1013904223u;
-        bit   = static_cast<std::uint16_t>(state >> 16);
+        const std::uint16_t sign = static_cast<std::uint16_t>((state >> 16) & 0x8000u);
+        // bf16 biased exponent 113..142 == fp16 biased exponent 1..30 (both normal).
+        const std::uint16_t exp =
+            static_cast<std::uint16_t>(113u + ((state >> 13) % 30u));
+        const std::uint16_t mantissa = static_cast<std::uint16_t>((state >> 16) & 0x007fu);
+        bit = static_cast<std::uint16_t>(sign | (exp << 7) | mantissa);
     }
     return bits;
+}
+
+// One cache word for a bf16 input word: the same widening the kernel performs, and exact for
+// every value patterned_bits produces.
+std::uint16_t cache_word_from_bf16(std::uint16_t word) {
+    const __half widened = __float2half_rn(bf16_to_f32(word));
+    return *reinterpret_cast<const std::uint16_t*>(&widened);
 }
 
 void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_t>& cache_v,
@@ -72,8 +90,8 @@ void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_
                 const auto src = input_index(d, head, token);
                 const auto dst = cyclic ? cyclic_cache_index(d, head, slot)
                                         : paged_cache_index(d, head, position, mapping);
-                cache_k[dst]   = input_k[src];
-                cache_v[dst]   = input_v[src];
+                cache_k[dst]   = cache_word_from_bf16(input_k[src]);
+                cache_v[dst]   = cache_word_from_bf16(input_v[src]);
             }
         }
     }
@@ -82,12 +100,12 @@ void append_oracle(std::vector<std::uint16_t>& cache_k, std::vector<std::uint16_
 PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
                                  DeviceBuffer& block_table, int table_rows = 1) {
     return {
-        .k_pages      = Tensor(k.data(), DType::BF16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
-        .v_pages      = Tensor(v.data(), DType::BF16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
+        .k_pages      = Tensor(k.data(), DType::FP16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
+        .v_pages      = Tensor(v.data(), DType::FP16, {kHeadDim, kPage, kPhysicalPages, kKVHeads}),
         .block_tables = Tensor(block_table.p, DType::I32, {kLogicalPages, table_rows}),
         .head_dim     = kHeadDim,
         .num_kv_heads = kKVHeads,
-        .dtype        = DType::BF16,
+        .dtype        = DType::FP16,
         .quant_group  = 0,
     };
 }
@@ -95,8 +113,8 @@ PagedKVBatchLayerView paged_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
 CyclicKVCacheLayerView cyclic_view(GuardedDeviceBuffer& k, GuardedDeviceBuffer& v,
                                    int lane_capacity = 1) {
     return {
-        .k        = Tensor(k.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
-        .v        = Tensor(v.data(), DType::BF16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
+        .k        = Tensor(k.data(), DType::FP16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
+        .v        = Tensor(v.data(), DType::FP16, {kHeadDim, kWindow, kKVHeads, lane_capacity}),
         .capacity = kWindow,
         .padded_capacity = kWindow,
         .num_kv_heads    = kKVHeads,
@@ -369,8 +387,8 @@ int batch_selector_case(bool cyclic) {
                                          lane_cache_count +
                                      cyclic_cache_index(d, head, position % kWindow)
                                : paged_cache_index(d, head, position, mapping);
-                    expected_k[dst] = host_k[src];
-                    expected_v[dst] = host_v[src];
+                    expected_k[dst] = cache_word_from_bf16(host_k[src]);
+                    expected_v[dst] = cache_word_from_bf16(host_v[src]);
                 }
             }
         }

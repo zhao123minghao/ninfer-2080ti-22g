@@ -54,6 +54,13 @@
 //     return) overwrites it. For allreduce_sum that protects the in-place combine; for both ops it
 //     is what makes back-to-back calls that reuse the same buffers safe.
 //
+//     It stays there, at the end of the call, and cannot be hoisted ahead of the export whose
+//     pinned slot it also protects -- even though hoisting would take it off the call's critical
+//     path, since a consumer's producer kernel sits between the two. At that point in a stream
+//     capture the peer's stream has not joined yet (the fork is the wait(transfer_ready[1-r])
+//     above), so waiting on the peer event's previous, uncaptured record raises
+//     cudaErrorStreamCaptureIsolation. Measured, not inferred: history.md section 38.
+//
 // POST-CONDITION. On return each rank's stream is ordered after the peer's read of that rank's
 // inputs. Therefore an unbounded sequence of calls sharing the same buffers, staging, and
 // PeerEvents needs NO host synchronization between calls -- which is exactly what a captured
@@ -95,7 +102,7 @@ namespace ninfer::ops {
 // Qualifies the actual cross-device copy route at startup. When both directions advertise peer
 // access, enables it and checks exact payloads through the collectives' own UVA D2D API on their
 // destination compute streams: several sizes bracketing the real payload range up to and including
-// the full host-staging cap, plus a sliced walk that covers every mapping of that buffer with many
+// `host_staging_bytes`, plus a sliced walk that covers every mapping of that buffer with many
 // separate small copies. Returns true only when every probe is exact. On Linux the two devices' PCI
 // bus IDs and their /sys/bus/pci/devices/<BDF>/iommu_group/type are resolved as diagnostic context,
 // not as a gate. A data mismatch or unadvertised peer access disables both directions (including
@@ -103,11 +110,16 @@ namespace ninfer::ops {
 // diagnostic, and returns false. A failed staged check or CUDA API error throws; inference must not
 // continue.
 //
+// `host_staging_bytes` is the largest payload any collective in this program can present -- the
+// pinned staging the staged route uses is sized for it once and never moves (see PeerEvents).
+// Declaring it here rather than letting the first large prefill grow the buffer is what keeps that
+// bound honest: the probe above validates the transport at exactly this size.
+//
 // Call once during setup, before graph capture or concurrent inference. This function allocates
 // temporary probe buffers, synchronizes each compute stream, and releases its buffers while
 // restoring the caller's current device. Peer-access changes are context-level operations;
 // none of this setup is graph-capturable or belongs in a hot path. A non-TP2 context returns false.
-bool enable_peer_access(const ExecutionContext& ec);
+bool enable_peer_access(const ExecutionContext& ec, std::size_t host_staging_bytes);
 
 // The reusable cross-device ordering events: two per device, created on that device with timing
 // disabled.
@@ -124,7 +136,13 @@ bool enable_peer_access(const ExecutionContext& ec);
 // moved-from instance holds no events and must not be passed to a collective (the ops reject it).
 class PeerEvents {
 public:
-    explicit PeerEvents(const ExecutionContext& ec);
+    // Allocates the staged route's pinned slot pair once, for `host_staging_bytes` -- the largest
+    // payload any collective in this program can present. The slots are then permanent: a captured
+    // CUDA Graph bakes the host address into its D2H/H2D copy nodes, so a later reallocation would
+    // leave every replayed collective reading freed host memory (history.md 5.4). A collective
+    // whose payload exceeds the declared bound is therefore a caller error and reports one, rather
+    // than relocating storage an already-instantiated graph still points at.
+    explicit PeerEvents(const ExecutionContext& ec, std::size_t host_staging_bytes);
     ~PeerEvents();
 
     PeerEvents(const PeerEvents&)            = delete;
@@ -140,8 +158,8 @@ public:
         return pull_done_[static_cast<std::size_t>(rank)];
     }
 
-    // Host-staged transport uses one pinned slot per source rank. These slots are allocated on
-    // demand before capture and remain stable for every captured graph replay.
+    // Host-staged transport uses one pinned slot per source rank, allocated once at construction
+    // for the declared payload bound and never moved. See the constructor.
     [[nodiscard]] cudaEvent_t transfer_ready(int rank) const noexcept {
         return transfer_ready_[static_cast<std::size_t>(rank)];
     }
@@ -149,7 +167,9 @@ public:
     [[nodiscard]] void* host_staging(int rank) const noexcept {
         return host_staging_[static_cast<std::size_t>(rank)];
     }
-    void ensure_host_staging(std::size_t bytes) const;
+    // Asserts that the pinned slots cover this collective's payload. Throws when they do not: the
+    // slots must never be relocated, so an undersized declaration is a fatal configuration error.
+    void require_host_staging(std::size_t bytes) const;
 
     // False for a moved-from instance.
     [[nodiscard]] bool live() const noexcept {
@@ -158,6 +178,8 @@ public:
     }
 
 private:
+    void allocate_host_staging(std::size_t bytes) const;
+
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> transfer_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
@@ -166,7 +188,7 @@ private:
     std::array<cudaStream_t, 2> streams_{nullptr, nullptr};
     mutable std::array<void*, 2> host_staging_{nullptr, nullptr};
     mutable std::size_t host_staging_bytes_ = 0;
-    bool host_staging_ready_ = false;
+    mutable bool host_staging_ready_ = false;
 };
 
 /**

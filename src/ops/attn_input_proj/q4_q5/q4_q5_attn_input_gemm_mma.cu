@@ -4,6 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/common/rowsplit_grouped_mma.cuh"
 #include "ops/common/token_slices.h"
+#include "ops/linear/f16/f16_materialized_gemm.h"
 
 #include <cstdint>
 #include <stdexcept>
@@ -62,7 +63,24 @@ void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
 // exact kernels in q4_q5_attn_input_small_t.cu, which the shard does not use.
 template <class Schedule>
 void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
-                  Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+                  Tensor& q, Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena* workspace,
+                  cudaStream_t stream) {
+    // The fp16 materialization route replaces these two grouped kernels' in-loop dequantization and
+    // bf16 -> fp16 fragment restaging (see ops/linear/f16/f16_materialized_gemm.h). All four jobs
+    // are row views of the same two packed weights, so one call covers them, shares the activation
+    // conversion, and derives each codec from its own weight.
+    if (workspace != nullptr) {
+        const F16GroupedJob f16_jobs[4] = {
+            {&query_key_weight, 0, q.ne[0], static_cast<__nv_bfloat16*>(q.data), q.ne[0], 0},
+            {&query_key_weight, q.ne[0], k.ne[0], static_cast<__nv_bfloat16*>(k.data), k.ne[0], 0},
+            {&gate_value_weight, 0, gate.ne[0], static_cast<__nv_bfloat16*>(gate.data), gate.ne[0],
+             0},
+            {&gate_value_weight, gate.ne[0], v.ne[0], static_cast<__nv_bfloat16*>(v.data),
+             v.ne[0], 0},
+        };
+        if (launch_f16_materialized_grouped(x, f16_jobs, 4, *workspace, stream)) { return; }
+    }
+
     const bool full = (x.ne[1] % Schedule::BN) == 0;
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
         full, x, make_job(query_key_weight, 0, q.ne[0], q),
@@ -74,7 +92,8 @@ void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight&
 
 template <class Schedule>
 void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
-            Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+            Tensor& q, Tensor& gate, Tensor& k, Tensor& v, WorkspaceArena* workspace,
+            cudaStream_t stream) {
     constexpr std::int32_t kSliceCols = 128;
     for_each_token_slice(x.ne[1], kSliceCols, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
@@ -83,7 +102,7 @@ void launch(const Tensor& x, const Weight& query_key_weight, const Weight& gate_
         Tensor k_slice       = k.slice(1, offset, count);
         Tensor v_slice       = v.slice(1, offset, count);
         launch_slice<Schedule>(x_slice, query_key_weight, gate_value_weight, q_slice, gate_slice,
-                               k_slice, v_slice, stream);
+                               k_slice, v_slice, workspace, stream);
     });
 }
 
@@ -95,15 +114,17 @@ using MmaR32C64S4 = GemmCfg<32, 64, 64, 16, 16, 4, 1, false, true, true>;
 void q4_q5_attn_input_grouped_mma_r16_c64_s3_launch(const Tensor& x, const Weight& query_key_weight,
                                                     const Weight& gate_value_weight, Tensor& q,
                                                     Tensor& gate, Tensor& k, Tensor& v,
+                                                    WorkspaceArena* workspace,
                                                     cudaStream_t stream) {
-    launch<MmaR16C64S3>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+    launch<MmaR16C64S3>(x, query_key_weight, gate_value_weight, q, gate, k, v, workspace, stream);
 }
 
 void q4_q5_attn_input_grouped_mma_r32_c64_s4_launch(const Tensor& x, const Weight& query_key_weight,
                                                     const Weight& gate_value_weight, Tensor& q,
                                                     Tensor& gate, Tensor& k, Tensor& v,
+                                                    WorkspaceArena* workspace,
                                                     cudaStream_t stream) {
-    launch<MmaR32C64S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, stream);
+    launch<MmaR32C64S4>(x, query_key_weight, gate_value_weight, q, gate, k, v, workspace, stream);
 }
 
 } // namespace ninfer::ops::detail

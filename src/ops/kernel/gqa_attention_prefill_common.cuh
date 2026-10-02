@@ -19,9 +19,12 @@ namespace ninfer::ops {
 inline constexpr int kGqaPrefillHeadDim = 256;
 
 #if defined(NINFER_SM75)
-inline constexpr int kGqaPrefillBr        = 32;
+// Turing: 64 query rows over four warps instead of 32 over two, which is the same 64 KiB of query
+// and K/V staging the non-Turing branch uses. The key tile stays 32 so the online-softmax tiling is
+// unchanged; only the query tile and the warp/thread counts move. See history.md 3.20.
+inline constexpr int kGqaPrefillBr        = 64;
 inline constexpr int kGqaPrefillBc        = 32;
-inline constexpr int kGqaPrefillThreads   = 64;
+inline constexpr int kGqaPrefillThreads   = 128;
 #else
 inline constexpr int kGqaPrefillBr        = 64;
 inline constexpr int kGqaPrefillBc        = 64;
@@ -83,6 +86,13 @@ __device__ __forceinline__ void gqa_prefill_zero_output_rows(__nv_bfloat16* out,
 // two consecutive signed bytes into each b16 lane before ldmatrix.
 __device__ __forceinline__ int gqa_prefill_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+}
+
+__device__ __forceinline__ void gqa_prefill_i8_sm75_a_fragment_base(int lane, int& row,
+                                                                    int& col) {
+    const int matrix = lane >> 3;
+    row              = (lane & 7) + ((matrix >> 1) << 3);
+    col              = (matrix & 1) << 3;
 }
 
 __device__ __forceinline__ unsigned gqa_prefill_swz_addr(unsigned lane_base, unsigned ck,

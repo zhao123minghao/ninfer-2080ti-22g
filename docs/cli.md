@@ -140,12 +140,12 @@ measured recommendation rather than a semantic limit.
 | `--rope native\|yarn` | rotary regime; `yarn` applies YaRN frequency correction and raises the `--max-context` ceiling to `--yarn-origin` x `--yarn-factor` | `native` |
 | `--yarn-factor F` | YaRN scaling factor, in `[1.0, 64.0]`; only read under `--rope yarn`; `origin x factor` must be a whole token count not exceeding `1048576` | `4.0` |
 | `--yarn-origin O` | YaRN origin window; must equal the artifact's registered native context capacity (`262144`) | `262144` |
-| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
+| `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `8192` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
 | `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
-| `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--kv-dtype fp16\|int8` | KV-cache storage | `fp16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -250,26 +250,30 @@ selected with one flag, and neither is a debug or fallback mode:
 
 | `--kv-dtype` | Stores | Resident KV bytes per element | Accuracy |
 |---|---|---:|---|
-| `bf16` (default) | the model's K/V values unchanged | 2.0 | lossless: the projections emit BF16 K/V, so a BF16 cache stores them bit exactly |
+| `fp16` (default) | the widened K/V value, one `half` per element | 2.0 | the K/V projections emit BF16 values, and BF16 -> FP16 is exact over FP16's whole normal range (BF16 carries 8 significand bits, FP16 carries 11) |
 | `int8` | a signed 8-bit code plus one FP16 scale per 64-element group | ~1.03 | lossy by construction; the only route to the largest windows |
 
-"16-bit KV" in this engine means **`bf16`, not `fp16`**, and there is no `fp16` value to select.
-The attention projections produce BF16 K and V, so BF16 storage round-trips them exactly; an FP16
-cache would re-round every value into a narrower exponent range while gaining no mantissa the source
-never had. `bf16` is therefore the 16-bit option, and it is the more accurate of the two values by
-construction rather than by measurement.
+The unquantized cache stores **`fp16`**, which is the tensor-core operand format on every supported
+target: Volta and Turing `mma.sync` only accept FP16 operands, and the Ampere+ kernels restage their
+fragments into FP16 as well. The projections produce BF16 K/V, so the cache write widens each value
+once, and every attention kernel then feeds the stored value straight to the mma instead of widening
+it again every time the key tile is walked. The widening is exact: it changes a value only below
+FP16's normal range (`|x| < 6.1e-5`, where FP16 subnormals carry fewer bits), and it produces
+exactly the operand the kernels previously computed on the fly from the same bits -- so the stored
+format is not a precision decision at all, it is the same arithmetic with the conversion hoisted to
+the write.
 
 The tradeoff is bytes against cache precision, and which side wins on decode throughput is a
 property of the target, not a rule: the halved footprint only converts into time where the attention
-path is bandwidth-bound. On a Turing target it measures the other way round -- `bf16` is both the
+path is bandwidth-bound. On a Turing target it measures the other way round -- `fp16` is both the
 more accurate and the *faster* value -- because the attention kernel is latency-bound there and the
 `int8` path pays a dequantization that cancels its byte saving, while the reduced MTP acceptance
 costs more than the round time it saves. See
 [KV-cache dtype on the Turing target](performance.md#kv-cache-dtype-on-the-turing-target).
 
-At a 262,144-token capacity the two choices measured 4.38 GiB (`int8`) and 8.50 GiB (`bf16`) of KV
+At a 262,144-token capacity the two choices measured 4.38 GiB (`int8`) and 8.50 GiB (`fp16`) of KV
 payload per device for a 27B target with MTP3 enabled, a ratio of 1.94x. The choice therefore also
-decides which capacities fit: `int8` is mandatory where a BF16 pool is too large.
+decides which capacities fit: `int8` is mandatory where an fp16 pool is too large.
 
 The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.

@@ -137,11 +137,11 @@ scale 隐藏在 Vision、Text 或某个 kernel 名称中。
 
 | 使用位置 | geometry | cache/布局 | 迁移后 entry |
 |---|---:|---|---|
-| Qwen3.6-27B Text/MTP | `D256/Hq24/Hkv4` | BF16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
-| Qwen3.6-35B-A3B Text/MTP | `D256/Hq16/Hkv2` | BF16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
-| Qwen3.6 Vision | `D72/Hq16/Hkv16` | packed BF16 Q/K/V | `packed_softmax_attention` |
-| Qwen3.6-35B-A3B DFlash full | `D128/Hq32/Hkv8` | 只读 BF16 context + query K/V | `context_softmax_attention` |
-| Qwen3.6-35B-A3B DFlash local | `D128/Hq32/Hkv8` | 只读 BF16 cyclic context + query K/V | `sliding_window_attention` |
+| Qwen3.6-27B Text/MTP | `D256/Hq24/Hkv4` | FP16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
+| Qwen3.6-35B-A3B Text/MTP | `D256/Hq16/Hkv2` | FP16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
+| Qwen3.6 Vision | `D72/Hq16/Hkv16` | packed BF16 Q/K/V（Vision 不走 paged KV） | `packed_softmax_attention` |
+| Qwen3.6-35B-A3B DFlash full | `D128/Hq32/Hkv8` | 只读 FP16 context + BF16 query K/V | `context_softmax_attention` |
+| Qwen3.6-35B-A3B DFlash local | `D128/Hq32/Hkv8` | 只读 FP16 cyclic context + BF16 query K/V | `sliding_window_attention` |
 
 ## 4. 公共契约
 
@@ -313,7 +313,7 @@ include/ninfer/ops/kv_cache_append.h
 src/ops/kv_cache/append/
 ```
 
-`kv_cache_append` 覆盖所有输入 rows，并按目标 cache dtype 执行 BF16 exact copy 或
+`kv_cache_append` 覆盖所有输入 rows，并按目标 cache dtype 执行 bf16→fp16 加宽写 或
 INT8-G64 encode；`kv_cache_append_prefix` 继续接受 device `commit_count`，只写入被接纳前缀。
 二者不因被 Attention 调用而归属 `softmax_attention/`。
 
@@ -532,7 +532,7 @@ Oracle 必须从 geometry 和 entry 可见集合计算 Head 映射，不复制�
 必须覆盖：
 
 - 四个当前注册 geometry；
-- BF16 与 INT8-G64 causal cache profile；
+- FP16 与 INT8-G64 causal cache profile；
 - append-and-attend、cached-only 和 standalone append；
 - plain single-segment entry，以及 packed 非等长与等长 segments；
 - context 为零和非零时的 context+query 可见域；

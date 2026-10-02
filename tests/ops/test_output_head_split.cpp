@@ -625,13 +625,16 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
+    // Widest collective this suite presents: one column of the sharded output head, 124160 rows
+    // x 2 B = 242 KiB. The pinned staging is sized for the declared bound once and never moved.
+    constexpr std::size_t kPeerStagingBytes = 1u << 20;
+    const bool peer_access = ops::enable_peer_access(ec, kPeerStagingBytes);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (CUDA stages the device-to-device copies through "
                                 "host memory)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, kPeerStagingBytes);
 
     failures += run_embedding_replication_case(ec);
 

@@ -39,7 +39,7 @@ peak CUDA allocation.
 Important runtime controls include:
 
 - `--gpu-memory auto|24GiB` and `--headroom 2GiB`;
-- `--kv-dtype bf16|int8`;
+- `--kv-dtype fp16|int8`;
 - `--prefill-chunk N`;
 - `--greedy` or sampling overrides;
 - `--vision-attention-limit N`;

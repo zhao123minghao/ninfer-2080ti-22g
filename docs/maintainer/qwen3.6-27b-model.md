@@ -146,7 +146,7 @@ x = x + o_projection(a)
 ```
 
 Prefill appends all K/V columns and evaluates causal attention for the chunk. Decode appends one
-column and attends over the resident prefix. KV storage may be BF16 or INT8-G64. The exact runtime
+column and attends over the resident prefix. KV storage may be FP16 or INT8-G64. The exact runtime
 cache codec and the common ideal attention oracle are defined by the repository-internal
 [`gqa_attention.h`](../../include/ninfer/ops/gqa_attention.h) contract. Both cache formats and their
 optimized compute profiles are judged by that one oracle construction rather than by
@@ -380,7 +380,8 @@ remain consistent.
   BF16 outputs; production reduction and staging are route-private choices;
 - GDN `g`, `beta`, and recurrent state are FP32;
 - the ideal GQA oracle evaluates dot products, stable softmax, and value reduction in FP64 from
-  BF16 Q and logical cache values; the BF16 Op output is promoted to FP64 for comparison;
+  BF16 Q and the logical (widened) cache values; the BF16 Op output is promoted to FP64 for
+  comparison;
 - low-bit weight storage changes representation, not the intended dequantized matrix;
 - INT8-G64 KV stores FP16 scales and signed codes, and its ideal logical K/V values are their FP32
   decode;
@@ -397,7 +398,7 @@ route and accepted against the Op's criterion for that implementation profile.
 
 GQA numerical qualification covers both registered geometries, supported prompt and small-T
 regimes, the maintained conformance matrix, and target-representative activation ranges. Its
-BF16-cache and INT8-cache compute-profile criteria are explicitly named in the GQA conformance
+FP16-cache and INT8-cache compute-profile criteria are explicitly named in the GQA conformance
 suite; they are not claimed as pointwise bounds for every arbitrary or adversarial BF16 tensor. A1
 append-and-attend and A3 cached-only attention are each checked directly against the common ideal
 oracle. Equality between those different numerical paths is not a contract or acceptance test.

@@ -767,13 +767,17 @@ int main() {
     }
 
     const ExecutionContext ec({0, 1});
-    const bool peer_access = ops::enable_peer_access(ec);
+    // Widest collective this suite presents: a row-parallel residual over hidden 5120 at the
+    // suite's largest token count, 1024 -- 10 MiB. The pinned staging is sized for the declared
+    // bound once and never moved, so the bound has to cover every case below.
+    constexpr std::size_t kPeerStagingBytes = 16u << 20;
+    const bool peer_access = ops::enable_peer_access(ec, kPeerStagingBytes);
     std::cout << "peer access: "
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (CUDA stages the device-to-device copies through "
                                 "host memory)")
               << '\n';
-    const ops::PeerEvents events(ec);
+    const ops::PeerEvents events(ec, kPeerStagingBytes);
 
     failures += verify_split_rejections(ec, events);
 

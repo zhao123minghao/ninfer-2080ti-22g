@@ -18,6 +18,18 @@ struct GqaGeometry {
     static constexpr int DecodeSplitScale = DecodeSplitScaleValue;
 #ifdef NINFER_VOLTA_BUILD
     static constexpr int DecodeSplits     = 560 * DecodeSplitScale;
+#elif defined(NINFER_SM75)
+    // Same rule as the branch below, re-derived for this target instead of inherited from it.
+    // The split grid's x extent is KVHeads and the partial kernel keeps 2 blocks/SM resident
+    // (`__launch_bounds__(128, 2)`, and its smem/register budget leaves room for exactly two --
+    // see gqa_attention_prefill_volta.cuh), so a per-head `splits` of S launches KVHeads*S CTAs
+    // into 2 * <SM count> slots and the elapsed time is ceil(KVHeads*S / slots) block-times.
+    // The 85*Scale policy targets 340 CTAs, which is precisely the 170-SM board it was measured
+    // on (4 x 85 and 2 x 170 are both 340) -- Gqa27Tp2Geometry's comment states that intent.
+    // On this 68-SM Turing target 340 CTAs is 2.5 waves, so its last wave runs on half the SMs.
+    // 68*Scale puts every geometry this file instantiates on exactly two full waves -- 24|4 at
+    // 4 x 68 = 272 and 12|2 / 16|2 at 2 x 136 = 272, against 2 x 2 x 68 = 272 slots.
+    static constexpr int DecodeSplits     = 68 * DecodeSplitScale;
 #else
     static constexpr int DecodeSplits     = 85 * DecodeSplitScale;
 #endif

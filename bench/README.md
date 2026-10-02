@@ -44,7 +44,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8>]
+          [--kv-dtype <fp16|int8>]
           [--mtp-draft-tokens <0..5>] [--lm-head-draft]
           [--device <id>] [--tp <1|2>] [--devices <id[,id]>]
           [--no-cuda-graph] [--profile-measured]
@@ -62,7 +62,7 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-`bf16` selects BF16 KV storage and `int8` selects INT8 group-64 KV storage. MTP is enabled with
+`fp16` selects fp16 KV storage and `int8` selects INT8 group-64 KV storage. MTP is enabled with
 `--mtp-draft-tokens`; `--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
 enabled by default.
 
@@ -699,7 +699,7 @@ qualification uses the append entry:
 
 ```bash
 ./build/bench/ninfer_causal_softmax_attention_bench \
-  --entry append --geometry d256-h16-kv2 --kv-dtype bf16 \
+  --entry append --geometry d256-h16-kv2 --kv-dtype fp16 \
   --batch 1,2,4,8 \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 128,1024,8192 --execution graph --cache cold

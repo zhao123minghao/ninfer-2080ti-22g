@@ -20,8 +20,8 @@ __launch_bounds__(128, 2) __global__ void noncausal_gqa_volta_partial_kernel(
         const std::int32_t* __restrict__ context_state,
         const std::int32_t* __restrict__ valid_columns,
         const std::int32_t* __restrict__ selectors,
-        const __nv_bfloat16* __restrict__ context_k,
-        const __nv_bfloat16* __restrict__ context_v,
+        const half* __restrict__ context_k,
+        const half* __restrict__ context_v,
         const std::int32_t* __restrict__ block_tables, int context_stride, int logical_pages,
         int max_context, int split_capacity, float scale,
         __nv_bfloat16* __restrict__ partial_acc, float* __restrict__ partial_m,
@@ -134,14 +134,14 @@ __launch_bounds__(128, 2) __global__ void noncausal_gqa_volta_partial_kernel(
             if (key < q_position - (context_stride - 1)) { continue; }
             const auto index = bidirectional_gqa_cyclic_context_index(
                 kv_head, d, key & (context_stride - 1), context_stride);
-            consume(__bfloat162float(context_k[index]), __bfloat162float(context_v[index]));
+            consume(__half2float(context_k[index]), __half2float(context_v[index]));
         } else {
             const int logical_page  = key >> 6;
             const int physical_page = block_tables[logical_page];
             const std::int64_t index = static_cast<std::int64_t>(d) +
                                        static_cast<std::int64_t>(D) *
                                            ((key & 63) + 64 * (physical_page + context_stride * kv_head));
-            consume(__bfloat162float(context_k[index]), __bfloat162float(context_v[index]));
+            consume(__half2float(context_k[index]), __half2float(context_v[index]));
         }
     }
     if (owns_query) {

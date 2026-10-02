@@ -426,9 +426,9 @@ int run_batch_cases() {
     int failures = 0;
     failures += run_batch_case(kGeometries[0], DType::I8,
                                {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
-    failures += run_batch_case(kGeometries[0], DType::BF16,
+    failures += run_batch_case(kGeometries[0], DType::FP16,
                                {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
-    failures += run_batch_case(kGeometries[0], DType::BF16,
+    failures += run_batch_case(kGeometries[0], DType::FP16,
                                {1, {63, 2048}, {1, 1}, {1, 0}, MappingPattern::Fragmented, 501u});
     failures += run_batch_case(kGeometries[1], DType::I8,
                                {1,
@@ -440,14 +440,14 @@ int run_batch_cases() {
     failures +=
         run_batch_case(kGeometries[0], DType::I8,
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
-    failures += run_batch_case(kGeometries[1], DType::BF16,
+    failures += run_batch_case(kGeometries[1], DType::FP16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
     return failures;
 }
 
 int run_geometry(const Geometry& geometry) {
     int failures = 0;
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    for (const DType dtype : {DType::FP16, DType::I8}) {
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
             failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
@@ -511,7 +511,7 @@ int run_int8_split_policy_cases() {
 
 int verify_workspace_capacity_contract() {
     int failures = 0;
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    for (const DType dtype : {DType::FP16, DType::I8}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
             ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 1, 17);
@@ -527,14 +527,14 @@ int verify_workspace_capacity_contract() {
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
+            16, DType::FP16, {1, ops::kGqaAttentionMaximumVisibleKeys}, 1, 1, 1);
     } catch (const std::invalid_argument&) {
         std::cerr << "gqa_attention rejected its maximum visible-key envelope\n";
         ++failures;
     }
     try {
         (void)ops::gqa_attention_workspace_capacity_bytes(
-            16, DType::BF16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
+            16, DType::FP16, {1, ops::kGqaAttentionMaximumVisibleKeys + 1}, 1, 1, 1);
         std::cerr << "gqa_attention accepted an envelope outside the launcher domain\n";
         ++failures;
     } catch (const std::invalid_argument&) {}

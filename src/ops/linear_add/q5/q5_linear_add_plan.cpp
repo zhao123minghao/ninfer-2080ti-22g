@@ -1,5 +1,6 @@
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 
+#include "ops/linear/f16/f16_materialized_gemm.h"
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 #ifdef NINFER_VOLTA_BUILD
 #include "ops/linear/q5/q5_launch.h"
@@ -99,15 +100,25 @@ constexpr std::array<RouteSpec, 6> kK17408Routes{{
 
 // TP2 row-parallel shard routes (K = 3072, 8704). GemvResidual and Split2ExactResidual are K-EXACT
 // templates that do not cover a halved K (see q5_linear_add_gemv.cu / q5_linear_add_gemm_simt.cu),
-// so unlike the tp1 tables above, every token count here routes straight to one of the MMA
-// schedules -- MmaResidualR64C* is fully N/K-generic (q5_linear_add_gemm_mma.cu reads both from the
-// Weight/Tensor at runtime), so this is the SAME qualified compute body as the tp1 route at T>=14
-// (K=6144) / T>=17 (K=17408), not a new kernel. Q5's own ops::linear shard table makes the
-// identical choice for its plain GEMV/split2-exact schedules
-// (src/ops/linear/q5/q5_dispatch.cpp), and this is a performance decision only; re-measuring the
-// shard's own T=1..13 crossover is deliberately deferred tuning work.
-constexpr std::array<RouteSpec, 4> kShardRoutes{{
-    {{1, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
+// so from T=2 up this table routes straight to one of the MMA schedules -- MmaResidualR64C* is
+// fully N/K-generic (q5_linear_add_gemm_mma.cu reads both from the Weight/Tensor at runtime), so
+// this is the SAME qualified compute body as the tp1 route at T>=14 (K=6144) / T>=17 (K=17408),
+// not a new kernel. Q5's own ops::linear shard table makes the identical choice for its plain
+// GEMV/split2-exact schedules (src/ops/linear/q5/q5_dispatch.cpp), and re-measuring the shard's own
+// T=2..13 crossover is deliberately deferred tuning work.
+//
+// The small-T exception is the decode leaf, where MmaResidualR64C16 pays a whole 64x16 MMA tile
+// (16x the work) for a handful of real columns, which profiling showed as the dominant per-token
+// decode cost. The wide-T SIMT residual kernel (q5_linear_add_simt_wide_t_launch) is runtime-K/N
+// and carries the identical `residual += sum` accumulate-before-store epilogue, so it computes
+// exactly the same single-rounding arithmetic at the shard's own K -- a bandwidth-bound sweep
+// instead of a 16x-wasted MMA tile. Its edge is the widest decode round this build admits, which
+// is concurrency * (1 + draft) rather than the single-request 1 + draft: at the original six a
+// two-request MTP3 round (eight columns) fell into the 64x16 tile and the q5 decode set cost 3.3x
+// per call (history.md 22.3). Wider T keeps the row-generic MMA, so prefill is unaffected.
+constexpr std::array<RouteSpec, 5> kShardRoutes{{
+    {{1, 12}, Q5LinearAddScheduleId::SimtWideTResidual},
+    {{13, 32}, Q5LinearAddScheduleId::MmaResidualR64C16},
     {{33, 48}, Q5LinearAddScheduleId::MmaResidualR64C24},
     {{49, 128}, Q5LinearAddScheduleId::MmaResidualR64C64},
     {{129, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128},
@@ -248,9 +259,24 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
     if (resolved.schedule != plan.schedule || resolved.workspace_bytes != plan.workspace_bytes) {
         throw std::invalid_argument("q5 linear_add: plan does not match the exact problem");
     }
-#ifndef NINFER_VOLTA_BUILD
-    (void)ws; // only CutlassSm70TensorCoreResidual (Volta-only) uses the workspace arena
-#endif
+
+    // Replace the registered bf16 MMA schedules with the fp16 materialization route, which removes
+    // the in-loop dequantization and the bf16 -> fp16 fragment restaging from the same tile (see
+    // ops/linear/f16/f16_materialized_gemm.h). The SIMT, GEMV and Volta schedules keep their
+    // measured choices: the route declines at the decode widths, and a plan that did not pick an
+    // MMA schedule did not pick it by accident.
+    const bool mma_schedule =
+        plan.schedule == Q5LinearAddScheduleId::MmaResidualR64C16 ||
+        plan.schedule == Q5LinearAddScheduleId::MmaResidualR64C24 ||
+        plan.schedule == Q5LinearAddScheduleId::MmaResidualR64C64 ||
+        plan.schedule == Q5LinearAddScheduleId::MmaResidualR64C128;
+    if (mma_schedule && ws != nullptr) {
+        const std::int32_t slice = f16_materialized_slice_rows(w, x.ne[1], *ws);
+        if (slice > 0) {
+            launch_f16_materialized_linear_add(x, w, residual_out, slice, *ws, stream);
+            return;
+        }
+    }
 
     switch (plan.schedule) {
     case Q5LinearAddScheduleId::GemvResidual:

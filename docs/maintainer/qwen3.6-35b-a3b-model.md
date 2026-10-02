@@ -747,7 +747,7 @@ encoder or audio projection tower. Token presence is not evidence of an audio in
   matrix. Proposal selection may use the existing full `lm_head` or the artifact's existing
   optimized proposal head; neither is a private companion parameter.
 - Public activation, cache, and recurrent-state dtypes are stated by their owning Op/state contract.
-  In particular, GDN recurrent matrices and decay controls are FP32, while registered BF16/INT8 KV
+  In particular, GDN recurrent matrices and decay controls are FP32, while registered FP16/INT8 KV
   formats remain real persistent representation boundaries.
 - Every floating-point Op uses one independent naive FP32/FP64 mathematical oracle over its logical
   inputs. Packed weights are decoded from their stored codes and exact stored scales. Exact
@@ -774,10 +774,10 @@ The Program-owned memory classes are:
 
 | State | Shape basis | BF16/FP32 payload at 262144 context | Lifetime |
 |---|---|---:|---|
-| Text GQA K and V | 10 layers × context × 2 heads × 256 × 2 planes | 5.0 GiB BF16 | active sequence |
-| MTP K and V | 1 layer × context × 2 heads × 256 × 2 planes | 0.5 GiB BF16 | active sequence when MTP enabled |
+| Text GQA K and V | 10 layers × context × 2 heads × 256 × 2 planes | 5.0 GiB FP16 | active sequence |
+| MTP K and V | 1 layer × context × 2 heads × 256 × 2 planes | 0.5 GiB FP16 | active sequence when MTP enabled |
 | DFlash current and turn-checkpoint local K/V | 2 copies × 5 layers × 4096 positions × 8 heads × 128 × 2 planes × `C` lanes | about 160 MiB × `C` BF16 | Program lifetime when DFlash enabled |
-| DFlash full context K and V | 1 layer × context × 8 heads × 128 × 2 planes | 1.0 GiB BF16 | active sequence when DFlash enabled |
+| DFlash full context K and V | 1 layer × context × 8 heads × 128 × 2 planes | 1.0 GiB FP16 | active sequence when DFlash enabled |
 | GDN convolution history | 30 layers × 8192 channels × 3 columns × `2C` | 1.406 MiB × `2C` BF16 | Program lifetime; current and turn-checkpoint slots |
 | GDN recurrent matrices | 30 layers × 32 heads × 128 × 128 × `2C` | 60 MiB × `2C` FP32 | Program lifetime; current and turn-checkpoint slots |
 | ReplaySSM records | 30 layers × `C` rows × `draft_window+1` convolution/key/value/gate columns | backend/window dependent | Program lifetime with MTP or DFlash; one pending round |

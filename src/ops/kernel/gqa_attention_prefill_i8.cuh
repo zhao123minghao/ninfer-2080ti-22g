@@ -350,10 +350,15 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
 
     const int gid      = lane >> 2;
     const int lid      = lane & 3;
-    const int a_mat    = lane >> 3;
-    const int a_rin    = lane & 7;
-    const int a_rowoff = a_rin + ((a_mat & 1) << 3);
-    const int a_coloff = (a_mat >> 1) << 3;
+    int a_rowoff, a_coloff;
+#if defined(NINFER_SM75)
+    gqa_prefill_i8_sm75_a_fragment_base(lane, a_rowoff, a_coloff);
+#else
+    const int a_mat = lane >> 3;
+    const int a_rin = lane & 7;
+    a_rowoff        = a_rin + ((a_mat & 1) << 3);
+    a_coloff        = (a_mat >> 1) << 3;
+#endif
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
