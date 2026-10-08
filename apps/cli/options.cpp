@@ -99,6 +99,7 @@ double parse_yarn_factor(const char* text) {
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "fp16") { return KvCacheStorage::Float16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
+    if (text == "fp8") { return KvCacheStorage::Fp8E4M3; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -122,7 +123,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
            "       [--device N] [--tp 1|2] [--devices N,N]\n"
-           "       [--kv-dtype fp16|int8] [--spec mtp|dflash --draft-tokens N]\n"
+           "       [--kv-dtype fp16|int8|fp8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -150,8 +151,13 @@ std::string usage_text(const char* argv0) {
            "registered 262144-position ceiling). --rope yarn applies YaRN frequency correction and\n"
            "raises the --max-context ceiling to --yarn-origin x --yarn-factor (at most 1048576);\n"
            "--yarn-origin must equal the artifact\'s registered native capacity (262144) and\n"
-           "defaults to it, --yarn-factor defaults to 4.0. YaRN is available at either --tp width\n"
+           "defaults to it, --yarn-factor defaults to 4.0; the product must be a whole number\n"
+           "of tokens. YaRN is available at either --tp width\n"
            "and is rejected with --vision or --spec dflash.\n"
+           "--kv-dtype selects the KV-cache storage and defaults to fp16. fp16 stores the widened\n"
+           "K/V value as one half per element; fp8 stores a plain E4M3FN code with no scale plane;\n"
+           "int8 stores a signed code plus one FP16 scale per 64-element group. The 8-bit routes\n"
+           "halve the resident KV bytes, which is what decides whether a given --max-context fits.\n"
            "--ignore-eos drops the checkpoint\'s own end-of-turn token ids from the request "
            "stop policy, so decode continues to --max-new or the remaining context capacity; "
            "--stop-token-id, --stop and --reasoning-stop still apply.\n"

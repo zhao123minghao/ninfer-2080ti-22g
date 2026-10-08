@@ -180,7 +180,7 @@ int test_cli_contract() {
     failures += expect_throws<std::invalid_argument>(
         [] {
             (void)parse_for_test(
-                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp8"});
+                {"ninfer_bench", "--weights", "model.ninfer", "--kv-dtype", "fp4"});
         },
         "unsupported KV storage");
     return failures;

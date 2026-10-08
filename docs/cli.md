@@ -242,7 +242,9 @@ The registered model IDs have a native context limit of 262,144 tokens, which is
 `--max-context` is checked against under the default `--rope native`. `--rope yarn` applies YaRN
 frequency correction and raises that ceiling to `--yarn-origin` x `--yarn-factor`, up to 1,048,576
 tokens; `--yarn-origin` must equal the registered native capacity (262,144); `--yarn-factor`
-accepts a finite value in [1.0, 64.0] and defaults to 4.0. YaRN works at either `--tp` width and is
+accepts a finite value in [1.0, 64.0] and defaults to 4.0. The product must land on a whole number
+of tokens, because it is the extended ceiling itself: 262,144 x 1.125 = 294,912 is admissible,
+262,144 x 1.15 = 301,465.6 is rejected. YaRN works at either `--tp` width and is
 rejected together with `--vision`, `--spec dflash`, or a target with no YaRN rope domain
 (`qwen3.6-35b-a3b`). The load summary's
 `rope` row reports the resolved mode, factor, origin, effective ceiling and `mscale`. The

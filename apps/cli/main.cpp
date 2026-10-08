@@ -93,7 +93,12 @@ std::string format_finish(ninfer::FinishReason reason) {
 }
 
 std::string format_kv_cache(ninfer::KvCacheStorage storage) {
-    return storage == ninfer::KvCacheStorage::Float16 ? "fp16" : "int8-group64";
+    switch (storage) {
+    case ninfer::KvCacheStorage::Float16: return "fp16";
+    case ninfer::KvCacheStorage::Fp8E4M3: return "fp8-e4m3";
+    case ninfer::KvCacheStorage::Int8Group64: return "int8-group64";
+    }
+    return "unknown";
 }
 
 std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
