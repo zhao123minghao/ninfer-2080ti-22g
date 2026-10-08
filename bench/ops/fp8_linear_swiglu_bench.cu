@@ -31,11 +31,13 @@ constexpr std::size_t kFlushBytes       = 256ULL << 20;
 constexpr double kFp8Fp32AccumulatePeak = 419.0;
 
 struct Options {
+    QType qtype              = QType::FP8_E4M3FN_ROW_BF16S;
     ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;
     std::vector<std::int32_t> tokens{1, 2, 4, 8, 16, 32, 48, 1024};
     int warmup   = 5;
     int repeat   = 30;
     bool profile = false;
+    bool marlin_layout = false;
 };
 
 std::vector<std::int32_t> parse_tokens(std::string_view raw) {
@@ -65,7 +67,16 @@ Options parse_options(int argc, char** argv) {
             if (++index >= argc) { throw std::invalid_argument(std::string("missing ") + label); }
             return argv[index];
         };
-        if (argument == "--policy") {
+        if (argument == "--qtype") {
+            const std::string_view value = next("--qtype value");
+            if (value == "fp8") {
+                options.qtype = QType::FP8_E4M3FN_ROW_BF16S;
+            } else if (value == "fp8block") {
+                options.qtype = QType::FP8_E4M3FN_BLOCK128_BF16S;
+            } else {
+                throw std::invalid_argument("--qtype must be fp8 or fp8block");
+            }
+        } else if (argument == "--policy") {
             const std::string_view value = next("--policy value");
             if (value == "a16") {
                 options.policy = ops::LinearPolicy::A16Only;
@@ -82,8 +93,10 @@ Options parse_options(int argc, char** argv) {
             options.repeat = std::stoi(std::string(next("--repeat value")));
         } else if (argument == "--profile") {
             options.profile = true;
+        } else if (argument == "--marlin-layout") {
+            options.marlin_layout = true;
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s [--policy a16|a8] [--t-sweep 1,2,...] [--warmup N] "
+            std::printf("Usage: %s [--qtype fp8|fp8block] [--marlin-layout] [--policy a16|a8] [--t-sweep 1,2,...] [--warmup N] "
                         "[--repeat N] [--profile]\n",
                         argv[0]);
             std::exit(0);
@@ -94,6 +107,13 @@ Options parse_options(int argc, char** argv) {
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
     }
+    if (options.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S &&
+        options.policy != ops::LinearPolicy::A16Only) {
+        throw std::invalid_argument("block-FP8 LinearSwiGLU requires --policy a16");
+    }
+    if (options.marlin_layout && options.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        throw std::invalid_argument("--marlin-layout requires --qtype fp8block");
+    }
     if (options.profile && options.tokens.size() != 1) {
         throw std::invalid_argument("--profile requires exactly one T");
     }
@@ -102,6 +122,10 @@ Options parse_options(int argc, char** argv) {
 
 const char* policy_name(ops::LinearPolicy policy) {
     return policy == ops::LinearPolicy::AllowA8 ? "A8" : "A16";
+}
+
+const char* qtype_name(QType qtype) {
+    return qtype == QType::FP8_E4M3FN_BLOCK128_BF16S ? "FP8BLOCK" : "FP8";
 }
 
 } // namespace
@@ -119,9 +143,14 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
-        bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kGateUpRows, kHidden);
+        bench::PackedQuantizedWeight packed =
+            options.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S
+                ? (options.marlin_layout
+                       ? bench::make_marlin_fp8_block_weight(kGateUpRows, kHidden)
+                       : bench::make_fp8_block_weight(kGateUpRows, kHidden))
+                : bench::make_fp8_weight(kGateUpRows, kHidden);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, kGateUpRows, kHidden, options.policy, min_t, max_t);
+            options.qtype, kGateUpRows, kHidden, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
@@ -139,7 +168,9 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             bench::flush_l2(flush, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::printf("PROFILE linear_swiglu weight_type=FP8 policy=%s T=%d\n",
+            std::printf("PROFILE linear_swiglu weight_type=%s layout=%s policy=%s T=%d\n",
+                        qtype_name(options.qtype),
+                        options.marlin_layout ? "marlin-fp8-block128-v1" : "default",
                         policy_name(options.policy), tokens);
             std::fflush(stdout);
             CUDA_CHECK(cudaProfilerStart());
@@ -150,7 +181,8 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        std::printf("# fp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n", kFp8Fp32AccumulatePeak);
+        std::printf("# fp8_fp32_accumulate_peak_tflops=%.1f cache=cold\n",
+                kFp8Fp32AccumulatePeak);
         std::printf("%-4s %6s %11s %11s %11s %10s %10s %8s\n", "pol", "T", "median_us", "min_us",
                     "p95_us", "eff_GB/s", "TFLOP/s", "TC_%");
         for (const std::int32_t tokens : options.tokens) {
@@ -162,8 +194,9 @@ int main(int argc, char** argv) {
             const double bytes   = static_cast<double>(packed.model_weight_bytes()) +
                                  2.0 * static_cast<double>(kHidden + kOutputRows) * tokens;
             const double tflops = flops / seconds / 1.0e12;
-            const bool tensor_route =
-                options.policy == ops::LinearPolicy::AllowA8 && (tokens == 1 || tokens >= 3);
+            const bool tensor_route = options.qtype == QType::FP8_E4M3FN_ROW_BF16S &&
+                                      options.policy == ops::LinearPolicy::AllowA8 &&
+                                      (tokens == 1 || tokens >= 3);
             const double tensor_percent = tensor_route ? 100.0 * tflops / kFp8Fp32AccumulatePeak
                                                        : std::numeric_limits<double>::quiet_NaN();
             if (std::isfinite(tensor_percent)) {

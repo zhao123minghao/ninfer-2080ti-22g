@@ -30,9 +30,13 @@ inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 // attention kernels read the cache straight into their operands instead of converting every
 // staged element on every key-tile walk. The K/V activations arrive as bf16 and are widened
 // once, at the cache write. `Int8Group64` trades group-64 INT8 codes for half the bytes.
+// `Fp8E4M3` stores E4M3 codes (no per-group scale plane) for the same half-byte footprint as
+// INT8 with a floating-point precision profile better suited to the wide-dynamic-range KV
+// activations.
 enum class KvCacheStorage : std::uint8_t {
     Float16,
     Int8Group64,
+    Fp8E4M3,
 };
 
 enum class KvCapacityMode : std::uint8_t {

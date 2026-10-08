@@ -23,6 +23,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
 - `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
   prefix test;
+- `targets/qwen3_8_27b/` — Qwen3.8-specific conversion contracts, including official block-FP8;
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
@@ -54,15 +55,15 @@ weight decoding.
 ## Build and run
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
-cmake --build build --parallel
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 -DBUILD_TESTING=ON
+cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
 ```
 
 Run a focused target for a localized change:
 
 ```bash
-cmake --build build --parallel --target ninfer_sampling_test
+cmake --build build --parallel 4 --target ninfer_sampling_test
 ctest --test-dir build -R ninfer_sampling_test --output-on-failure
 ```
 
@@ -80,13 +81,13 @@ statistics still drive the normal verdict. Passing tests remain quiet without it
 Linear tests are independently runnable by weight and activation-compute profile:
 
 ```bash
-cmake --build build --parallel --target \
+cmake --build build --parallel 4 --target \
   ninfer_linear_q4_a16_test ninfer_linear_q5_a16_test \
   ninfer_linear_q6_a16_test ninfer_linear_w8_a16_test
 ctest --test-dir build -R '^ninfer_linear_(q4|q5|q6|w8)_a16_test$' --output-on-failure
 ```
 
-All Linear files use `ops/linear/linear_test_common.{h,cpp}` and the same
+The Q4/Q5/Q6/W8 profile suites use `ops/linear/linear_test_common.{h,cpp}` and the same
 `ops/quantized_weight.h` fixture as the fused projection tests. The fixture produces the complete
 packed GPU payload and exact-decodes the logical float rows used by the one
 `cpu_linear_gemm_fp64()` reference. The reference performs naive double accumulation and never
@@ -95,6 +96,72 @@ rounding. Each activation compute path selects one centrally defined comparison 
 whole suite; private kernel, schedule, launcher, and T selection do not change it. Individual test
 files call public `linear()` and contain no private selector, launcher, schedule, or kernel
 assertions.
+
+### Block-FP8 checks
+
+The BF16 vocabulary head is covered by `ninfer_linear_bf16_a16_test` at both full/TP2 shapes,
+including T1 all-row FP64 comparison and T2-T5 route boundaries. Its host oracle uses at most
+eight worker threads. To check FP8 MTP state without loading the 30.6 GB artifact on one card:
+
+```bash
+NINFER_QWEN3_8_27B_WEIGHTS=/data/models/qwen3.8-27b/qwen3_8_27b_fp8_block128.ninfer \
+NINFER_MTP_TP2_FP16_ONLY=1 ./build/tests/ninfer_qwen3_8_27b_mtp_tp2_real_test
+```
+
+This existing suite's explicit TP2/FP16 slice checks repeated generation, graph/eager tokens,
+cross-rank acceptance/commit egress and fixed-prefix teacher forcing against the ordinary
+target, using the same existing near-tie criterion. The default TP1/TP2/INT8 suite is unchanged.
+
+For SM75 FP16 prefill attention work, run
+`NINFER_GQA_FP16_ONLY=1 ./build/tests/ninfer_gqa_attention_test` to select the existing FP16
+mathematical, cache and batch checks, including the TP2 T129 fragmented-page tail. The default
+suite still runs both KV formats; this selection does not qualify or suppress INT8 failures.
+
+| Existing entry | What it protects |
+|---|---|
+| [test_fp8_block_numeric.py](artifact/test_fp8_block_numeric.py) | exact code/scale round trip, partial 128x128 tiles, multiplier decode and invalid words |
+| [test_fp8_block_converter.py](targets/qwen3_8_27b/test_fp8_block_converter.py) | registered source recipe and conversion transforms |
+| [test_fp8_block.cpp](ops/linear/test_fp8_block.cpp) / `ninfer_linear_fp8_block_test` | independent FP64 Linear, LinearAdd, SwiGLU, attention/GDN projection and LinearPair formulas; optional real Text/MTP weights and TP2 slice bytes |
+| [materialization real test](targets/qwen3_6_27b/test_fp8_block_materialization_real.cpp) | actual target plan upload/readback; `ninfer_qwen3_8_27b_fp8_block_materialization_real_test` |
+| [logits real probe](targets/qwen3_6_27b/test_fp8_block_logits_real.cpp) | exact artifact embedding-row capture gate, diagnostic last-prefill logits/layers and sampling boundary; `ninfer_qwen3_8_27b_fp8_block_logits_real_test` |
+
+```bash
+python3 -m pytest -q tests/artifact/test_fp8_block_numeric.py \
+  tests/targets/qwen3_8_27b/test_fp8_block_converter.py
+cmake --build build --parallel 4 --target ninfer_linear_fp8_block_test
+NINFER_FP8_BLOCK_ARTIFACT=/data/models/qwen3.8-27b/qwen3_8_27b_fp8_block128.ninfer \
+NINFER_FP8_BLOCK_ROUTE=hmma ./build/tests/ninfer_linear_fp8_block_test
+```
+
+Run the last command separately with `NINFER_FP8_BLOCK_ROUTE=scalar` for the other implementation.
+Run it with the route variable unset for the production auto thresholds.
+Without the artifact variable the synthetic cases still run, but real-weight cases do not.
+Synthetic cases cover T4/5/8/9 and GDN T12/13. T192 covers Linear, SwiGLU and attention/GDN
+scatter, including sampled columns127/128. Real Text/MTP weights cover T1/4/5/9/192;
+real GDN and `5120x17408` down Linear cover T12/13. All use synthetic BF16 activations,
+not real activation replay. The three routes use the same independent FP64 formulas and
+unchanged absolute/relative criteria; passing these does not qualify complete model behavior.
+These are SM75 W8A16 checks, not the architecture-stubbed FP8 A8 tests. A repository-wide CTest
+failure from an unsupported A8/A4 leaf is not evidence that block-FP8 failed its oracle.
+
+The materialization test requires `NINFER_FP8_BLOCK_ARTIFACT` and two devices. The logits probe
+additionally requires `NINFER_FP8_BLOCK_PROMPT_IDS`; set `NINFER_FP8_BLOCK_ROUTE_COMPARE=1` to
+compare the same artifact (defaults scalar/HMMA), otherwise it also requires
+`NINFER_GROUPWISE_INT_ARTIFACT`. `NINFER_FP8_BLOCK_DEVICES=0,1` and
+`NINFER_FP8_BLOCK_PREFILL_CHUNK=4096` fix the route-compare research configuration; `_ROUTE_A/B`
+and `_PREFILL_CHUNK_A/B` variants provide explicit controls. Missing prerequisites return skip77.
+Every FP8 capture checks its final token embedding against the artifact's contiguous BF16 row,
+word for word. A mismatch fails the probe even when both routes repeat the same stale data;
+reported post-mixer/logit distances remain diagnostic, not a model-quality gate.
+
+The probe's route-compare branch reports errors without an error-threshold assertion. Exit0 is
+not a numerical pass. Its capture is the prefill-finalization boundary, not every decode position;
+later comparisons require an explicit common token prefix. Embedding capture producer ordering
+is still under investigation, and groupwise weights are not a same-source oracle. See
+[todo.md](../todo.md) for the minimal regression and model-quality checks still needed.
+
+Use the selected Python3.11 environment with existing torch/pytest. A prior local attempt lacked
+pytest; the commands above are entry points, not a claim that this documentation update ran them.
 
 Run the native Python suites with the project Python environment:
 

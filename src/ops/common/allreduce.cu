@@ -29,6 +29,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <array>
 #include <stdexcept>
@@ -386,7 +387,13 @@ bool enable_peer_access(const ExecutionContext& ec, std::size_t host_staging_byt
                       "cudaDeviceCanAccessPeer forward");
         startup_check(cudaDeviceCanAccessPeer(&reverse, pair[1], pair[0]),
                       "cudaDeviceCanAccessPeer reverse");
-        const bool supported = forward != 0 && reverse != 0;
+        bool supported = forward != 0 && reverse != 0;
+        // Diagnostic: force the two-hop host-staged route even on a pair whose peer link works. The
+        // route is the only thing this changes, so the same binary can A/B it (set the variable for
+        // one side of the pair of runs and not the other). Nothing else about the collective set
+        // changes -- the same bytes land in the same staging buffer.
+        const bool force_host_staged = std::getenv("NINFER_FORCE_HOST_STAGED") != nullptr;
+        if (force_host_staged) { supported = false; }
 
         std::string direct_failure;
         if (supported) {
@@ -400,7 +407,8 @@ bool enable_peer_access(const ExecutionContext& ec, std::size_t host_staging_byt
                 }
             }
         } else {
-            direct_failure = "peer access unavailable";
+            direct_failure = force_host_staged ? "NINFER_FORCE_HOST_STAGED is set (diagnostic A/B)"
+                                               : "peer access unavailable";
             probe.disable_peer_access();
         }
         probe.initialize(host_staging_bytes);
@@ -778,6 +786,86 @@ void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<T
         CurrentDeviceGuard::set(local.device);
         CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
     }
+}
+
+void gather_columns_rank0(const Tensor& destination, const std::array<Tensor, 2>& part,
+                          const ExecutionContext& ec, const PeerEvents& events) {
+    require_two_devices(
+        ec, "gather_columns_rank0: requires an ExecutionContext with two distinct devices");
+    const DType dtype = destination.dtype;
+    const std::int32_t full_width = destination.ne[0];
+    const std::int32_t columns = destination.ne[1];
+    require(full_width > 0 && columns > 0 && destination.data != nullptr &&
+                destination.is_contiguous() && destination.ne[2] == 1 && destination.ne[3] == 1,
+            "gather_columns_rank0: destination must be contiguous [C,T]");
+    for (int rank = 0; rank < 2; ++rank) {
+        require(part[rank].dtype == dtype && part[rank].data != nullptr &&
+                    part[rank].is_contiguous() && part[rank].ne[0] > 0 &&
+                    part[rank].ne[1] == columns && part[rank].ne[2] == 1 &&
+                    part[rank].ne[3] == 1,
+                "gather_columns_rank0: parts must be contiguous [C_r,T] tensors of one dtype");
+    }
+    require(part[0].ne[0] + part[1].ne[0] == full_width,
+            "gather_columns_rank0: shard widths must sum to destination width");
+    require(events.live(), "gather_columns_rank0: events must be live");
+
+    const std::size_t element_bytes = dtype_size(dtype);
+    const std::size_t destination_pitch = static_cast<std::size_t>(full_width) * element_bytes;
+    const std::size_t block[2] = {
+        static_cast<std::size_t>(part[0].ne[0]) * element_bytes,
+        static_cast<std::size_t>(part[1].ne[0]) * element_bytes};
+    const std::size_t offset[2] = {0, block[0]};
+    events.require_host_staging(block[1]);
+
+#ifndef NDEBUG
+    require_resident_on(destination.data, ec.dev[0]->device,
+                        "gather_columns_rank0: destination must be resident on rank 0");
+    for (int rank = 0; rank < 2; ++rank) {
+        require_resident_on(part[rank].data, ec.dev[rank]->device,
+                            "gather_columns_rank0: part[r] must be resident on its rank");
+        require_disjoint(destination.data, destination.bytes(), part[rank].data,
+                         part[rank].bytes(),
+                         "gather_columns_rank0: parts must not overlap destination");
+    }
+#endif
+
+    const CurrentDeviceGuard guard;
+    const DeviceContext& rank0 = *ec.dev[0];
+    const DeviceContext& rank1 = *ec.dev[1];
+    CurrentDeviceGuard::set(rank0.device);
+    CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), rank0.stream));
+    CurrentDeviceGuard::set(rank1.device);
+    CUDA_CHECK(cudaEventRecord(events.inputs_ready(1), rank1.stream));
+
+    CurrentDeviceGuard::set(rank0.device);
+    CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(0), 0));
+    CUDA_CHECK(cudaMemcpy2DAsync(destination.data, destination_pitch, part[0].data, block[0],
+                                 block[0], static_cast<std::size_t>(columns),
+                                 cudaMemcpyDeviceToDevice, rank0.stream));
+    if (events.direct_transport()) {
+        CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(1), 0));
+        CUDA_CHECK(cudaMemcpy2DAsync(byte_offset(destination.data, offset[1]), destination_pitch,
+                                     part[1].data, block[1], block[1],
+                                     static_cast<std::size_t>(columns), cudaMemcpyDeviceToDevice,
+                                     rank0.stream));
+    } else {
+        CurrentDeviceGuard::set(rank1.device);
+        CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, events.inputs_ready(1), 0));
+        CUDA_CHECK(cudaMemcpyAsync(events.host_staging(1), part[1].data, part[1].bytes(),
+                                   cudaMemcpyDeviceToHost, rank1.stream));
+        CUDA_CHECK(cudaEventRecord(events.transfer_ready(1), rank1.stream));
+        CurrentDeviceGuard::set(rank0.device);
+        CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.transfer_ready(1), 0));
+        CUDA_CHECK(cudaMemcpy2DAsync(byte_offset(destination.data, offset[1]), destination_pitch,
+                                     events.host_staging(1), block[1], block[1],
+                                     static_cast<std::size_t>(columns), cudaMemcpyHostToDevice,
+                                     rank0.stream));
+    }
+    CUDA_CHECK(cudaEventRecord(events.pull_done(0), rank0.stream));
+
+    // Rank 1 may reuse its source and pinned slot only after rank 0 has consumed them.
+    CurrentDeviceGuard::set(rank1.device);
+    CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, events.pull_done(0), 0));
 }
 
 void broadcast_rank0(const Tensor& source, const Tensor& destination,

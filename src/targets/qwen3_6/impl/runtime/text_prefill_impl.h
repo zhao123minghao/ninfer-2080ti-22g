@@ -81,9 +81,16 @@ PrefillChunkResult prefill_text_chunk(
             : -1);
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
+        if (state.layer_capture != nullptr) {
+            throw std::logic_error("layer capture cannot run with DFlash prefill");
+        }
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
                                   sink);
+    }
+    if (state.layer_capture != nullptr) {
+        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
+                                  *state.layer_capture);
     }
     return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
 }

@@ -184,9 +184,9 @@ inline void flush_l2(DeviceBuffer& flush, cudaStream_t stream) {
     CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
 }
 
-template <class Launch>
+template <class Launch, class Prepare>
 ColdTiming measure_cold_launch(Launch&& launch, DeviceBuffer& flush, cudaStream_t stream,
-                               int warmup, int repeat) {
+                               int warmup, int repeat, Prepare&& prepare) {
     if (warmup < 0 || repeat <= 0) {
         throw std::invalid_argument(
             "cold benchmark requires nonnegative warmup and positive repeat");
@@ -198,6 +198,7 @@ ColdTiming measure_cold_launch(Launch&& launch, DeviceBuffer& flush, cudaStream_
     CUDA_CHECK(cudaEventCreate(&stop));
 
     for (int index = 0; index < warmup; ++index) {
+        prepare(stream);
         flush_l2(flush, stream);
         launch(stream);
     }
@@ -206,6 +207,7 @@ ColdTiming measure_cold_launch(Launch&& launch, DeviceBuffer& flush, cudaStream_
     std::vector<double> samples;
     samples.reserve(static_cast<std::size_t>(repeat));
     for (int index = 0; index < repeat; ++index) {
+        prepare(stream);
         flush_l2(flush, stream);
         CUDA_CHECK(cudaEventRecord(start, stream));
         launch(stream);
@@ -225,6 +227,12 @@ ColdTiming measure_cold_launch(Launch&& launch, DeviceBuffer& flush, cudaStream_
         samples[std::min(samples.size() - 1,
                          static_cast<std::size_t>(0.95 * static_cast<double>(samples.size())))],
     };
+}
+
+template <class Launch>
+ColdTiming measure_cold_launch(Launch&& launch, DeviceBuffer& flush, cudaStream_t stream,
+                               int warmup, int repeat) {
+    return measure_cold_launch(launch, flush, stream, warmup, repeat, [](cudaStream_t) {});
 }
 
 inline ColdTiming measure_cold_graph(const TimedGraph& graph, DeviceBuffer& flush,

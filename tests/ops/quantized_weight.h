@@ -276,6 +276,24 @@ struct PackedWeight {
                                           static_cast<std::size_t>(row_begin) * high_row;
             w.scales = static_cast<const std::uint8_t*>(w.scales) +
                        static_cast<std::size_t>(row_begin) * scale_row;
+        } else if (w.layout == QuantLayout::BlockScaleM128K128) {
+            if ((row_begin % 128) != 0 || (row_count % 128) != 0) {
+                throw std::invalid_argument(
+                    "quantized-weight fixture: block-FP8 row view must align to 128 rows");
+            }
+            const std::int32_t k_tiles = w.k / 128;
+            const std::size_t scale_offset =
+                static_cast<std::size_t>(row_begin / 128) * k_tiles * sizeof(std::uint16_t);
+            if ((scale_offset & 15U) != 0) {
+                throw std::invalid_argument(
+                    "quantized-weight fixture: block-FP8 row view scale pointer is unaligned");
+            }
+            w.qdata = static_cast<const std::uint8_t*>(w.qdata) +
+                      static_cast<std::size_t>(row_begin) * w.k;
+            w.scales = static_cast<const std::uint8_t*>(w.scales) + scale_offset;
+            w.scale_ne[1] = row_count / 128;
+            w.scale_nb[2] = w.scale_nb[1] * w.scale_ne[1];
+            w.scale_nb[3] = w.scale_nb[2];
         } else if (w.layout == QuantLayout::BlockScaleK16M128x4) {
             if ((row_begin % 128) != 0 || (row_count % 128) != 0) {
                 throw std::invalid_argument(
@@ -485,6 +503,93 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         packed.weight.scale_nb[3]      = packed.weight.scale_nb[1];
         packed.weight.n                = n;
         packed.weight.k                = k;
+        return packed;
+    }
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (options.weight_scale_divisor != 0.0F || options.input_scale_divisor != 0.0F ||
+            options.row_split_scale != RowSplitScalePattern::Unit ||
+            options.row_split_codes != RowSplitCodePattern::Coordinate) {
+            throw std::invalid_argument(
+                "quantized-weight fixture: row-split patterns and divisors do not apply to "
+                "block-FP8");
+        }
+        if ((n % 128) != 0 || (k % 128) != 0) {
+            throw std::invalid_argument(
+                "quantized-weight fixture: block-FP8 N and K must be divisible by 128");
+        }
+        if ((row_origin % 128) != 0 || (column_origin % 128) != 0) {
+            throw std::invalid_argument(
+                "quantized-weight fixture: block-FP8 shard origins must align to 128");
+        }
+
+        constexpr std::uint8_t kCodes[]{
+            0x00U, 0x80U, 0x01U, 0x81U, 0x07U, 0x87U, 0x08U, 0x88U,
+            0x18U, 0x98U, 0x38U, 0xb8U, 0x44U, 0xc4U, 0x7eU, 0xfeU,
+        };
+        constexpr std::uint16_t kScales[]{0x3b00U, 0x3b40U, 0x3b80U, 0x3bc0U};
+        const std::int32_t m_tiles = n / 128;
+        const std::int32_t k_tiles = k / 128;
+
+        PackedWeight packed;
+        packed.code_plane_bytes = static_cast<std::uint64_t>(n) * k;
+        packed.scale_plane_offset = detail::align_up_size(
+            static_cast<std::size_t>(packed.code_plane_bytes), 256);
+        packed.scale_plane_bytes =
+            static_cast<std::uint64_t>(m_tiles) * k_tiles * sizeof(std::uint16_t);
+        packed.payload.assign(
+            static_cast<std::size_t>(packed.scale_plane_offset + packed.scale_plane_bytes), 0);
+
+        for (std::int32_t row = 0; row < n; ++row) {
+            const std::uint64_t global_row = pattern_row(row);
+            const std::uint32_t row_mix =
+                static_cast<std::uint32_t>(global_row ^ (global_row >> 7));
+            for (std::int32_t column = 0; column < k; ++column) {
+                const std::uint32_t pattern =
+                    row_mix * 13U + static_cast<std::uint32_t>(pattern_column(column)) * 7U + seed;
+                packed.payload[static_cast<std::size_t>(row) * k + column] = kCodes[pattern & 15U];
+            }
+        }
+        for (std::int32_t m_tile = 0; m_tile < m_tiles; ++m_tile) {
+            const std::uint64_t global_m_tile = decorrelate(
+                static_cast<std::uint64_t>(row_origin / 128 + m_tile), 0x9e37U);
+            for (std::int32_t k_tile = 0; k_tile < k_tiles; ++k_tile) {
+                const std::uint64_t global_k_tile =
+                    pattern_group(k_tile, static_cast<std::uint64_t>(column_origin / 128));
+                const std::size_t scale_pattern = static_cast<std::size_t>(
+                    (global_m_tile * 5U + global_k_tile * 3U + seed) & 3U);
+                const std::size_t scale_index =
+                    static_cast<std::size_t>(m_tile) * k_tiles + k_tile;
+                detail::store_u16_le(packed.payload, packed.scale_plane_offset + scale_index * 2,
+                                     kScales[scale_pattern]);
+            }
+        }
+
+        packed.weight.qtype = QType::FP8_E4M3FN_BLOCK128_BF16S;
+        packed.weight.layout = QuantLayout::BlockScaleM128K128;
+        packed.weight.scale_dtype = DType::BF16;
+        packed.weight.payload = packed.payload.data();
+        packed.weight.payload_bytes = packed.payload.size();
+        packed.weight.high_plane_bytes = 0;
+        packed.weight.qdata = packed.payload.data();
+        packed.weight.qhigh = nullptr;
+        packed.weight.scales = packed.payload.data() + packed.scale_plane_offset;
+        packed.weight.group_size = 128;
+        packed.weight.group = 128;
+        packed.weight.ndim = 2;
+        packed.weight.shape[0] = packed.weight.padded_shape[0] = n;
+        packed.weight.shape[1] = packed.weight.padded_shape[1] = k;
+        packed.weight.shape[2] = packed.weight.padded_shape[2] = 1;
+        packed.weight.shape[3] = packed.weight.padded_shape[3] = 1;
+        packed.weight.scale_ne[0] = k_tiles;
+        packed.weight.scale_ne[1] = m_tiles;
+        packed.weight.scale_ne[2] = 1;
+        packed.weight.scale_ne[3] = 1;
+        packed.weight.scale_nb[0] = sizeof(std::uint16_t);
+        packed.weight.scale_nb[1] = static_cast<std::int64_t>(k_tiles) * sizeof(std::uint16_t);
+        packed.weight.scale_nb[2] = packed.weight.scale_nb[1] * m_tiles;
+        packed.weight.scale_nb[3] = packed.weight.scale_nb[2];
+        packed.weight.n = n;
+        packed.weight.k = k;
         return packed;
     }
     if (qtype == QType::NVFP4) {
@@ -783,6 +888,33 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
         const float decoded =
             static_cast<float>(detail::decode_e4m3fn(code)) * detail::bf16_to_f32(scale_bits);
         return static_cast<double>(decoded);
+    }
+
+    if (weight.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (weight.layout != QuantLayout::BlockScaleM128K128 ||
+            weight.scale_dtype != DType::BF16 || weight.group != 128 ||
+            weight.group_size != 128 || weight.shape[0] % 128 != 0 ||
+            weight.shape[1] % 128 != 0 || weight.padded_shape[0] != weight.shape[0] ||
+            weight.padded_shape[1] != weight.shape[1]) {
+            throw std::invalid_argument("quantized-weight fixture: invalid block-FP8 metadata");
+        }
+        const std::int32_t k_tiles = weight.shape[1] / 128;
+        const std::size_t code_bytes =
+            static_cast<std::size_t>(weight.shape[0]) * weight.shape[1];
+        const std::size_t scale_offset = detail::align_up_size(code_bytes, 256);
+        const std::size_t scale_bytes = static_cast<std::size_t>(weight.shape[0] / 128) *
+                                        k_tiles * sizeof(std::uint16_t);
+        if (packed.scale_plane_offset != scale_offset || packed.scale_plane_bytes != scale_bytes ||
+            packed.payload.size() < scale_offset + scale_bytes) {
+            throw std::invalid_argument("quantized-weight fixture: invalid block-FP8 planes");
+        }
+        const std::uint8_t code = packed.payload[static_cast<std::size_t>(row) * weight.shape[1] +
+                                                 column];
+        const std::size_t scale_index = static_cast<std::size_t>(row / 128) * k_tiles +
+                                        column / 128;
+        const std::uint16_t scale_bits =
+            detail::load_u16_le(packed.payload, scale_offset + scale_index * 2);
+        return detail::decode_e4m3fn(code) * detail::bf16_to_f32(scale_bits);
     }
 
     if (weight.qtype == QType::NVFP4) {

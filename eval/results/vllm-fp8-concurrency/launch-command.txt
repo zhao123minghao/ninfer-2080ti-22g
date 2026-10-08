@@ -1,0 +1,9 @@
+# Launcher invocation (2026-10-07, vLLM 2080 Ti Definitive v0.2.2-post3)
+cd /home/zhaomh/ws/vLLM-2080Ti-Definitive
+PATH="$PWD/.venv/bin:$PATH" bash launcher.sh --non-interactive \
+  --model-dir /data/models/qwen3.8-27b/Qwen3.8-27B-FP8 \
+  --profile 2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x262K-text-only.env \
+  --max-model-len 65536 --max-num-seqs 3
+
+# Resolved engine command line (from ps while the service was live)
+-m vllm.entrypoints.openai.api_server --host 127.0.0.1 --port 8000 --model /data/models/qwen3.8-27b/Qwen3.8-27B-FP8 --served-model-name Qwen3.8-27B-FP8 --dtype half --tensor-parallel-size 2 --generation-config auto --gpu-memory-utilization 0.96 --max-model-len 65536 --enable-chunked-prefill --max-num-seqs 3 --max-num-batched-tokens 2048 --prefill-batch-barrier --quantization fp8 --kv-cache-dtype fp8 --mamba-cache-mode align --enable-prefix-caching --enable-prompt-tokens-details --language-model-only --skip-mm-profiling --disable-log-stats --reasoning-parser qwen3 --additional-config {"gdn_prefill_backend":"flashqla_legacy"} --speculative-config {"method":"mtp","num_speculative_tokens":4} --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[5,10,15],"max_cudagraph_capture_size":15}

@@ -15,6 +15,7 @@ The storage registry contains exactly these identities:
 | `row-split-k128-v1` | tensor layout | `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | rank 2 `[N,K]` | 256 bytes |
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | rank 2 `[N,K]` | 256 bytes |
+| `blockscale-m128-k128-v1` | tensor layout | `FP8_E4M3FN_BLOCK128_BF16S` | positive rank 2 `[N,K]` | 256 bytes |
 | `ggml-k256-v1` | tensor layout | `GGML_K` | rank 2 `[N,K]`, `K % 256 == 0` | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
@@ -22,7 +23,8 @@ These are closed identities, not templates. A format/layout combination not pres
 unsupported. In particular, a direct format cannot use a quantized layout, grouped
 signed-integer formats cannot use `contiguous-le-v1`, and `NVFP4` cannot use
 `row-split-k128-v1`. `FP8_E4M3FN_ROW_BF16S` can use only `row-scale-v1`; a bare E4M3FN code plane
-is not a compatible direct tensor.
+is not a compatible direct tensor. `FP8_E4M3FN_BLOCK128_BF16S` uses only
+`blockscale-m128-k128-v1`; its tile scale plane is not interchangeable with `row-scale-v1`.
 
 Object alignment applies to the object's payload-relative `offset` in the `.ninfer` JSON. Internal
 plane offsets and padding belong to the selected layout. Inter-object padding belongs to the
@@ -351,6 +353,8 @@ Layout decoding yields only persistent logical words:
   matrix-level FP32 weight divisor;
 - `row-scale-v1` yields the natural row-major E4M3FN code words and one BF16 multiplier per logical
   row;
+- `blockscale-m128-k128-v1` yields row-major E4M3FN codes and the natural BF16 128x128 tile-scale
+  matrix, without converting either plane;
 - `raw-bytes-v1` yields the enclosing resource bytes.
 - `ggml-k256-v1` yields each row's unchanged Q4_K or Q6_K codes and scales.
 
@@ -378,3 +382,67 @@ GGUF GDN output columns when TP2 selects key-head groups from three tiled repeat
 requantizing any block. The materialization plan owns the generated descriptor
 prefix until its host-to-device transfer completes. `Weight.qhigh` points to the descriptor table
 and `Weight.qdata` to the code plane; scales remain inside the raw blocks.
+
+## 9. `blockscale-m128-k128-v1`
+
+This layout accepts only `FP8_E4M3FN_BLOCK128_BF16S`, positive rank-two `[N,K]` matrices.
+The generic geometry supports partial tiles; the registered Qwen3.8 execution matrices and
+slice boundaries are 128-aligned. Let:
+
+```text
+m_tiles            = ceil_div(N, 128)
+k_tiles            = ceil_div(K, 128)
+code_plane_bytes   = N * K
+scale_plane_offset = align_up(code_plane_bytes, 256)
+scale_plane_bytes  = 2 * m_tiles * k_tiles
+payload_bytes      = scale_plane_offset + scale_plane_bytes
+```
+
+Code byte `[n,k]` is at `n*K+k`, without matrix padding. The alignment gap before the scale
+plane is zero-filled. Scale `[tile_row,tile_column]` is a little-endian BF16 word at
+`scale_plane_offset + 2*(tile_row*k_tiles+tile_column)`. There is no tensor divisor or per-row
+scale. Decode recovers the two planes exactly and applies the multiplier formula in
+[`tensor-formats.md`](tensor-formats.md#35-fp8_e4m3fn_block128_bf16s).
+
+Materialized row-range slicing requires starts and lengths divisible by 128. It concatenates
+selected code rows and the corresponding scale-tile rows, recomputing the shard's scale-plane
+alignment. Column ranges likewise have 128-aligned starts and lengths; each code row and its
+selected scale columns are copied without requantization. Arbitrary row gathering must not
+silently assign a source tile's scale to a different logical tile.
+
+The typed `Weight` uses `QuantLayout::BlockScaleM128K128`, `group_size=128`, BF16 `scales`,
+`scale_ne=[k_tiles,m_tiles]`, and byte strides `[2,2*k_tiles]`. An in-place aligned row view
+advances `qdata` by `row_begin*K` and `scales` by `(row_begin/128)*k_tiles*2`; those planes are not
+one assumed-contiguous view payload. TP2 binding owns the correct row/column slice, not the
+kernel. The layout preserves source FP8/BF16 words and implies neither runtime repacking nor
+a persistent FP16 expansion.
+
+## 10. `marlin-fp8-block128-v1`
+
+This layout accepts only `FP8_E4M3FN_BLOCK128_BF16S` rank-two `[N,K]` matrices with
+`N % 128 == 0` and `K % 128 == 0`. It is a lossless persistent execution layout for the SM75
+Marlin-style consumer, not a second quantization: decoding must return every original E4M3 code
+and every original BF16 128x128 multiplier word exactly.
+
+Let `n_tiles=N/32`, `k_tiles=K/32`, and `groups=K/128`. The code plane has `N*K` bytes, ordered
+first by 32-wide K tile and then 32-row N tile. Inside each tile, bytes are ordered by
+`thread=0..31`, `warp=0..3`, `result=0..1`, and four fragment bytes. For a thread `t`, warp `w`,
+result `r`, and byte `i`, the represented logical code is:
+
+```text
+n = tile_n*32 + (w/2)*16 + t/4 + (w%2)*8
+k = tile_k*32 + (t%4)*4 + i + r*16
+```
+
+The scale plane starts at `align_up(N*K,256)` and holds the logical `[N/128,K/128]` BF16
+multipliers once each, in the same order the block-scale layout stores them. Only the code plane
+is reordered: every consumer reads one multiplier per row block and K group, so replicating a
+multiplier across its 128 rows (as the registered Marlin kernel does, which indexes scales by row)
+would spend 128x the bytes for no lookup advantage.
+
+TP2 row ranges must be multiples of 128 (both the code tiles and the scale plane are
+row-block addressable); registered MLP row shards satisfy that. TP2 column ranges must be
+multiples of 128, so every selected code tile and scale group remains contiguous. `Weight` uses
+`QuantLayout::MarlinFp8Block128` with the code plane at `qdata` and the compact scale plane at
+`scales`; the native execution leaf owns fragment interpretation. No consumer may reconstruct
+row-major codes, repack weights at runtime, or create a persistent FP16 copy.

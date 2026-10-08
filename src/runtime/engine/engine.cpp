@@ -440,6 +440,34 @@ void Engine::debug_enable_logit_capture(bool enabled) {
         impl_->executor);
 }
 
+std::vector<std::uint16_t> Engine::debug_last_prefill_layers_bf16() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [](const auto& executor) -> std::vector<std::uint16_t> {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                return executor->debug_last_prefill_layers_bf16();
+            }
+        },
+        impl_->executor);
+}
+
+void Engine::debug_enable_layer_capture(bool enabled) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    std::visit(
+        [enabled](const auto& executor) {
+            using Executor = std::remove_cvref_t<decltype(executor)>;
+            if constexpr (std::is_same_v<Executor, std::monostate>) {
+                throw std::logic_error("concurrent Engine executor is unavailable");
+            } else {
+                executor->debug_enable_layer_capture(enabled);
+            }
+        },
+        impl_->executor);
+}
+
 void Engine::debug_enable_peer_egress_check(bool enabled) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     std::visit(

@@ -5,17 +5,17 @@ two additions to the 27B execution package: tensor-parallel execution across two
 (`--tp 2 --devices A,B`) and YaRN positional scaling (`--rope yarn`) for contexts up to 1,048,576
 tokens.
 
-It is a maintainer reference, not a user guide. User-facing option contracts live in
-[CLI](../cli.md) and [HTTP serving](../serving.md); the measured throughput, memory and retrieval
-tables live in [Performance](../performance.md) and the project [README](../../README.md). What is
-here is the material a maintainer needs before changing any of it: why the transport is shaped the
-way it is, why the YaRN constants are what they are, and what each correctness gate actually
-proves.
+This document records the upstream RTX 5090 implementation of that path, which this checkout
+inherits as a design reference; check that a statement below still applies to the local `sm_75`
+target before acting on it. User-facing option contracts live in [CLI](../cli.md) and
+[HTTP serving](../serving.md). What is here is the material a maintainer needs before changing any
+of it: why the transport is shaped the way it is, why the YaRN constants are what they are, and what
+each correctness gate actually proves.
 
 Scope: the 27B execution package (`qwen3.6-27b` and `qwen3.8-27b`, either weight profile).
 `qwen3.6-35b-a3b` has no tensor-parallel path. Every measurement quoted here was taken on the
-Qwen3.8-27B NVFP4 artifact, and every timing carries a per-GPU power limit — see
-[Measurement conditions](#7-measurement-conditions-and-open-items).
+upstream RTX 5090 host with the Qwen3.8-27B NVFP4 artifact, and every timing carries a per-GPU power
+limit — see [Measurement conditions](#7-measurement-conditions-and-open-items).
 
 ---
 
@@ -390,22 +390,13 @@ at ten-plus new shapes; it is Op work, not integration work. See
 
 ## 7. Measurement conditions and open items
 
-**Every timing carries a per-GPU power limit, and there are three of them.**
-
-| Condition | What it covers |
-|---|---|
-| **400 W** per GPU | The main campaign. The minimum settable limit on these cards; sampled draw sat at 346–353 W, so the limit was binding |
-| **575 W** per GPU | The re-measurement of the publishable subset |
-| **500 W** per GPU | The cross-engine comparison against vLLM (see [Performance](../performance.md)) |
-
-Vendor defaults are 600 W and 575 W; the maximum is 600 W on both cards. Do not quote a figure
-without its condition, do not compare rows across conditions, and do not compare any of them
-against the single-GPU campaigns elsewhere in [Performance](../performance.md), which were taken
-under none of the three.
-
-Lifting the cap helps TP1 more than TP2: one card running the whole model saturates its limit (peak
-575.5 W) while two cards sharing it peak at 391 and 406 W, so the TP2-over-TP1 decode advantage
-narrows from 1.44× at 400 W to 1.40× at 575 W.
+**Every inherited timing carries a per-GPU power limit, and there are three of them**: the 400 W
+main campaign (the minimum settable limit on these cards; sampled draw sat at 346–353 W, so the
+limit was binding), its 575 W re-measurement of the publishable subset, and the 500 W cross-engine
+comparison. Do not quote a figure without its condition, do not compare rows across conditions, and
+do not compare any of them against the single-GPU campaigns, which were taken under none of the
+three. All three ran on the upstream RTX 5090 target; the raw records are under
+[`eval/results/`](../../eval/results).
 
 Power *draw* is retained per tick (`power.limit` and `power.draw`) by the current samplers, so newer
 CSVs carry their own power condition; the earliest campaign CSVs do not.
@@ -415,7 +406,7 @@ CSVs carry their own power condition; the earliest campaign CSVs do not.
 | Item | Status |
 |---|---|
 | Shard-extent FP64-oracle conformance beyond the FP8 A8 row extents | Open — see §6.6. Currently covered pairwise plus model-level evidence |
-| vLLM-NVFP4 like-for-weights throughput comparison | Measured, at a **500 W** per-GPU cap — a third power condition distinct from the 400 W campaign and the 575 W re-measurement. The table and its caveats are in the cross-engine section of [Performance](../performance.md); §7.3 below records what vLLM can serve and why the weights are not identical. Still open within it: no vLLM MTP-off row, and the prefill-chunk difference was not swept |
+| vLLM-NVFP4 like-for-weights throughput comparison | Measured at a **500 W** per-GPU cap; the table, caveats and raw records are under [`eval/results/cross-engine-nvfp4/`](../../eval/results/cross-engine-nvfp4/README.md), and §7.3 below records what vLLM can serve and why the weights are not identical. Still open within it: no vLLM MTP-off row, and the prefill-chunk difference was not swept |
 | CUDA Graph per-device allowance at 1M | Open. The 20 MiB allowance is too tight against a capture pool that is not deterministic: successful boots capture 2.00–3.44 MiB per device, but one 1,048,576-token boot claimed 44,433,408 bytes and aborted, then booted normally on the immediate retry with no change to the command line. Workaround: retry. Fix candidates: raise the allowance, or size it from a measured reservation rather than a fixed per-request multiplier. Log retained at `eval/results/cross-engine-nvfp4/ninfer-500w-700000-mtp0-cudagraph-allowance-failure.txt`, and the successful boots' capacity summaries at `ninfer-boot-summaries.txt` in the same directory |
 | Concurrency C=2 at 575 W | Not re-measured; C=1 and C=4 were |
 | A seeded temperature > 0 soak | Not run. The soak is greedy, which is what makes its two passes hash-comparable; a sampled soak needs a seeded run and a different determinism criterion |
@@ -442,25 +433,14 @@ None is a regression against tp1 and none affects correctness:
 vLLM does serve NVFP4 Qwen3.8-27B beyond 262,144 tokens. Extended context there is read from the
 checkpoint's `config.json` `rope_parameters` rather than from a serving flag, so an NVFP4
 repackaging that ships without a YaRN block is capped at its `max_position_embeddings` (262,144)
-*until* one is injected at load — which `--hf-overrides` does:
-
-```
-VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve unsloth/Qwen3.8-27B-NVFP4 \
-  --max-model-len 750000 --hf-overrides '{"text_config": {"rope_parameters": {
-    "mrope_interleaved": true, "mrope_section": [11,11,10], "rope_type": "yarn",
-    "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0,
-    "original_max_position_embeddings": 262144}}}'
-```
-
-The measurement host's own `serve-qwen38-27b-long.sh` runs exactly that shape at 750,000 tokens
-with FP8 KV, TP2 and MTP3. The difference from NInfer is therefore *where the configuration lives*
-— a serving flag on an unmodified artifact here, a checkpoint-config override there — not a
-capability difference.
+*until* one is injected at load (`--hf-overrides`). The difference from NInfer is therefore *where
+the configuration lives* — a serving flag on an unmodified artifact here, a checkpoint-config
+override there — not a capability difference.
 
 Any throughput row against vLLM also compares **two quantizations**, not one: the vLLM side uses an
 independent NVFP4 quantization of the same base fine-tune rather than NInfer's own conversion. The
-cross-engine numbers, taken at a **500 W** per-GPU cap, live in
-[Performance](../performance.md).
+cross-engine numbers, taken at a **500 W** per-GPU cap, are archived under
+[`eval/results/cross-engine-nvfp4/`](../../eval/results/cross-engine-nvfp4/README.md).
 
 **Freeing the GPUs after a vLLM run needs `SIGKILL`.** `kill -TERM` to the `vllm serve` process
 group leaves its `VLLM::Worker_TP*` processes re-parented to init and still holding about 14.6 GiB
@@ -508,8 +488,9 @@ capture and transport probes all live in `tools/tp2/`. The 1M needle, soak and p
 - **Vision is `--tp 1` only.** The Vision encoder runs on the primary device against replicated
   weights and has no split path, so `--tp 2 --vision` is rejected at startup. YaRN is likewise
   rejected together with `--vision`, because the encoder ropes 2-D image-grid positions.
-- **DFlash is rejected at `--tp 2`.** It remains a 35B-A3B text-only backend, and that target has no
-  tensor-parallel path at all.
+- **Qwen3.8-27B DFlash2 supports `--tp 2` when a groupwise-int or GGUF artifact includes its
+  optional companion package.** This all-local route is text-only. The separate 35B-A3B DFlash route
+  remains single-device because that target has no tensor-parallel path.
 - **`--tp 2` requires an explicit `--devices A,B`** naming two distinct devices of the same compute
   capability.
 - **1,048,576 tokens is a one-slot configuration**, by arithmetic rather than policy: the per-slot
@@ -520,8 +501,8 @@ capture and transport probes all live in `tools/tp2/`. The 1M needle, soak and p
 
 ## 10. Related documents
 
-- [Performance](../performance.md) — the measured throughput, memory and latency tables, with their
-  power conditions and reproduction commands.
+- [Performance](../performance.md) — this target's measured tables, the inherited V100X2 tables, and
+  a one-line-per-campaign summary of the archived RTX 5090 campaigns.
 - [CLI](../cli.md) and [HTTP serving](../serving.md) — the `--tp`, `--devices`, `--rope` and
   `--yarn-*` option contracts.
 - [Op admission, contracts, ownership, qualification, and performance rules](op-development.md) —

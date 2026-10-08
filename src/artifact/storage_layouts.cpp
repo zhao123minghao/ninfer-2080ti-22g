@@ -9,6 +9,10 @@ namespace {
 
 constexpr std::uint64_t kTensorAlignment = 256;
 constexpr std::uint64_t kKAlignment      = 128;
+constexpr std::uint64_t kFp8BlockRows    = 128;
+constexpr std::uint64_t kFp8BlockColumns = 128;
+constexpr std::uint64_t kMarlinTileRows   = 32;
+constexpr std::uint64_t kMarlinTileColumns = 32;
 
 // blockscale-k16-m128x4-v1 physical tiling constants (storage-layouts.md section 4, and
 // tools/artifact/layouts.py swizzle_nvfp4_scales, which is the encoder of record).
@@ -131,6 +135,8 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "NVFP4";
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return "FP8_E4M3FN_ROW_BF16S";
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return "FP8_E4M3FN_BLOCK128_BF16S";
     case NumericFormat::GGML_K:
         return "GGML_K";
     }
@@ -147,6 +153,10 @@ std::string_view layout_name(StorageLayout layout) noexcept {
         return "blockscale-k16-m128x4-v1";
     case StorageLayout::RowScaleV1:
         return "row-scale-v1";
+    case StorageLayout::BlockScaleM128K128V1:
+        return "blockscale-m128-k128-v1";
+    case StorageLayout::MarlinFp8Block128V1:
+        return "marlin-fp8-block128-v1";
     case StorageLayout::GgmlK256V1:
         return "ggml-k256-v1";
     }
@@ -206,6 +216,12 @@ std::uint64_t tensor_encoded_size(StorageLayout layout, NumericFormat format,
     }
     if (layout == StorageLayout::RowScaleV1) {
         return row_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::BlockScaleM128K128V1) {
+        return fp8_block_scale_geometry(format, shape).encoded_bytes;
+    }
+    if (layout == StorageLayout::MarlinFp8Block128V1) {
+        return marlin_fp8_block_geometry(format, shape).encoded_bytes;
     }
     throw ArtifactError("unknown tensor layout");
 }
@@ -492,6 +508,55 @@ TensorSlice tensor_row_slice(StorageLayout layout, NumericFormat format,
         append_row_plane_copies(out, planes, rows, 1);
         return out;
     }
+
+    if (layout == StorageLayout::BlockScaleM128K128V1) {
+        require_slice(shape.size() == 2,
+                      "blockscale-m128-k128-v1 requires a rank-two shape");
+        const std::uint64_t total_rows = validate_row_ranges(rows, shape[0], kFp8BlockRows);
+        const Fp8BlockScaleGeometry parent = fp8_block_scale_geometry(format, shape);
+        const std::array<std::uint64_t, 2> shard_shape = {total_rows, shape[1]};
+        const Fp8BlockScaleGeometry shard = fp8_block_scale_geometry(format, shard_shape);
+        out.encoded_bytes                = shard.encoded_bytes;
+        const std::array<SlicePlane, 1> codes = {SlicePlane{0, 0, shape[1]}};
+        append_row_plane_copies(out, codes, rows, 1);
+        const std::array<SlicePlane, 1> scales = {
+            SlicePlane{parent.scale_plane_offset, shard.scale_plane_offset,
+                       checked_mul(parent.k_tiles, 2, "FP8 block scale row bytes")}};
+        append_row_plane_copies(out, scales, rows, kFp8BlockRows);
+        return out;
+    }
+
+    if (layout == StorageLayout::MarlinFp8Block128V1) {
+        require_slice(shape.size() == 2, "marlin-fp8-block128-v1 requires a rank-two shape");
+        const std::uint64_t total_rows = validate_row_ranges(rows, shape[0], kFp8BlockRows);
+        const MarlinFp8BlockGeometry parent = marlin_fp8_block_geometry(format, shape);
+        const std::array<std::uint64_t, 2> shard_shape = {total_rows, shape[1]};
+        const MarlinFp8BlockGeometry shard = marlin_fp8_block_geometry(format, shard_shape);
+        out.encoded_bytes = shard.encoded_bytes;
+        std::uint64_t destination_tiles = 0;
+        for (const SliceRange& range : rows) {
+            require_slice(range.begin % kMarlinTileRows == 0 && range.count % kMarlinTileRows == 0,
+                          "marlin-fp8-block128-v1 row ranges must be multiples of 32");
+            const std::uint64_t source_tiles = range.begin / kMarlinTileRows;
+            const std::uint64_t tiles = range.count / kMarlinTileRows;
+            for (std::uint64_t kt = 0; kt < parent.k_tiles; ++kt) {
+                const std::uint64_t source =
+                    (kt * parent.n_tiles + source_tiles) * kMarlinTileRows * kMarlinTileColumns;
+                const std::uint64_t destination =
+                    (kt * shard.n_tiles + destination_tiles) * kMarlinTileRows * kMarlinTileColumns;
+                out.copies.push_back({source, destination,
+                                      tiles * kMarlinTileRows * kMarlinTileColumns});
+            }
+            destination_tiles += tiles;
+        }
+        // The scale plane is row-block addressable, so every selected 128-row range is one
+        // contiguous copy of its whole K extent.
+        const std::array<SlicePlane, 1> scales = {
+            SlicePlane{parent.scale_plane_offset, shard.scale_plane_offset,
+                       checked_mul(parent.scale_groups, 2, "Marlin FP8 scale row bytes")}};
+        append_row_plane_copies(out, scales, rows, kFp8BlockRows);
+        return out;
+    }
     throw ArtifactError("unknown tensor layout");
 }
 
@@ -615,6 +680,48 @@ TensorSlice tensor_column_slice(StorageLayout layout, NumericFormat format,
                                        shard.scale_plane_bytes});
         return out;
     }
+
+    if (layout == StorageLayout::BlockScaleM128K128V1) {
+        const Fp8BlockScaleGeometry parent = fp8_block_scale_geometry(format, shape);
+        require_slice(columns.begin % kFp8BlockColumns == 0 &&
+                          columns.count % kFp8BlockColumns == 0,
+                      "blockscale-m128-k128-v1 column ranges must be multiples of 128");
+        const std::array<std::uint64_t, 2> shard_shape = {rows, columns.count};
+        const Fp8BlockScaleGeometry shard = fp8_block_scale_geometry(format, shard_shape);
+        out.encoded_bytes                = shard.encoded_bytes;
+        const std::array<SlicePlane, 1> codes = {SlicePlane{0, 0, 1}};
+        append_column_plane_copies(out, codes, rows, columns.begin, shape[1], columns.count,
+                                   columns.count);
+        const std::array<SlicePlane, 1> scales = {
+            SlicePlane{parent.scale_plane_offset, shard.scale_plane_offset, 2}};
+        append_column_plane_copies(out, scales, parent.m_tiles,
+                                   columns.begin / kFp8BlockColumns, parent.k_tiles, shard.k_tiles,
+                                   shard.k_tiles);
+        return out;
+    }
+
+    if (layout == StorageLayout::MarlinFp8Block128V1) {
+        const MarlinFp8BlockGeometry parent = marlin_fp8_block_geometry(format, shape);
+        require_slice(columns.begin % kFp8BlockColumns == 0 &&
+                          columns.count % kFp8BlockColumns == 0,
+                      "marlin-fp8-block128-v1 column ranges must be multiples of 128");
+        const std::array<std::uint64_t, 2> shard_shape = {rows, columns.count};
+        const MarlinFp8BlockGeometry shard = marlin_fp8_block_geometry(format, shard_shape);
+        out.encoded_bytes = shard.encoded_bytes;
+        const std::uint64_t source_k_tiles = columns.begin / kMarlinTileColumns;
+        const std::uint64_t selected_k_tiles = columns.count / kMarlinTileColumns;
+        out.copies.push_back({source_k_tiles * parent.n_tiles * kMarlinTileRows * kMarlinTileColumns,
+                              0,
+                              selected_k_tiles * parent.n_tiles * kMarlinTileRows *
+                                  kMarlinTileColumns});
+        const std::uint64_t source_groups = columns.begin / kFp8BlockColumns;
+        const std::array<SlicePlane, 1> scales = {
+            SlicePlane{parent.scale_plane_offset, shard.scale_plane_offset, 2}};
+        append_column_plane_copies(out, scales, parent.scale_rows, source_groups,
+                                   parent.scale_groups, shard.scale_groups, shard.scale_groups,
+                                   0);
+        return out;
+    }
     throw ArtifactError("unknown tensor layout");
 }
 
@@ -635,6 +742,56 @@ RowScaleGeometry row_scale_geometry(NumericFormat format, std::span<const std::u
     out.scale_plane_bytes = checked_mul(out.rows, 2, "FP8 scale plane bytes");
     out.encoded_bytes =
         checked_add(out.scale_plane_offset, out.scale_plane_bytes, "FP8 tensor encoded size");
+    return out;
+}
+
+Fp8BlockScaleGeometry fp8_block_scale_geometry(NumericFormat format,
+                                               std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::FP8_E4M3FN_BLOCK128_BF16S) {
+        throw ArtifactError("blockscale-m128-k128-v1 requires FP8_E4M3FN_BLOCK128_BF16S");
+    }
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0) {
+        throw ArtifactError("blockscale-m128-k128-v1 requires a positive rank-two shape");
+    }
+
+    Fp8BlockScaleGeometry out;
+    out.rows             = shape[0];
+    out.columns          = shape[1];
+    out.m_tiles          = shape[0] / kFp8BlockRows + (shape[0] % kFp8BlockRows != 0);
+    out.k_tiles          = shape[1] / kFp8BlockColumns + (shape[1] % kFp8BlockColumns != 0);
+    out.code_plane_bytes = checked_mul(out.rows, out.columns, "FP8 block code plane bytes");
+    out.scale_plane_offset =
+        align_up(out.code_plane_bytes, kTensorAlignment, "FP8 block scale plane offset");
+    const auto scale_count = checked_mul(out.m_tiles, out.k_tiles, "FP8 block scale count");
+    out.scale_plane_bytes  = checked_mul(scale_count, 2, "FP8 block scale plane bytes");
+    out.encoded_bytes =
+        checked_add(out.scale_plane_offset, out.scale_plane_bytes, "FP8 block tensor encoded size");
+    return out;
+}
+
+MarlinFp8BlockGeometry marlin_fp8_block_geometry(NumericFormat format,
+                                                  std::span<const std::uint64_t> shape) {
+    if (format != NumericFormat::FP8_E4M3FN_BLOCK128_BF16S) {
+        throw ArtifactError("marlin-fp8-block128-v1 requires FP8_E4M3FN_BLOCK128_BF16S");
+    }
+    if (shape.size() != 2 || shape[0] == 0 || shape[1] == 0 ||
+        shape[0] % kFp8BlockRows != 0 || shape[1] % kFp8BlockColumns != 0) {
+        throw ArtifactError("marlin-fp8-block128-v1 requires N and K multiples of 128");
+    }
+    MarlinFp8BlockGeometry out;
+    out.rows = shape[0];
+    out.columns = shape[1];
+    out.n_tiles = out.rows / kMarlinTileRows;
+    out.k_tiles = out.columns / kMarlinTileColumns;
+    out.scale_rows = out.rows / kFp8BlockRows;
+    out.scale_groups = out.columns / kFp8BlockColumns;
+    out.code_plane_bytes = checked_mul(out.rows, out.columns, "Marlin FP8 code bytes");
+    out.scale_plane_offset = align_up(out.code_plane_bytes, kTensorAlignment, "Marlin FP8 scale offset");
+    out.scale_plane_bytes = checked_mul(checked_mul(out.scale_rows, out.scale_groups,
+                                                    "Marlin FP8 scale words"),
+                                        2, "Marlin FP8 scale bytes");
+    out.encoded_bytes = checked_add(out.scale_plane_offset, out.scale_plane_bytes,
+                                    "Marlin FP8 payload bytes");
     return out;
 }
 

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 
@@ -16,6 +17,23 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     // shard resolves to the runtime-dimension MMA launcher at every T rather than gaining a second
     // tuned kernel set. See q5_dispatch.cpp for the rules every family follows here.
     const bool tp2_shard = (n == 7168 && k == 5120) || (n == 5120 && k == 3072);
+    const bool vocabulary_head = (n == 248320 || n == 124160) && k == 5120;
+    const bool mtp_input_projection = n == 5120 && (k == 10240 || k == 5120);
+    const bool dflash2_problem =
+        (n == 5120 && k == 25600) || (n == 1024 && k == 5120) ||
+        (n == 1280 && k == 5120) || (n == 4096 && k == 5120) ||
+        (n == 5120 && k == 4096) || (n == 34816 && k == 5120) ||
+        (n == 5120 && k == 17408) || (n == 256 && k == 5120);
+    if (dflash2_problem && t > 0) { return launch_bf16_mma; }
+    if (vocabulary_head && t > 0) {
+#if defined(NINFER_SM75)
+        if (t <= 4) {
+            return t == 1 ? launch_bf16_decode : launch_bf16_small_t;
+        }
+#endif
+        return launch_bf16_mma;
+    }
+    if (mtp_input_projection && t > 0) { return launch_bf16_mma; }
     if ((!supported_problem && !tp2_shard) || t <= 0) {
 #ifdef NINFER_VOLTA_BUILD
         // DFlash2 carries BF16 projections at draft-only geometries (6144x5120,
@@ -23,7 +41,9 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
         // qualified general BF16 fallback for these contiguous matrices.
         if (n > 0 && k > 0 && t > 0) { return launch_bf16_cutlass_sm70; }
 #endif
-        throw std::invalid_argument("bf16 linear: unsupported shape or T");
+        throw std::invalid_argument("bf16 linear: unsupported shape or T (n=" +
+                        std::to_string(n) + ", k=" + std::to_string(k) +
+                        ", t=" + std::to_string(t) + ")");
     }
     if (tp2_shard) { return launch_bf16_mma; }
     if (t == 1) { return launch_bf16_decode; }

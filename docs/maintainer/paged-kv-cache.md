@@ -76,13 +76,19 @@ MTP Engine:
     Main Text KV Pool
     MTP KV Pool
 
-DFlash Engine:
+DFlash Engine with at least one global-attention DFlash layer:
     Main Text KV Pool
     DFlash Full-Context KV Pool
+
+All-local DFlash2 Engine:
+    Main Text KV Pool
 ```
 
 MTP 与 DFlash 是 engine-wide mutually exclusive backends，因此一个 Engine 当前最多包含两个 growing
-KV pools。DFlash local cyclic KV 属于 fixed state，不在这个 pool set 中。
+KV pools。DFlash local cyclic KV 属于 fixed state，不在这个 pool set 中。DFlash 是否另有 growing
+Full pool 由 target 的 global-attention DFlash layer 决定；Qwen3.8-27B DFlash2 的五层全是 local，
+所以它只有 Main growing pool，仍保留独立的 DFlash context frontier、local cyclic KV 与 local
+rewrite-checkpoint state。
 
 这些名称属于 target/runtime 对 pool 的使用方式。Common KV Store 只看到一组 immutable pool layouts
 和 opaque pool handles，不根据 feature name、attention type 或 runtime string 分派。
@@ -179,7 +185,7 @@ active lane 至少可获得一页、且不接受 lanes 永远无法使用的 phy
 已提交的稳定 KV frontier 仍满足 backend 不领先 Main；MTP 的领先只存在于 round 内已映射的 provisional
 范围，不能被解释为已提交状态。
 
-当前 registered targets 的 Main、MTP 和 DFlash Full pools 都使用 `P=64`。令
+当前实际建立的 Main、MTP 和 DFlash Full pools 都使用 `P=64`。令
 `C=max_concurrency`，MTP draft window 为 `K_draft`。Startup capacity profile 固定为：
 
 ```text
@@ -193,13 +199,16 @@ speculative_backend = MTP:
 
 speculative_backend = DFlash:
     Main physical=M, logical-per-allocation=L
-    DFlash Full physical=M, logical-per-allocation=L
+    if target has a global DFlash layer:
+        DFlash Full physical=M, logical-per-allocation=L
+    otherwise:
+        no growing DFlash backend pool
 ```
 
 MTP 的额外 physical groups 覆盖最多 `C` 条 concurrent rows 各自相对 Main entitlement 多出的
 `K_draft-1` provisional positions；它不增加 block-table width，也不允许任一 allocation 超过 `L` logical
 pages。
-DFlash Full 不存在这类 provisional lead，因此不需要额外 headroom。
+DFlash Full（存在时）不涉及这类 provisional lead，因此不需要额外 headroom。
 
 两个 pools 不共享 physical pages；它们只是为相同数量的 logical 64-token groups 分别规划 typed
 payload。由于 materialize 时机不同，一个 pool 有空闲 page 而另一个 pool 已全部 materialize 是正常
@@ -473,7 +482,7 @@ Active pages 不搬迁。
 ```text
 SequenceKVBundle
 ├── Main Text PoolAllocation
-└── selected Backend PoolAllocation (MTP or DFlash Full, iff enabled)
+└── selected growing Backend PoolAllocation (MTP or target requires DFlash Full)
 ```
 
 每个 `PoolAllocation` 独立包含：
@@ -486,8 +495,10 @@ PoolAllocation
 └── target-owned valid frontier
 ```
 
-MTP 与 DFlash 互斥。Backend 关闭时 bundle 只有 Main；启用某个 backend 时，每个 admitted sequence
-必须同时拥有 Main 与该 backend 的 allocation，不能按 request 降级成缺少 backend state 的 bundle。
+MTP 与 DFlash 互斥。Backend 关闭时 bundle 只有 Main。启用 MTP 时，每个 admitted sequence 必须同时
+拥有 Main 与 MTP allocations。启用 DFlash 时，只有 target 含 global DFlash layer 才增加 Full allocation；
+全 local 的 Qwen3.8-27B DFlash2 仍维护 DFlash context frontier、local cyclic KV 和 local rewrite-checkpoint
+state，但只分配 Main paged KV 与 fixed local state。
 
 ### 6.1 Three extents per pool
 
@@ -835,7 +846,7 @@ KV Store 不理解 proposal、verify 或 acceptance，也不推导 Main Text、M
 |---|---|---|
 | target full-attention KV | Main Text paged pool | 每个 target materialized token 增长 |
 | MTP persistent KV | MTP paged pool | 独立 MTP frontier |
-| DFlash full-context KV | DFlash Full paged pool | 独立 DFlash context frontier |
+| DFlash full-context KV | DFlash Full paged pool（target 有 global DFlash layer 时） | 独立 DFlash context frontier |
 | DFlash local sliding-window KV | fixed per-sequence KV state | 容量固定为 window，不随总 context 增长 |
 | DFlash boundary-local snapshot | fixed per-sequence KV state | 固定 checkpoint payload |
 | Vision/temporary query K/V | shared execution workspace | 只在一个 operator/phase 内存活 |

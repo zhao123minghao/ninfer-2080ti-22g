@@ -115,7 +115,8 @@ ProgramImplCore::plan_request_base(const PreparedPromptData& prompt,
         const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
             capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
         base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
+    } else if (speculative_backend == SpeculativeBackend::DFlash &&
+               backend_kv_cache() != nullptr) {
         base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
     }
     base->summary.admission = runtime::AdmissionResources{

@@ -146,26 +146,6 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
     ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
 }
 
-void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
-                                Tensor& key, Tensor& value, WorkspaceArena& workspace,
-                                cudaStream_t stream) {
-    auto scope     = workspace.scope();
-    const int cols = hidden.ne[1];
-    Tensor query   = workspace.alloc(DType::BF16, {TextConfig::query_size, cols});
-    Tensor gate    = workspace.alloc(DType::BF16, {TextConfig::query_size, cols});
-    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
-}
-
-void Variant::mtp_q_gate_projection(const Tensor& hidden,
-                                    const MtpAttentionProjectionWeights& weights, Tensor& query,
-                                    Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream) {
-    auto scope     = workspace.scope();
-    const int cols = hidden.ne[1];
-    Tensor key     = workspace.alloc(DType::BF16, {TextConfig::kv_size, cols});
-    Tensor value   = workspace.alloc(DType::BF16, {TextConfig::kv_size, cols});
-    ops::attn_input_proj(hidden, weights.query_key_gate_value, query, gate, key, value, stream);
-}
-
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
                                    WorkspaceArena&, cudaStream_t stream) {
@@ -224,28 +204,12 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
     run_sparse_moe(hidden, weights.op, residual, workspace, stream);
 }
 
-std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                       std::int32_t last) {
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(
+    WeightsProfile, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
+    // The one fused leaf writes all four section buffers the workspace recipe already owns; its
+    // attn_input_proj leaves need no arena of their own.
     return 0;
-}
-
-std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                std::int32_t last) {
-    validate_token_interval(first, last);
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::query_size, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::query_size, last});
-    return layout.peak_bytes(1);
-}
-
-std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                    std::int32_t last) {
-    validate_token_interval(first, last);
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
-    (void)layout.alloc(DType::BF16, {TextConfig::kv_size, last});
-    return layout.peak_bytes(1);
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile,
@@ -406,21 +370,6 @@ void Variant::mtp_attention_projection(const std::array<Tensor, 2>&,
                                        const std::array<WorkspaceArena*, 2>&,
                                        const ExecutionContext&) {
     reject_tensor_parallel("mtp_attention_projection");
-}
-
-void Variant::mtp_kv_projection(const std::array<Tensor, 2>&,
-                                const std::array<const MtpAttentionProjectionWeights*, 2>&,
-                                const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                const std::array<WorkspaceArena*, 2>&, const ExecutionContext&) {
-    reject_tensor_parallel("mtp_kv_projection");
-}
-
-void Variant::mtp_q_gate_projection(const std::array<Tensor, 2>&,
-                                    const std::array<const MtpAttentionProjectionWeights*, 2>&,
-                                    const std::array<Tensor, 2>&, const std::array<Tensor, 2>&,
-                                    const std::array<WorkspaceArena*, 2>&,
-                                    const ExecutionContext&) {
-    reject_tensor_parallel("mtp_q_gate_projection");
 }
 
 void Variant::mtp_post_mixer(const std::array<Tensor, 2>&,

@@ -2,8 +2,8 @@
 
 Committed summary of results whose raw logs are excluded by `.gitignore` (`*.log`, `eval/runs/`,
 `eval/server-logs/`). Method, power conditions and caveats:
-[`docs/performance.md`](../../../docs/performance.md) and
-[`docs/maintainer/tp2-yarn-1m.md`](../../../docs/maintainer/tp2-yarn-1m.md). The re-run set was
+[`docs/maintainer/tp2-yarn-1m.md`](../../../docs/maintainer/tp2-yarn-1m.md) and, for the
+cross-engine rows, [`cross-engine-nvfp4/`](../cross-engine-nvfp4). The re-run set was
 taken on the pre-publication development branch, at the point that hardened the peer-ingress copy
 and added the cross-rank MTP egress check.
 
@@ -103,7 +103,7 @@ host's `serve-qwen38-27b-long.sh` targets 750,000 with FP8 KV, TP2 and MTP3. NIn
 this session in three configurations tried (fp8 KV + FlashInfer; bf16 KV + FlashAttention; and the
 host's own production script verbatim). The cross-engine comparison was taken separately, at a
 **500 W** per-GPU cap — a different power condition from the 400 W and 575 W rows above, and
-therefore not comparable to them. See the cross-engine section of
-[`docs/performance.md`](../../../docs/performance.md). `eval/run_qwen3_8_27b_nvfp4_stock_power_perf.sh vllm-nvfp4`
+therefore not comparable to them. See
+[`eval/results/cross-engine-nvfp4/`](../cross-engine-nvfp4/README.md). `eval/run_qwen3_8_27b_nvfp4_stock_power_perf.sh vllm-nvfp4`
 reproduces the row against NInfer's 2,787.0 / 75.32 tok/s at the same prompt and the same
 condition.

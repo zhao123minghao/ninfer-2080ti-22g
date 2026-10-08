@@ -32,6 +32,18 @@ Binder::Binder(const Reader& reader, int device_count)
 
 bool Binder::has_tensor(std::string_view name) const noexcept { return reader_.find(name) != nullptr; }
 
+StorageLayout Binder::declared_layout(std::string_view name) const {
+    const ObjectDescriptor* object = reader_.find(name);
+    if (object == nullptr) {
+        throw ArtifactError("required artifact object is missing: " + std::string(name));
+    }
+    const auto* tensor = std::get_if<TensorDescriptor>(object);
+    if (tensor == nullptr) {
+        throw ArtifactError("required tensor is a resource: " + std::string(name));
+    }
+    return tensor->layout;
+}
+
 void Binder::set_shard_resolver(ShardResolver resolver) {
     if (!materialization_.device_objects.empty()) {
         throw ArtifactError("the shard resolver must be installed before any tensor is placed");

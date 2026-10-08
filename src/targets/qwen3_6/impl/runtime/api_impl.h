@@ -232,6 +232,16 @@ void Program<Variant>::enable_logits_capture(bool enabled) {
 }
 
 template <>
+std::span<const std::uint16_t> Program<Variant>::last_prefill_layers_bf16() const noexcept {
+    return impl_->last_prefill_layers_bf16();
+}
+
+template <>
+void Program<Variant>::enable_layer_capture(bool enabled) {
+    impl_->enable_layer_capture(enabled);
+}
+
+template <>
 void Program<Variant>::enable_peer_egress_check(bool enabled) noexcept {
     impl_->enable_peer_egress_check(enabled);
 }

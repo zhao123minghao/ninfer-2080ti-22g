@@ -9,6 +9,7 @@
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/dflash_selector.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
@@ -170,26 +171,28 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 builder, DFlashConfig::local_layers, DFlashConfig::local_capacity,
                 DFlashConfig::kv_heads, DFlashConfig::head_dim,
                 static_cast<std::int32_t>(plan.max_concurrency));
-            PagedKVPoolSpec full_pool{
-                .page_group_count      = physical_pages,
-                .logical_page_capacity = logical_pages,
-                .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
-                .plane_order           = PagedKVPlaneOrder::HeadMajor,
-                .planes =
-                    {
-                        {DType::FP16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                        {DType::FP16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
-                    },
-            };
-            dflash.full = qwen3_6::PagedKVCacheLayout{
-                .pool        = plan_paged_kv_pool(builder, full_pool),
-                .layers      = 1,
-                .max_context = plan.capacity,
-                .kv_heads    = DFlashConfig::kv_heads,
-                .head_dim    = DFlashConfig::head_dim,
-                .dtype       = DType::FP16,
-                .quant_group = 0,
-            };
+            if constexpr (DFlashConfig::local_layers < DFlashConfig::layers) {
+                PagedKVPoolSpec full_pool{
+                    .page_group_count      = physical_pages,
+                    .logical_page_capacity = logical_pages,
+                    .table_rows            = static_cast<std::int32_t>(plan.max_concurrency),
+                    .plane_order           = PagedKVPlaneOrder::HeadMajor,
+                    .planes =
+                        {
+                            {DType::FP16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                            {DType::FP16, DFlashConfig::head_dim, DFlashConfig::kv_heads, 256},
+                        },
+                };
+                dflash.full = qwen3_6::PagedKVCacheLayout{
+                    .pool        = plan_paged_kv_pool(builder, full_pool),
+                    .layers      = 1,
+                    .max_context = plan.capacity,
+                    .kv_heads    = DFlashConfig::kv_heads,
+                    .head_dim    = DFlashConfig::head_dim,
+                    .dtype       = DType::FP16,
+                    .quant_group = 0,
+                };
+            }
             dflash.prefill_features = add_tensor(
                 builder, DType::BF16, {DFlashConfig::feature_rows, effective_prefill_chunk},
                 "DFlash prefill target features");
@@ -336,7 +339,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         auto core = layout.scope();
         mtp_stem(layout, tokens, false);
         (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
-        scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
+        scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(
+                            plan.weights_profile, tokens, tokens));
         (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                             TextConfig::query_heads, plan.kv_dtype, envelope, 1, tokens, tokens));
@@ -366,15 +370,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         {
             auto bulk = layout.scope();
             mtp_stem(layout, last, preembedded);
-            matrix(layout, DType::BF16, TextConfig::kv_size, last);
-            matrix(layout, DType::BF16, TextConfig::kv_size, last);
-            scratch(layout, Variant::mtp_kv_projection_workspace_capacity_bytes(first, last));
+            (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, last);
+            scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(
+                                plan.weights_profile, first, last));
             matrix(layout, DType::BF16, TextConfig::kv_size, last);
         }
-        matrix(layout, DType::BF16, TextConfig::query_size, 1);
-        matrix(layout, DType::BF16, TextConfig::query_size, 1);
-        scratch(layout, Variant::mtp_q_gate_projection_workspace_capacity_bytes(1, 1));
-        matrix(layout, DType::BF16, TextConfig::query_size, 1);
+        (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, 1);
+        scratch(layout, Variant::mtp_attention_projection_workspace_capacity_bytes(
+                            plan.weights_profile, 1, 1));
         matrix(layout, DType::I32, 3, 1);
         matrix(layout, DType::BF16, TextConfig::query_size, 1);
         scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
@@ -493,7 +496,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 mtp_stem(layout, tokens, false);
                 (void)workspace_recipe::mtp_attention_projection<TextConfig>(layout, tokens);
                 scratch(layout,
-                        Variant::mtp_attention_projection_workspace_capacity_bytes(tokens, tokens));
+                        Variant::mtp_attention_projection_workspace_capacity_bytes(
+                            plan.weights_profile, tokens, tokens));
                 (void)workspace_recipe::mtp_attention_results<TextConfig>(layout, tokens);
                 scratch(layout, ops::gqa_attention_workspace_capacity_bytes(
                                     TextConfig::query_heads, plan.kv_dtype, text_envelope, batch,
@@ -536,35 +540,72 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 return finish(layout);
             };
             const auto dflash_proposal_capacity = [&](std::int32_t width, std::int32_t batch) {
-                WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens = width * batch;
-                matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
-                {
-                    auto attention = layout.scope();
-                    (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
-                    scratch(layout,
-                            std::max(ops::swa_workspace_capacity_bytes({0, plan.capacity}, width,
-                                                                       width, batch),
-                                     ops::bidirectional_gqa_attention_workspace_capacity_bytes(
-                                         {0, plan.capacity}, width, width, batch)));
-                }
-                {
-                    auto mlp = layout.scope();
-                    (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
-                    matrix(layout, DType::BF16, 2 * DFlashConfig::intermediate, tokens);
-                }
-                matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
-                matrix(layout, DType::BF16, DFlashConfig::hidden, drafts * batch);
-                if (plan.proposal_head == ProposalHead::Optimized) {
-                    matrix(layout, DType::BF16, Variant::draft_head_rows, drafts * batch);
-                } else {
-                    matrix(layout, DType::BF16, TextConfig::output_rows, drafts * batch);
-                }
-                matrix(layout, DType::BF16, 256, drafts * batch);
-                matrix(layout, DType::I64,
-                       16 * ((TextConfig::output_rows + 1023) / 1024), drafts * batch);
-                matrix(layout, DType::I32, 16, drafts * batch);
-                return finish(layout);
+                const std::int32_t draft_columns = drafts * batch;
+                const auto build_rank = [&](bool peer_rank) {
+                    WorkspaceLayoutBuilder layout;
+                    if (peer_rank) {
+                        const std::int32_t shard0 = TextConfig::output_rows / 2;
+                        const std::int32_t shard1 = TextConfig::output_rows - shard0;
+                        const std::int32_t parts1 =
+                            (shard1 + ops::kDFlashSelectorTile - 1) /
+                            ops::kDFlashSelectorTile;
+                        matrix(layout, DType::BF16, DFlashConfig::hidden, draft_columns);
+                        matrix(layout, DType::BF16, shard1, draft_columns);
+                        matrix(layout, DType::I64, 16 * parts1, draft_columns);
+                        matrix(layout, DType::I64, 16, draft_columns);
+                        return finish(layout);
+                    }
+
+                    matrix(layout, DType::BF16, DFlashConfig::hidden, tokens);
+                    {
+                        auto attention = layout.scope();
+                        (void)workspace_recipe::dflash_attention<DFlashConfig>(layout, tokens);
+                        std::size_t attention_scratch = 0;
+                        if constexpr (DFlashConfig::local_layers > 0) {
+                            attention_scratch = ops::swa_workspace_capacity_bytes(
+                                {0, plan.capacity}, width, width, batch);
+                        }
+                        if constexpr (DFlashConfig::local_layers < DFlashConfig::layers) {
+                            attention_scratch = std::max(
+                                attention_scratch,
+                                ops::bidirectional_gqa_attention_workspace_capacity_bytes(
+                                    {0, plan.capacity}, width, width, batch));
+                        }
+                        scratch(layout, attention_scratch);
+                    }
+                    {
+                        auto mlp = layout.scope();
+                        (void)workspace_recipe::dflash_mlp<DFlashConfig>(layout, tokens);
+                        matrix(layout, DType::BF16, 2 * DFlashConfig::intermediate, tokens);
+                    }
+                    matrix(layout, DType::BF16, DFlashConfig::hidden, draft_columns);
+                    matrix(layout, DType::BF16, DFlashConfig::hidden, draft_columns);
+                    matrix(layout, DType::BF16, 256, draft_columns);
+                    if (plan.tp == 1) {
+                        const std::int32_t parts =
+                            (TextConfig::output_rows + ops::kDFlashSelectorTile - 1) /
+                            ops::kDFlashSelectorTile;
+                        matrix(layout, DType::BF16, TextConfig::output_rows, draft_columns);
+                        matrix(layout, DType::I64, 16 * parts, draft_columns);
+                        matrix(layout, DType::I32, 16 * drafts, batch);
+                    } else {
+                        const std::int32_t shard0 = TextConfig::output_rows / 2;
+                        const std::int32_t shard1 = TextConfig::output_rows - shard0;
+                        const std::int32_t parts0 =
+                            (shard0 + ops::kDFlashSelectorTile - 1) /
+                            ops::kDFlashSelectorTile;
+                        matrix(layout, DType::BF16, shard0, draft_columns);
+                        matrix(layout, DType::I64, 16 * parts0, draft_columns);
+                        matrix(layout, DType::I64, 16, draft_columns);
+                        matrix(layout, DType::I64, 32, draft_columns);
+                        matrix(layout, DType::I64, 16, draft_columns);
+                    }
+                    return finish(layout);
+                };
+
+                const std::size_t rank0 = build_rank(false);
+                return plan.tp == 2 ? std::max(rank0, build_rank(true)) : rank0;
             };
 
             out.dflash_context = dflash_context_capacity(chunk, false);
@@ -813,8 +854,11 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::Float16 ? DType::FP16 : DType::I8,
-        .kv_quant_group = options.kv_cache == KvCacheStorage::Float16 ? 0 : qwen3_6::kKvQuantGroup,
+        .kv_dtype       = options.kv_cache == KvCacheStorage::Float16   ? DType::FP16
+                          : options.kv_cache == KvCacheStorage::Fp8E4M3 ? DType::FP8_E4M3FN
+                                                                        : DType::I8,
+        .kv_quant_group = options.kv_cache == KvCacheStorage::Int8Group64 ? qwen3_6::kKvQuantGroup
+                                                                          : 0,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .rope_mode      = options.rope_mode,

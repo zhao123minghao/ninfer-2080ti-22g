@@ -352,6 +352,11 @@ int run_nvfp4() {
     };
     failures += run(2, 1, {}, ops::LinearPolicy::A16Only, 1611U);
     failures += run(16, 1, {11}, ops::LinearPolicy::A16Only, 1621U);
+    if (!nvfp4_a4_available()) {
+        std::cout << "SKIP: NVFP4 A4 record cases require an sm_120a device\n";
+        failures += parent.verify_preserved("NVFP4 record parent weight");
+        return failures;
+    }
     failures += run(3, 1, {2}, ops::LinearPolicy::AllowA4, 1631U);
     failures += run(4, 1, {}, ops::LinearPolicy::AllowA4, 1641U);
     failures += run(16, 1, {13}, ops::LinearPolicy::AllowA4, 1651U);
@@ -362,7 +367,7 @@ int run_nvfp4() {
 
 int run_fp8_oracle_case(DevicePackedWeight& parent, std::int32_t width, std::int32_t batch,
                         std::vector<std::int32_t> valid_columns, ops::LinearPolicy policy,
-                        std::uint32_t seed) {
+                        std::uint32_t seed, QType qtype = QType::FP8_E4M3FN_ROW_BF16S) {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
@@ -408,7 +413,7 @@ int run_fp8_oracle_case(DevicePackedWeight& parent, std::int32_t width, std::int
     Tensor value_view(value.data(), DType::BF16, {kValueRows, width, batch});
     Tensor z_view(z.data(), DType::BF16, {kZRows, width, batch});
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, batch, width, width);
+        qtype, kRows, kHidden, policy, batch, width, width);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, state, valid, initial,
@@ -482,7 +487,8 @@ int run_fp8_oracle_case(DevicePackedWeight& parent, std::int32_t width, std::int
         policy == ops::LinearPolicy::AllowA8 && (batch == 1 ? width >= 10 : width * batch >= 8);
     const ReductionCriterion& criterion =
         uses_a8 ? kFp8GdnInputProjConvRecordA8Tolerance : kFp8GdnInputProjConvRecordA16Tolerance;
-    const std::string label = std::string("FP8 ") + (uses_a8 ? "A8" : "A16") +
+    const char* format = qtype == QType::FP8_E4M3FN_BLOCK128_BF16S ? "block-FP8" : "FP8";
+    const std::string label = std::string(format) + " " + (uses_a8 ? "A8" : "A16") +
                               " B=" + std::to_string(batch) + " W=" + std::to_string(width);
     int failures = compare(label + " record", record_actual, record_expected, criterion);
     failures += compare(label + " query/key/value", output_actual, output_expected, criterion);
@@ -527,15 +533,38 @@ int run_fp8() {
     failures += run_fp8_oracle_case(parent, 3, 1, {2}, ops::LinearPolicy::A16Only, 1721U);
     failures += run_fp8_oracle_case(parent, 4, 1, {}, ops::LinearPolicy::A16Only, 1731U);
     failures += run_fp8_oracle_case(parent, 6, 1, {5}, ops::LinearPolicy::A16Only, 1741U);
+    failures += run_fp8_oracle_case(parent, 10, 1, {8}, ops::LinearPolicy::A16Only, 1781U);
+    failures += run_fp8_oracle_case(parent, 11, 1, {9}, ops::LinearPolicy::A16Only, 1791U);
+    if (!fp8_a8_available()) {
+        std::cout << "SKIP: FP8 A8 record cases require an sm_100a or sm_120a device\n";
+        return failures;
+    }
     failures += run_fp8_oracle_case(parent, 7, 1, {}, ops::LinearPolicy::AllowA8, 1751U);
     failures += run_fp8_oracle_case(parent, 9, 1, {7}, ops::LinearPolicy::AllowA8, 1761U);
     failures += run_fp8_oracle_case(parent, 10, 1, {}, ops::LinearPolicy::AllowA8, 1771U);
-    failures += run_fp8_oracle_case(parent, 10, 1, {8}, ops::LinearPolicy::A16Only, 1781U);
-    failures += run_fp8_oracle_case(parent, 11, 1, {9}, ops::LinearPolicy::A16Only, 1791U);
     failures += run_fp8_oracle_case(parent, 3, 2, {3, 1}, ops::LinearPolicy::AllowA8, 1801U);
     failures += run_fp8_oracle_case(parent, 4, 2, {4, 2}, ops::LinearPolicy::AllowA8, 1811U);
     failures += run_fp8_oracle_case(parent, 16, 8, {16, 13, 11, 7, 5, 3, 2, 1},
                                     ops::LinearPolicy::AllowA8, 1821U);
+    return failures;
+}
+
+int run_block_fp8() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kRows = 16384;
+    constexpr QType kQType = QType::FP8_E4M3FN_BLOCK128_BF16S;
+    quantized_weight::PatternedWeightOptions options;
+    options.decorrelate_coordinates = true;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(kQType, kRows, kHidden, 971U, options));
+
+    int failures = 0;
+    failures += run_fp8_oracle_case(parent, 4, 1, {}, ops::LinearPolicy::A16Only, 1831U, kQType);
+    failures += run_fp8_oracle_case(parent, 4, 2, {4, 2}, ops::LinearPolicy::A16Only, 1841U,
+                                    kQType);
+    failures += run_fp8_oracle_case(parent, 16, 8, {16, 13, 11, 7, 5, 3, 2, 1},
+                                    ops::LinearPolicy::A16Only, 1851U, kQType);
+    failures += parent.verify_preserved("block-FP8 record parent weight");
     return failures;
 }
 
@@ -563,10 +592,17 @@ int main() {
         std::cerr << "FP8 record capacity did not preserve measured route witnesses\n";
         ++failures;
     }
+    if (ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_BLOCK128_BF16S, 16384, 5120, ops::LinearPolicy::A16Only, 1, 2,
+            16) != 0) {
+        std::cerr << "block-FP8 record unexpectedly requested workspace\n";
+        ++failures;
+    }
     failures += run_q4_q5();
     failures += run_w8();
     failures += run_nvfp4();
     failures += run_fp8();
+    failures += run_block_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_record\n";
     return failures == 0 ? 0 : 1;
 }

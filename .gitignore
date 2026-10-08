@@ -49,3 +49,5 @@ profiles/
 
 models/
 *.ninfer
+.scratch
+ninfer-V100X2

@@ -9,6 +9,7 @@
 #include "ops/linear/bf16/bf16_config.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
@@ -129,6 +130,12 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16S:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::FP8_E4M3FN_BLOCK128_BF16S:
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("block-FP8 linear admits only A16");
+        }
+        detail::fp8_block_linear_dispatch(x, w, out, stream);
+        return;
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;
@@ -199,6 +206,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16S:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
+    case QType::FP8_E4M3FN_BLOCK128_BF16S:
+        return detail::fp8_block_linear_workspace_capacity_bytes(
+            output_rows, input_rows, policy, min_tokens, max_tokens);
     case QType::FP32_CTRL:
     case QType::I32_CTRL:
         break;

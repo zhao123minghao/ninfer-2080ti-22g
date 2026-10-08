@@ -71,12 +71,13 @@ int run_case() {
         for (std::size_t i = 0; i < src.size(); ++i) { dst[i] = f32_to_bf16(src[i]); }
         return dst;
     };
-    DeviceBuffer d_logits = to_device(bits(logits));
+    const auto logits_bf16 = bits(logits);
+    DeviceBuffer d_logits = to_device(logits_bf16);
     DeviceBuffer d_gate = to_device(bits(gate));
     DeviceBuffer d_prev = to_device(bits(prev));
     DeviceBuffer d_next = to_device(bits(next));
     DeviceBuffer d_anchor = to_device(anchors);
-    DeviceBuffer d_partial(static_cast<std::size_t>(16 * 2 * K * B) * sizeof(std::int64_t));
+    DeviceBuffer d_partial(static_cast<std::size_t>(16 * 1 * K * B) * sizeof(std::int64_t));
     DeviceBuffer d_topk(static_cast<std::size_t>(16 * K * B) * sizeof(std::int32_t));
     DeviceBuffer d_out(static_cast<std::size_t>(K * B) * sizeof(std::int32_t));
     Tensor logits_t(d_logits.p, DType::BF16, {V, K, B});
@@ -84,13 +85,70 @@ int run_case() {
     Tensor prev_t(d_prev.p, DType::BF16, {V, R});
     Tensor next_t(d_next.p, DType::BF16, {V, R});
     Tensor anchor_t(d_anchor.p, DType::I32, {B});
-    Tensor partial_t(d_partial.p, DType::I64, {16, 2, K * B});
+    Tensor partial_t(d_partial.p, DType::I64,
+                     {16, (V + ops::kDFlashSelectorTile - 1) / ops::kDFlashSelectorTile, K * B});
     Tensor topk_t(d_topk.p, DType::I32, {16, K, B});
     Tensor out_t(d_out.p, DType::I32, {K, B});
     ops::dflash2_select(logits_t, gate_t, prev_t, next_t, anchor_t, partial_t, topk_t,
                         out_t, nullptr);
     cuda_synchronize();
-    return verify_exact("DFlash2 selector", from_device<std::int32_t>(d_out, K * B), expected);
+    if (verify_exact("DFlash2 selector", from_device<std::int32_t>(d_out, K * B), expected) != 0) {
+        return 1;
+    }
+
+    constexpr int V0 = V / 2;
+    constexpr int V1 = V - V0;
+    constexpr int C = K * B;
+    std::vector<std::uint16_t> logits0(static_cast<std::size_t>(V0) * C);
+    std::vector<std::uint16_t> logits1(static_cast<std::size_t>(V1) * C);
+    for (int col = 0; col < C; ++col) {
+        std::copy_n(logits_bf16.begin() + static_cast<std::size_t>(col) * V, V0,
+                    logits0.begin() + static_cast<std::size_t>(col) * V0);
+        std::copy_n(logits_bf16.begin() + static_cast<std::size_t>(col) * V + V0, V1,
+                    logits1.begin() + static_cast<std::size_t>(col) * V1);
+    }
+    DeviceBuffer d_logits0 = to_device(logits0);
+    DeviceBuffer d_logits1 = to_device(logits1);
+    DeviceBuffer d_partial0(static_cast<std::size_t>(16 * ((V0 + ops::kDFlashSelectorTile - 1) /
+                                                            ops::kDFlashSelectorTile) * C) *
+                             sizeof(std::int64_t));
+    DeviceBuffer d_partial1(static_cast<std::size_t>(16 * ((V1 + ops::kDFlashSelectorTile - 1) /
+                                                            ops::kDFlashSelectorTile) * C) *
+                             sizeof(std::int64_t));
+    DeviceBuffer d_keys0(static_cast<std::size_t>(16 * C) * sizeof(std::int64_t));
+    DeviceBuffer d_keys1(static_cast<std::size_t>(16 * C) * sizeof(std::int64_t));
+    Tensor logits0_t(d_logits0.p, DType::BF16, {V0, C});
+    Tensor logits1_t(d_logits1.p, DType::BF16, {V1, C});
+    Tensor partial0_t(d_partial0.p, DType::I64,
+                      {16, (V0 + ops::kDFlashSelectorTile - 1) / ops::kDFlashSelectorTile, C});
+    Tensor partial1_t(d_partial1.p, DType::I64,
+                      {16, (V1 + ops::kDFlashSelectorTile - 1) / ops::kDFlashSelectorTile, C});
+    Tensor keys0_t(d_keys0.p, DType::I64, {16, C});
+    Tensor keys1_t(d_keys1.p, DType::I64, {16, C});
+    ops::dflash2_local_topk(logits0_t, partial0_t, keys0_t, 0, nullptr);
+    ops::dflash2_local_topk(logits1_t, partial1_t, keys1_t, V0, nullptr);
+    cuda_synchronize();
+
+    const auto keys0 = from_device<std::int64_t>(d_keys0, 16 * C);
+    const auto keys1 = from_device<std::int64_t>(d_keys1, 16 * C);
+    std::vector<std::int64_t> gathered_keys(static_cast<std::size_t>(32) * C);
+    for (int col = 0; col < C; ++col) {
+        std::copy_n(keys0.begin() + static_cast<std::size_t>(col) * 16, 16,
+                    gathered_keys.begin() + static_cast<std::size_t>(col) * 32);
+        std::copy_n(keys1.begin() + static_cast<std::size_t>(col) * 16, 16,
+                    gathered_keys.begin() + static_cast<std::size_t>(col) * 32 + 16);
+    }
+    DeviceBuffer d_gathered_keys = to_device(gathered_keys);
+    DeviceBuffer d_global_keys(static_cast<std::size_t>(16 * C) * sizeof(std::int64_t));
+    DeviceBuffer d_sharded_out(static_cast<std::size_t>(K * B) * sizeof(std::int32_t));
+    Tensor gathered_keys_t(d_gathered_keys.p, DType::I64, {32, C});
+    Tensor global_keys_t(d_global_keys.p, DType::I64, {16, C});
+    Tensor sharded_out_t(d_sharded_out.p, DType::I32, {K, B});
+    ops::dflash2_select_sharded(gathered_keys_t, gate_t, prev_t, next_t, anchor_t,
+                                global_keys_t, sharded_out_t, nullptr);
+    cuda_synchronize();
+    return verify_exact("DFlash2 sharded selector",
+                        from_device<std::int32_t>(d_sharded_out, K * B), expected);
 }
 
 } // namespace

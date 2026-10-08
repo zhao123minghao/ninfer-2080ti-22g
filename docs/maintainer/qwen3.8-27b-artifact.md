@@ -1,10 +1,12 @@
 # Qwen3.8-27B artifact reference
 
 This reference defines the registered Qwen3.8-27B `.ninfer` storage contracts: the
-`qwen3.8-27b/nvfp4` and preserved `qwen3.8-27b/gguf-q4-k-m` identities, their object inventories,
+`qwen3.8-27b/nvfp4`, preserved `qwen3.8-27b/gguf-q4-k-m`, and official
+`qwen3.8-27b/fp8-block128` identities, their object inventories,
 shapes, numeric formats, storage layouts, fused row order, aliases, fixed sources, and
 source-to-object transforms. The existing registered `qwen3.8-27b/groupwise-int` contract remains
-defined in Section 13.
+defined in Section 13. Sections 1-12 describe NVFP4; Section 14 describes GGUF and Section 15
+describes block-FP8. Their source precision and scale semantics are not interchangeable.
 
 The NVFP4 profile is a registered Engine identity implemented by the target converter, exact
 binder, and Qwen3.8 execution leaves. The generic artifact registry resolves its version-2
@@ -813,7 +815,107 @@ with official JSON files. Image geometry and normalization come from the compani
 image-size/video-sampling values use the existing family defaults. These resources do not enable
 Vision execution for this identity.
 
+The converter accepts an optional `--dflash2-model <Qwen3.8-27B-DFlash2 directory>`. When present,
+it appends 66 BF16 tensors from the fixed five-layer checkpoint, including feature taps
+`[5,19,33,47,61]`, the two selector codebooks, and all five draft blocks. Without those tensors,
+`--spec dflash` is rejected at startup. With them, the GGUF identity supports text-only DFlash2 at
+TP1 or TP2.
+
+An existing `groupwise-int` artifact can receive the same optional package without reopening the
+base checkpoint or changing any base payload:
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.attach_dflash2 \
+  --artifact /path/to/qwen3_8_27b_v2.ninfer \
+  --dflash2-model /path/to/Qwen3.8-27B-DFlash2 \
+  --out /path/to/qwen3_8_27b_v2_dflash2.ninfer
+```
+
+The tool preserves the `qwen3.8-27b/groupwise-int` identity and appends the same 66 BF16 tensors;
+the existing groupwise-int artifact then supports text-only DFlash2 at TP1 or TP2. NVFP4 artifacts
+do not acquire this package. All five draft layers use local attention, so no growing DFlash Full KV
+pool is planned; local cyclic KV, rewrite-checkpoint state, and the DFlash context frontier remain
+per-sequence state.
+
 The local conversion produced an 18,322,586,368-byte artifact. Exact checks cover representative
 embedding, fused Q/K/gate/V, and MTP source rows. Host tests cover mixed-row tensor materialization
 and TP row/column slicing. Conversion success does not establish decode throughput; performance
 claims require real Engine execution and stated context occupancy.
+
+## 15. Official block-FP8 artifact
+
+```text
+filename   = qwen3_8_27b_fp8_block128.ninfer
+model_id   = qwen3.8-27b
+weights_id = fp8-block128
+target_key = qwen3_8_27b
+recipe_id  = qwen3_8_27b_fp8-block128-v1
+```
+
+This independent identity consumes the official `Qwen3.8-27B-FP8` checkpoint, locally selected at
+`/data/models/qwen3.8-27b/Qwen3.8-27B-FP8`. It is not the mixed NVFP4/row-scaled FP8 source in
+Sections 1-12. The source preflight checks the complete name/shape/dtype inventory: 66 shards,
+407 `F8_E4M3` matrices and 1199 BF16 tensors. Each quantized source matrix `[N,K]` has
+`weight_scale_inv [N/128,K/128]` in BF16. Despite that name, each scale is a multiplier.
+
+### 15.1 Format assignment and transforms
+
+| Role | Persistent representation |
+|---|---|
+| Text attention/GDN input and output, all 64 layers' gate/up and down projections | 256 fused `FP8_E4M3FN_BLOCK128_BF16S` objects |
+| MTP attention input/output and gate/up/down | four block-FP8 objects |
+| token embedding, full output head, MTP input projection | source BF16, `contiguous-le-v1` |
+| norms, GDN convolution and control projection | source BF16 with the fixed family reshape/fusion |
+| GDN `A_log` / `dt_bias` | exact BF16-to-FP32 expansion |
+| optimized draft head and ID map | the existing 131072-row Q4 shortlist recipe and I32 IDs |
+| Vision and six frontend resources | existing family inventory and source transforms, not block-FP8 matrices |
+
+The 407 source FP8 matrices become 260 fused artifact objects. Every code byte and BF16 scale
+word is preserved. Text and MTP attention use `[query,key,output_gate,value]`, GDN uses
+`[query,key,value,z]`, and MLP input uses `[gate,up]`. The source per-head query/gate split moves
+complete 128-row scale tiles with the corresponding code rows. Both selected row beginnings and
+lengths are multiples of 128; fusion never decodes/requantizes FP8 words or treats tile scales as
+row scales. There are no NVFP4 input-divisor tensors in this identity.
+
+The closed source mapping lives in
+[`recipe_fp8_block.py`](../../tools/convert/qwen3_8_27b/recipe_fp8_block.py), and its object plan in
+[`inventory_fp8_block.py`](../../tools/convert/qwen3_8_27b/inventory_fp8_block.py).
+The active block matrices use [`blockscale-m128-k128-v1`](storage-layouts.md#9-blockscale-m128-k128-v1).
+The converter also has a research-only `--marlin-layout` mode that persists the same logical
+E4M3 codes and BF16 multipliers with
+[`marlin-fp8-block128-v1`](storage-layouts.md#10-marlin-fp8-block128-v1), which reorders the code
+plane into the SM75 consumer's 32x32 fragment tiles and keeps the logical `[N/128,K/128]` scale
+plane, so both layouts have identical payload sizes. It is not accepted by
+the active block128 Engine until its native execution leaf is qualified; it must never be treated
+as a runtime repack or an interchangeable descriptor for the active artifact.
+TP2 column-parallel projections gather the corresponding 128-aligned row ranges and scale rows;
+row-parallel projections select 128-aligned K ranges and scale columns. They preserve original
+scale ownership even for fused Q/K/gate/V ranges. Runtime materialization does not repack weights
+into a full FP16 copy.
+
+### 15.2 Conversion and evidence
+
+```bash
+python3 -m tools.convert.qwen3_8_27b.convert_fp8_block \
+  --model /data/models/qwen3.8-27b/Qwen3.8-27B-FP8 \
+  --out /data/models/qwen3.8-27b/qwen3_8_27b_fp8_block128.ninfer \
+  --device cuda
+```
+
+The local artifact is 30,610,987,520 bytes; its sibling `.conversion.json` records this recipe
+and inventory. Conversion is not a diagnostic prerequisite and should not be repeated merely to
+rerun a probe. Existing exact checks cover all 260 block-FP8 objects, BF16 embedding/head,
+representative TP2 slices and actual materialization. Numerical tests separately evaluate real
+Text/MTP weights against an independent FP64 oracle.
+
+This identity uses the same public Engine, family schedules and MTP state machinery. The current
+SM75 research workload is text-only TP2 `0,1`, FP16 KV, chunk4096, capacity100000, graphs and MTP3
+with the draft head. The inventory retains Vision, but these text measurements do not qualify it.
+The optional DFlash2 package is supported by groupwise-int/GGUF, not this identity.
+
+Most real-weight Op cases currently use T5 and synthetic activations; after auto thresholds moved
+to9/13 they do not by default cover HMMA. The model-boundary logits probe is diagnostic, not a
+quality gate, and its embedding capture ordering needs verification. Registration, exact packed
+bytes and successful generation do not close end-to-end quality. See [todo.md](../../todo.md) for
+the specific unfinished checks and [performance.md](../performance.md#local-block-fp8-research)
+for separately labeled local measurements.

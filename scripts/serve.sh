@@ -28,7 +28,7 @@ PORT="${NINFER_PORT:-8000}"          # HTTP 端口
 DEVICES="${NINFER_DEVICES:-0,1}"     # 使用的 GPU（双卡 2080Ti 默认 0,1）
 TP="${NINFER_TP:-2}"                 # 张量并行度
 MAX_CONTEXT="${NINFER_MAX_CONTEXT:-262144}"  # 上下文长度（单并发 262k）
-KV_DTYPE="${NINFER_KV_DTYPE:-fp16}"  # KV 缓存精度（fp16 最快；int8 更省显存）
+KV_DTYPE="${NINFER_KV_DTYPE:-fp16}"  # KV 缓存精度（fp16 最快；fp8 减半且精度损失小于 int8；int8 最省显存）
 API_KEY="${NINFER_API_KEY:-}"        # 接口鉴权 key；留空 = 不鉴权
 MODEL_ID="${NINFER_MODEL_ID:-}"      # 对外报告的 model id；留空 = 用模型自带 id
 LOG_DIR="${NINFER_LOG_DIR:-logs}"    # 日志与 PID 文件目录

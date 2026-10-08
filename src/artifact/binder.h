@@ -87,6 +87,12 @@ public:
     // targets use this read-only probe to bind them only when the startup feature selects them.
     [[nodiscard]] bool has_tensor(std::string_view name) const noexcept;
 
+    // The persistent layout an artifact actually declares for one tensor. A target binds the layout
+    // it was converted with instead of a compiled-in default, so a recipe that changes only the
+    // stored arrangement of the same codes and scales needs no target-side layout switch. Read-only:
+    // the object stays unbound and require_tensor still validates format and shape.
+    [[nodiscard]] StorageLayout declared_layout(std::string_view name) const;
+
     void set_shard_resolver(ShardResolver resolver);
 
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,

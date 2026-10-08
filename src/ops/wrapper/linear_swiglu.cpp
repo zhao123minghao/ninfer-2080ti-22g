@@ -4,6 +4,7 @@
 #include "ninfer/ops/silu_mul.h"
 #include "ops/common/split_launch.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
@@ -74,6 +75,14 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S && gate_up_rows == 34816 && input_rows == 5120) {
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S && gate_up_rows == 34816 &&
+        input_rows == 5120) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("linear_swiglu workspace: block-FP8 admits only A16");
+        }
+        return detail::fp8_block_linear_workspace_capacity_bytes(
+            gate_up_rows, input_rows, policy, min_tokens, max_tokens);
+    }
     throw std::invalid_argument("linear_swiglu workspace: unsupported weight format");
 }
 
@@ -132,13 +141,29 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                            gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16S;
-    if (!q4_weight && !w8_weight && !nvfp4_weight && !fp8_weight) {
+    const bool block_fp8_weight =
+        large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S;
+    if (!q4_weight && !w8_weight && !nvfp4_weight && !fp8_weight && !block_fp8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
     if (fp8_weight) {
         (void)detail::validate_fp8_weight(gate_up_weight, "fp8 linear_swiglu");
         detail::fp8_linear_swiglu_dispatch(x, gate_up_weight, out, policy, ws, stream);
+        return;
+    }
+
+    if (block_fp8_weight) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("block-FP8 linear_swiglu admits only A16");
+        }
+        if (gate_up_weight.layout == QuantLayout::MarlinFp8Block128) {
+            (void)detail::validate_marlin_fp8_block_weight(gate_up_weight,
+                                                            "block-FP8 linear_swiglu");
+        } else {
+            (void)detail::validate_fp8_block_weight(gate_up_weight, "block-FP8 linear_swiglu");
+        }
+        detail::fp8_block_linear_swiglu_dispatch(x, gate_up_weight, out, stream);
         return;
     }
 
@@ -212,7 +237,8 @@ void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, con
         w.qtype == QType::Q4G64_F16S && w.group_size == 64 && w.group == 64 && common_row_split;
     const bool nvfp4_weight = w.qtype == QType::NVFP4;
     const bool fp8_weight   = w.qtype == QType::FP8_E4M3FN_ROW_BF16S;
-    if (!q4_weight && !nvfp4_weight && !fp8_weight) {
+    const bool block_fp8_weight = w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S;
+    if (!q4_weight && !nvfp4_weight && !fp8_weight && !block_fp8_weight) {
         throw std::invalid_argument("linear_swiglu column-parallel: unsupported weight format");
     }
 
@@ -225,6 +251,14 @@ void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, con
             throw std::invalid_argument("linear_swiglu column-parallel: FP8 admits only A16 or A8");
         }
         (void)detail::validate_fp8_weight(w, "fp8 linear_swiglu column-parallel");
+        return;
+    }
+    if (block_fp8_weight) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument(
+                "linear_swiglu column-parallel: block-FP8 admits only A16");
+        }
+        (void)detail::validate_fp8_block_weight(w, "block-FP8 linear_swiglu column-parallel");
         return;
     }
     if (policy != LinearPolicy::A16Only) {
@@ -302,6 +336,9 @@ void issue_swiglu_column_rank(int rank, const std::array<Tensor, 2>& x,
     } else if (w[slot].qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         detail::fp8_linear_swiglu_dispatch_shard(x[slot], w[slot], out[slot], policy,
                                                  workspace[slot], ec.dev[slot]->stream);
+    } else if (w[slot].qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        detail::fp8_block_linear_swiglu_dispatch(x[slot], w[slot], out[slot],
+                                                 ec.dev[slot]->stream);
     } else {
         q4_column_parallel_rank(x[slot], w[slot], out[slot], workspace[slot], ec.dev[slot]->stream);
     }
@@ -326,6 +363,14 @@ std::size_t linear_swiglu_column_parallel_workspace_capacity_bytes(QType qtype, 
         // unchanged by the shard (only the output row count N halves) -- the tp1 query is exact
         // here, the same rule attn_input_proj's and gdn_input_proj's column shards follow.
         return detail::fp8_linear_swiglu_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    }
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument(
+                "linear_swiglu column-parallel workspace: block-FP8 admits only A16");
+        }
+        return detail::fp8_block_linear_workspace_capacity_bytes(
+            kShardGateUpRows, kShardInputRows, policy, min_tokens, max_tokens);
     }
     if (qtype == QType::Q4G64_F16S || qtype == QType::GGML_K) {
         if (policy != LinearPolicy::A16Only) {

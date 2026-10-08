@@ -10,6 +10,7 @@
 
 #include "artifact/reader.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -149,6 +150,34 @@ Bytes build_block_scale(std::uint64_t rows, std::uint64_t columns, std::uint64_t
     return out;
 }
 
+Bytes build_marlin_fp8_block(std::uint64_t rows, std::uint64_t columns,
+                             std::uint64_t row_origin, std::uint64_t column_origin) {
+    const std::array<std::uint64_t, 2> shape = {rows, columns};
+    const auto geometry = ninfer::artifact::marlin_fp8_block_geometry(
+        NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, shape);
+    Bytes out(static_cast<std::size_t>(geometry.encoded_bytes), 0);
+    for (std::uint64_t kt = 0; kt < geometry.k_tiles; ++kt) {
+        for (std::uint64_t nt = 0; nt < geometry.n_tiles; ++nt) {
+            const std::uint64_t offset = (kt * geometry.n_tiles + nt) * 1024;
+            for (std::uint64_t byte = 0; byte < 1024; ++byte) {
+                out[static_cast<std::size_t>(offset + byte)] =
+                    pattern(column_origin / 32 + kt, row_origin / 32 + nt, byte);
+            }
+        }
+    }
+    for (std::uint64_t block = 0; block < rows / 128; ++block) {
+        for (std::uint64_t group = 0; group < geometry.scale_groups; ++group) {
+            const std::uint64_t offset = geometry.scale_plane_offset +
+                (block * geometry.scale_groups + group) * 2;
+            out[static_cast<std::size_t>(offset)] =
+                pattern(column_origin / 128 + group, row_origin / 128 + block, 0);
+            out[static_cast<std::size_t>(offset + 1)] =
+                pattern(column_origin / 128 + group, row_origin / 128 + block, 100);
+        }
+    }
+    return out;
+}
+
 // row-scale-v1 (storage-layouts.md 5): row-major E4M3FN code plane, 256-aligned BF16 row scales.
 Bytes build_row_scale(std::uint64_t rows, std::uint64_t columns, std::uint64_t row_origin,
                       std::uint64_t column_origin) {
@@ -164,6 +193,31 @@ Bytes build_row_scale(std::uint64_t rows, std::uint64_t columns, std::uint64_t r
         for (std::uint64_t i = 0; i < 2; ++i) {
             out[static_cast<std::size_t>(geometry.scale_plane_offset + n * 2 + i)] =
                 pattern(row_origin + n, 0, 200 + i);
+        }
+    }
+    return out;
+}
+
+// blockscale-m128-k128-v1: row-major E4M3FN codes and row-major BF16 scales per 128x128 tile.
+Bytes build_fp8_block_scale(std::uint64_t rows, std::uint64_t columns,
+                            std::uint64_t row_origin, std::uint64_t column_origin) {
+    const std::array<std::uint64_t, 2> shape = {rows, columns};
+    const auto geometry = ninfer::artifact::fp8_block_scale_geometry(
+        NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, shape);
+    Bytes out(static_cast<std::size_t>(geometry.encoded_bytes), 0);
+    for (std::uint64_t n = 0; n < rows; ++n) {
+        for (std::uint64_t k = 0; k < columns; ++k) {
+            out[static_cast<std::size_t>(n * columns + k)] =
+                pattern(row_origin + n, column_origin + k, 0);
+        }
+    }
+    for (std::uint64_t m = 0; m < geometry.m_tiles; ++m) {
+        for (std::uint64_t k = 0; k < geometry.k_tiles; ++k) {
+            const std::uint64_t scale_index = m * geometry.k_tiles + k;
+            out[static_cast<std::size_t>(geometry.scale_plane_offset + scale_index * 2)] =
+                pattern(row_origin / 128 + m, column_origin / 128 + k, 200);
+            out[static_cast<std::size_t>(geometry.scale_plane_offset + scale_index * 2 + 1)] =
+                pattern(row_origin / 128 + m, column_origin / 128 + k, 201);
         }
     }
     return out;
@@ -411,6 +465,98 @@ int main() {
             one(SliceRange{8, 16}));
         expect_equal(apply_slice(parent, column_slice), build_row_scale(kRows, 16, 0, 8),
                      "FP8 column slice");
+    }
+
+    // --- blockscale-m128-k128-v1 (block-FP8) -----------------------------------------------
+    {
+        constexpr std::uint64_t kRows = 384;
+        constexpr std::uint64_t kCols = 512;
+        const std::array<std::uint64_t, 2> shape = {kRows, kCols};
+        const Bytes parent = build_fp8_block_scale(kRows, kCols, 0, 0);
+
+        const TensorSlice row_slice = ninfer::artifact::tensor_row_slice(
+            StorageLayout::BlockScaleM128K128V1, NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
+            shape, one(SliceRange{128, 128}));
+        expect_equal(apply_slice(parent, row_slice), build_fp8_block_scale(128, kCols, 128, 0),
+                     "block-FP8 row slice");
+
+        const TensorSlice column_slice = ninfer::artifact::tensor_column_slice(
+            StorageLayout::BlockScaleM128K128V1, NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
+            shape, one(SliceRange{128, 256}));
+        expect_equal(apply_slice(parent, column_slice),
+                     build_fp8_block_scale(kRows, 256, 0, 128), "block-FP8 column slice");
+
+        expect_throws(
+            [&] {
+                (void)ninfer::artifact::tensor_row_slice(
+                    StorageLayout::BlockScaleM128K128V1,
+                    NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, shape,
+                    one(SliceRange{64, 128}));
+            },
+            "block-FP8 row slice off the 128-row tile boundary");
+        expect_throws(
+            [&] {
+                (void)ninfer::artifact::tensor_column_slice(
+                    StorageLayout::BlockScaleM128K128V1,
+                    NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, shape,
+                    one(SliceRange{64, 256}));
+            },
+            "block-FP8 column slice off the 128-column tile boundary");
+    }
+
+    // --- marlin-fp8-block128-v1 --------------------------------------------------------------
+    {
+        constexpr std::uint64_t kRows = 34816;
+        constexpr std::uint64_t kCols = 5120;
+        const std::array<std::uint64_t, 2> shape = {kRows, kCols};
+        const Bytes parent = build_marlin_fp8_block(kRows, kCols, 0, 0);
+
+        // TP2 gate/up owns one 8704-row range from each half of the fused object.
+        const std::array<SliceRange, 2> gate_up_ranges = {
+            SliceRange{0, 8704}, SliceRange{17408, 8704}};
+        const TensorSlice row_slice = ninfer::artifact::tensor_row_slice(
+            StorageLayout::MarlinFp8Block128V1, NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
+            shape, gate_up_ranges);
+        const Bytes expected_rows_first = build_marlin_fp8_block(8704, kCols, 0, 0);
+        const Bytes expected_rows_second = build_marlin_fp8_block(8704, kCols, 17408, 0);
+        Bytes expected_rows = expected_rows_first;
+        const std::array<std::uint64_t, 2> shard_shape = {17408, kCols};
+        const std::array<std::uint64_t, 2> half_shape = {8704, kCols};
+        // The expected shard concatenates each selected row range inside every K tile and scale group.
+        const auto shard_geometry = ninfer::artifact::marlin_fp8_block_geometry(
+            NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, shard_shape);
+        const auto half_geometry = ninfer::artifact::marlin_fp8_block_geometry(
+            NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, half_shape);
+        const auto parent_geometry = ninfer::artifact::marlin_fp8_block_geometry(
+            NumericFormat::FP8_E4M3FN_BLOCK128_BF16S, shape);
+        expected_rows.assign(static_cast<std::size_t>(shard_geometry.encoded_bytes), 0);
+        for (std::uint64_t kt = 0; kt < shard_geometry.k_tiles; ++kt) {
+            const std::size_t tile_bytes = 8704 / 32 * 1024;
+            const std::size_t first_offset = static_cast<std::size_t>(kt * (8704 / 32) * 1024);
+            const std::size_t dest = static_cast<std::size_t>(kt * shard_geometry.n_tiles * 1024);
+            std::copy_n(expected_rows_first.begin() + first_offset, tile_bytes,
+                        expected_rows.begin() + dest);
+            std::copy_n(expected_rows_second.begin() + first_offset, tile_bytes,
+                        expected_rows.begin() + dest + tile_bytes);
+        }
+        for (std::uint64_t i = 0; i < 2; ++i) {
+            const std::uint64_t parent_block = i == 0 ? 0 : 136;
+            const std::size_t row_blocks = 8704 / 128;
+            const std::size_t source = static_cast<std::size_t>(
+                parent_geometry.scale_plane_offset + parent_block * half_geometry.scale_groups * 2);
+            const std::size_t dest = static_cast<std::size_t>(
+                shard_geometry.scale_plane_offset + i * row_blocks * half_geometry.scale_groups * 2);
+            std::copy_n(parent.begin() + source, row_blocks * half_geometry.scale_groups * 2,
+                        expected_rows.begin() + dest);
+        }
+        expect_equal(apply_slice(parent, row_slice), expected_rows, "Marlin FP8 fused gate/up row slice");
+
+        const TensorSlice column_slice = ninfer::artifact::tensor_column_slice(
+            StorageLayout::MarlinFp8Block128V1, NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
+            shape, one(SliceRange{0, 2560}));
+        expect_equal(apply_slice(parent, column_slice),
+                     build_marlin_fp8_block(kRows, 2560, 0, 0),
+                     "Marlin FP8 K-half column slice");
     }
 
     // GGML_K keeps row-dependent Q4_K/Q6_K block bytes, and rebuilds shard row descriptors.

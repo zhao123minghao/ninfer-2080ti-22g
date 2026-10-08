@@ -9,11 +9,15 @@ composition. Correctness and model parity live outside this directory; developme
 ## Build
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DNINFER_BUILD_BENCHMARKS=ON
-cmake --build build --parallel --target ninfer_bench
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 -DNINFER_BUILD_BENCHMARKS=ON
+cmake --build build --parallel 4 --target ninfer_bench
 ```
 
 ## Product benchmark
+
+On this checkout use one build process and keep aggregate host CPU below approximately 85%.
+The examples span registered hardware profiles: NVFP4 A4 and row-scaled FP8 A8 are not executable
+SM75 routes. Official block128 FP8 uses the separate A16 path described below.
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
@@ -90,9 +94,10 @@ load, graph construction, and warmup do not enter topology counts.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-W8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
+W8, registered BF16 weights, NVFP4, row-scaled FP8 and block128 FP8 problems.
 Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
-FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
+Row-scaled FP8 additionally supports `--policy a8` on its admitted hardware, while block128
+requires `--policy a16`. Each permission lets the production resolver select the qualified
 route for the exact geometry and T. LinearAdd, LinearSwiGLU,
 LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
 benchmark modes here.
@@ -100,15 +105,17 @@ benchmark modes here.
 This is a long-lived public benchmark: every timed and profiled point calls `ninfer::ops::linear`
 and lets production dispatch choose the implementation. Candidate crossover work uses a
 task-local temporary sweep, puts the winner or boundary in production dispatch, and deletes losing
-candidates and temporary controls afterward; private launchers and route forcing do not belong in
-this retained benchmark. An Op-scoped Linear qualification uses this benchmark directly and does
+candidates and temporary controls afterward; private launchers and candidate CLI selectors do not
+belong in this retained benchmark. The block-FP8 Op's diagnostic `NINFER_FP8_BLOCK_ROUTE` override
+still goes through public dispatch; record any override and use auto for production evidence.
+An Op-scoped Linear qualification uses this benchmark directly and does
 not load an artifact or invoke the target, Program, Engine, or round benchmarks documented
 elsewhere in this file.
 
 Build the benchmark and measure one exact production point:
 
 ```bash
-cmake --build build --parallel --target ninfer_linear_bench
+cmake --build build --parallel 4 --target ninfer_linear_bench
 ./build/bench/ninfer_linear_bench \
   --qtype q4 --policy a16 --n 4096 --k 5120 --t 8
 ./build/bench/ninfer_linear_bench \
@@ -118,6 +125,43 @@ cmake --build build --parallel --target ninfer_linear_bench
 ./build/bench/ninfer_linear_bench \
   --qtype fp8 --policy a8 --n 16384 --k 5120 --t 1024
 ```
+
+For the actual SM75 block-FP8 payload, use `FP8BLOCK`, not `FP8`:
+
+```bash
+./build/bench/ninfer_linear_bench \
+  --qtype FP8BLOCK --policy a16 --n 7168 --k 5120 --t 4
+./build/bench/ninfer_linear_bench \
+  --qtype FP8BLOCK --policy a16 --n 34816 --k 5120 --t 4096
+```
+
+`FP8` is the row-scaled format and does not benchmark block128 decoding. Current block128 auto
+thresholds are T9 for ordinary Linear and T13 for `N=5120,K=17408`; fused Ops own their own
+thresholds. Use T1/T4/T5 and relevant T8/9 or T12/13 boundaries when investigating narrow widths,
+and preserve a wider tail case for numerical checking. Isolated full-matrix shapes do not replace
+the actual TP2 shard shapes from the Engine trace. Do not reuse RTX5090 peak percentages as SM75
+hardware utilization or logical bytes/time as measured DRAM traffic.
+
+For same-input block-FP8 operator comparisons, `--fp8-data DIR` replaces the synthetic weight
+and activation with `weight.bin` (the FP8BLOCK code/scale payload) and `activation.bin`
+(contiguous `[T,K]` BF16 words). Ordinary explicit points/sweeps use the prefix required by
+their shape; setup remains outside timing. `--output-bf16 PATH` writes one exact point's
+contiguous `[T,N]` output after timing for independent numerical checking. These are benchmark
+inputs, not another Engine artifact route. The target-private
+[Marlin comparison](../tools/parity/qwen3_8_27b/compare_marlin_linear.py) prepares exact source/
+artifact TP2 MLP inputs, performs cold-cache alternating measurements and checks both routes
+against the same mathematical oracle. See [tool commands](../tools/README.md).
+
+`--epilogue swiglu|add` admits ordinary A16 FP8BLOCK replay only. SwiGLU invokes the actual
+TP2-capable closed FP8 Op leaf and writes `[T,N/2]`; LinearAdd calls the public Op and reads
+`residual.bin` as the represented `[T,N]` BF16 input. Each sample restores that residual before
+the L2 flush and timing event, so only `R+W*x` is measured. Default `linear` behavior is unchanged;
+the shared cold-timing helper's optional prepare callback is outside the timed range.
+
+The local FP8 workload uses TP2 `0,1`, FP16 KV, chunk4096 and an explicitly selected corpus.
+`-pg P,G` requests G+1 output tokens: the first belongs to prefill and G to decode. Report this
+distinction with capacity, occupancy, rounds and acceptance. Existing codechat/prose results in
+[performance](../docs/performance.md#local-block-fp8-research) are not matched A/B pairs.
 
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
@@ -182,7 +226,7 @@ There are no repeated-T=1 comparisons, private launchers, forced routes, candida
 copied controls in this benchmark.
 
 ```bash
-cmake --build build --parallel --target ninfer_embedding_bench
+cmake --build build --parallel 4 --target ninfer_embedding_bench
 ./build/bench/ninfer_embedding_bench --profile q6-d5120 --warmup 10 --repeat 61
 ./build/bench/ninfer_embedding_bench --profile w8-d5120 --warmup 10 --repeat 61
 ./build/bench/ninfer_embedding_bench --profile w8-d2048 --warmup 10 --repeat 61
@@ -200,7 +244,7 @@ selects the 35B contiguous-parent form. `--candidate auto` uses production dispa
 selected route and transient workspace after a 256 MiB L2 flush.
 
 ```bash
-cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
+cmake --build build --parallel 4 --target ninfer_gdn_gating_proj_bench
 ./build/bench/ninfer_gdn_gating_proj_bench \
   --norm-control --candidate auto \
   -p 1,2,3,4,5,6,8,16,32,48 --warmup 10 --repeat 200
@@ -240,7 +284,7 @@ normalization and chunked-workspace accesses. These deterministic byte counts de
 implementation-level tensor traffic; physical DRAM/L2 sectors and cache reuse still require NCU.
 
 ```bash
-cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_layer_bench
+cmake --build build --parallel 4 --target ninfer_gated_delta_net_bench ninfer_gdn_layer_bench
 ./build/bench/ninfer_gated_delta_net_bench \
   --running --value-heads 32 --sweep --warmup 20 --repeat 100 --csv
 ./build/bench/ninfer_gated_delta_net_bench \
@@ -266,7 +310,7 @@ once, BF16 input once, and QKV/Z outputs once. FLOPs describe the complete regis
 The benchmark reports caller policy rather than inferring a private activation-compute route.
 
 ```bash
-cmake --build build --parallel --target ninfer_gdn_input_proj_bench
+cmake --build build --parallel 4 --target ninfer_gdn_input_proj_bench
 ./build/bench/ninfer_gdn_input_proj_bench \
   --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
   --cache cold --warmup 5 --repeat 30 \
@@ -294,7 +338,7 @@ results make launch and cache effects visible. The initial state occupies a slot
 published snapshot slots, so repeated replay does not introduce a benchmark-only state reset.
 
 ```bash
-cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_bench
+cmake --build build --parallel 4 --target ninfer_gdn_input_proj_conv_snapshot_bench
 ./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
   --format q4q5 --sweep 1:6 --execution graph --cache both \
   --warmup 10 --repeat 100 \
@@ -338,7 +382,7 @@ interval. Uniform full-width profiles use the dense public contract; exact parti
 device-resident valid extents. Reported useful bytes/FLOPs sum only valid row work.
 
 ```bash
-cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
+cmake --build build --parallel 4 --target ninfer_causal_softmax_attention_bench
 ./build/bench/ninfer_causal_softmax_attention_bench \
   --entry both --geometry all --kv-dtype all --batch 1 \
   --tokens 1,2,4,6,8,12,16 --context 0,128,2048,8192 \
@@ -358,7 +402,7 @@ at Q32/KV8/D128 with BF16 context storage. `T` is a complete non-causal query bl
 external context length.
 
 ```bash
-cmake --build build --parallel --target ninfer_context_softmax_attention_bench
+cmake --build build --parallel 4 --target ninfer_context_softmax_attention_bench
 ./build/bench/ninfer_context_softmax_attention_bench \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 0,2048,8192,32768,131072,196608,262144 \
@@ -369,7 +413,7 @@ cmake --build build --parallel --target ninfer_context_softmax_attention_bench
 contract over the 4096-slot cyclic BF16 cache and a complete non-causal query block.
 
 ```bash
-cmake --build build --parallel --target ninfer_sliding_window_attention_bench
+cmake --build build --parallel 4 --target ninfer_sliding_window_attention_bench
 ./build/bench/ninfer_sliding_window_attention_bench \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 0,32,64,96,128,4095,4096,8192,262144 \
@@ -381,7 +425,7 @@ plain-segment entry and a packed entry driven by cumulative segment lengths. Equ
 can compare both public entries; nonuniform inputs select only `packed`.
 
 ```bash
-cmake --build build --parallel --target ninfer_packed_softmax_attention_bench
+cmake --build build --parallel 4 --target ninfer_packed_softmax_attention_bench
 ./build/bench/ninfer_packed_softmax_attention_bench \
   --entry both --segments 16 --length 256 \
   --execution graph --cache cold --warmup 10 --repeat 61
@@ -403,7 +447,7 @@ caches; `T` is the public envelope and `C` is the device commit count. Every mea
 captured graph contains exactly one selected public append call.
 
 ```bash
-cmake --build build --parallel --target ninfer_kv_cache_append_bench
+cmake --build build --parallel 4 --target ninfer_kv_cache_append_bench
 ./build/bench/ninfer_kv_cache_append_bench \
   --mode full --full-geometry all --kv-dtype all --tokens 1,2,4,8,16 \
   --context 128 --execution graph --cache cold --warmup 10 --repeat 61
@@ -422,7 +466,7 @@ registered `B=2..16`. Eager and graph modes call the same public contract; cold 
 256 MiB L2 eviction before the timed interval.
 
 ```bash
-cmake --build build --parallel --target ninfer_prepare_masked_block_bench
+cmake --build build --parallel 4 --target ninfer_prepare_masked_block_bench
 ./build/bench/ninfer_prepare_masked_block_bench \
   --block-sizes 2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --execution graph --cache both --warmup 20 --repeat 101
@@ -441,7 +485,7 @@ decode, exact-T split-K Tensor Core, and tiled Tensor Core schedules used to tun
 seam. Every cold-cache sample follows a 256 MiB L2 flush.
 
 ```bash
-cmake --build build --parallel --target ninfer_w8_linear_swiglu_bench
+cmake --build build --parallel 4 --target ninfer_w8_linear_swiglu_bench
 ./build/bench/ninfer_w8_linear_swiglu_bench \
   --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,64,96,128,256,512,896,1024 \
   --warmup 10 --repeat 50 --csv-out profiles/bench/w8_linear_swiglu.csv
@@ -455,21 +499,30 @@ cmake --build build --parallel --target ninfer_w8_linear_swiglu_bench
 queries workspace capacity for the requested aggregate interval.
 
 ```bash
-cmake --build build --parallel --target ninfer_q4_linear_swiglu_bench
+cmake --build build --parallel 4 --target ninfer_q4_linear_swiglu_bench
 ./build/bench/ninfer_q4_linear_swiglu_bench \
   --t-sweep 1,2,4,8,16,24,32,40,48 --warmup 10 --repeat 50
 ```
 
 ## FP8 LinearSwiGLU Op benchmark
 
-`ninfer_fp8_linear_swiglu_bench` measures the public row-scaled FP8 `[34816,5120] ->
-[17408,T]` profile. `--policy a8` measures the production resolver, including caller-owned
+`ninfer_fp8_linear_swiglu_bench` measures public `[34816,5120] -> [17408,T]` SwiGLU with
+`--qtype fp8` (row-scaled, default) or `--qtype fp8block` (block128). For row-scaled FP8,
+`--policy a8` measures the production resolver, including caller-owned
 activation workspace and the fused SwiGLU output; `--policy a16` measures the public A16 form.
 The Tensor Core percentage uses the RTX 5090 dense FP8/FP32-accumulate reference of 419 TFLOP/s
 only for extents that the production resolver sends to A8.
 
+Block128 requires `--policy a16` and runs on SM75. Its auto route is scalar below T9 and HMMA
+from T9. Use its closed fused Op, not a pure Linear timing, when evaluating gate/up changes:
+
 ```bash
-cmake --build build --parallel --target ninfer_fp8_linear_swiglu_bench
+./build/bench/ninfer_fp8_linear_swiglu_bench \
+  --qtype fp8block --policy a16 --t-sweep 1,4,5,8,9,192,4096 --warmup 5 --repeat 30
+```
+
+```bash
+cmake --build build --parallel 4 --target ninfer_fp8_linear_swiglu_bench
 ./build/bench/ninfer_fp8_linear_swiglu_bench \
   --policy a8 \
   --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,24,32,40,48,1024 \
@@ -483,7 +536,7 @@ LinearAdd profiles. Every cold-cache sample is one production-dispatched public 
 workspace capacity queried for the requested interval.
 
 ```bash
-cmake --build build --parallel --target ninfer_q5_linear_add_bench
+cmake --build build --parallel 4 --target ninfer_q5_linear_add_bench
 ./build/bench/ninfer_q5_linear_add_bench \
   --k 6144 --t-sweep 1,2,4,8,16,24,32,48 --warmup 10 --repeat 50
 ./build/bench/ninfer_q5_linear_add_bench \
@@ -500,7 +553,7 @@ the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explic
 references.
 
 ```bash
-cmake --build build --parallel --target ninfer_bf16_linear_add_bench
+cmake --build build --parallel 4 --target ninfer_bf16_linear_add_bench
 ./build/bench/ninfer_bf16_linear_add_bench \
   --sweep 1:48:1 --route production --warmup 10 --repeat 50 \
   --csv-out profiles/bench/bf16_linear_add_t1_48.csv
@@ -517,7 +570,7 @@ BF16 residual epilogue. Production updates the residual in place and uses no wor
 `--production-only` for public evidence; every cold-cache sample follows a 256 MiB L2 flush.
 
 ```bash
-cmake --build build --parallel --target ninfer_w8_linear_add_bench
+cmake --build build --parallel 4 --target ninfer_w8_linear_add_bench
 ./build/bench/ninfer_w8_linear_add_bench \
   --k 4096 --production-only \
   --t-sweep 1,2,4,8,16,32,48,64,96,128 --warmup 10 --repeat 50
@@ -534,7 +587,15 @@ cmake --build build --parallel --target ninfer_w8_linear_add_bench
 
 ## FP8 LinearAdd Op benchmark
 
-`ninfer_fp8_linear_add_bench` measures the two public row-scaled FP8 LinearAdd registrations,
+`ninfer_fp8_linear_add_bench` accepts `--qtype fp8|fp8block` (default `fp8`). The block128
+registrations require `--policy a16`, with scalar below T9 and HMMA from T9 on SM75:
+
+```bash
+./build/bench/ninfer_fp8_linear_add_bench \
+  --qtype fp8block --k 17408 --policy a16 --t-sweep 1,4,5,8,9,192,4096 --warmup 5 --repeat 30
+```
+
+The row-scaled FP8 mode measures the two public LinearAdd registrations,
 including activation quantization, caller-owned workspace, contraction, residual read, and final
 in-place BF16 write. `--policy a8` follows the independent production resolver of the selected
 semantic Op: `[5120,6144]` uses A16 below `T=22`, while `[5120,17408]` uses A16 below `T=25`; larger
@@ -542,7 +603,7 @@ extents use FP8/FP32-accumulate Tensor Core contraction. `TC_%` is reported only
 actually executes, against the RTX 5090 419 TFLOP/s reference.
 
 ```bash
-cmake --build build --parallel --target ninfer_fp8_linear_add_bench
+cmake --build build --parallel 4 --target ninfer_fp8_linear_add_bench
 ./build/bench/ninfer_fp8_linear_add_bench \
   --k 6144 --policy a8 --t-sweep 1,2,4,8,16,20,21,22,32,48,1024 \
   --warmup 5 --repeat 30
@@ -561,7 +622,7 @@ range contains exactly one public Op call, so production owns format-specific di
 decomposition.
 
 ```bash
-cmake --build build --parallel --target ninfer_attn_input_proj_bench
+cmake --build build --parallel 4 --target ninfer_attn_input_proj_bench
 ./build/bench/ninfer_attn_input_proj_bench \
   --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
   --cache cold --warmup 10 --repeat 50 \
@@ -593,7 +654,7 @@ body while excluding fixture reset, L2 eviction, graph capture/instantiation/pri
 and host synchronization. `eager` uses the same public-call lambda and is only a comparison mode.
 
 ```bash
-cmake --build build --parallel --target ninfer_sparse_moe_bench
+cmake --build build --parallel 4 --target ninfer_sparse_moe_bench
 ./build/bench/ninfer_sparse_moe_bench \
   --codec q4-q5 --tokens 1 --execution graph --cache both \
   --distribution trace-like --warmup 20 --repeat 200
@@ -622,7 +683,7 @@ or sweep, and reports route-neutral effective bandwidth, logical FLOP/s, and cal
 extrapolation.
 
 ```bash
-cmake --build build --parallel --target ninfer_linear_pair_bench
+cmake --build build --parallel 4 --target ninfer_linear_pair_bench
 ./build/bench/ninfer_linear_pair_bench --sweep 1:128:1 --warmup 5 --repeat 30
 ```
 
@@ -631,7 +692,7 @@ cmake --build build --parallel --target ninfer_linear_pair_bench
 `ninfer_mtp_pack_bench` calls the public bit-exact pack or attention-split Op once per point:
 
 ```bash
-cmake --build build --parallel --target ninfer_mtp_pack_bench
+cmake --build build --parallel 4 --target ninfer_mtp_pack_bench
 ./build/bench/ninfer_mtp_pack_bench --op pack --d 5120 --tokens 1,2,3,4,5,6,48
 ./build/bench/ninfer_mtp_pack_bench --op split --tokens 1,2,3,4,5,6,48
 ```
@@ -644,7 +705,7 @@ artifact through the target-private package facade, prepares a real prompt with 
 Frontend, and reports draft/accept statistics for the target-owned MTP schedule:
 
 ```bash
-cmake --build build --parallel --target ninfer_qwen3_6_27b_mtp_round_bench
+cmake --build build --parallel 4 --target ninfer_qwen3_6_27b_mtp_round_bench
 ./build/bench/ninfer_qwen3_6_27b_mtp_round_bench \
   --artifact out/qwen3_6_27b.ninfer
 ```
@@ -657,7 +718,7 @@ the six-layer proposal, target verify/accept, and host publication. It reports G
 real acceptance, per-position acceptance, mean licensed length, and published tokens/s:
 
 ```bash
-cmake --build build --parallel \
+cmake --build build --parallel 4 \
   --target ninfer_qwen3_6_35b_a3b_dflash_round_bench
 ./build/bench/ninfer_qwen3_6_35b_a3b_dflash_round_bench \
   --artifact out/qwen3_6_35b_a3b.ninfer \
@@ -675,7 +736,7 @@ valid rows through `C=128`, and for the 131072-row shortlist through `C=120`. Wi
 covers every B=1 full-vocabulary width, both T1 routes, and both aggregate maxima:
 
 ```bash
-cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_select_bench
+cmake --build build --parallel 4 --target ninfer_argmax_bench ninfer_sampling_select_bench
 ./build/bench/ninfer_argmax_bench
 ./build/bench/ninfer_argmax_bench --shape full --cols 128
 ./build/bench/ninfer_argmax_bench --shape shortlist --cols 120
@@ -721,7 +782,7 @@ the selected kernel topology and payload while replacing the mathematical operat
 bitwise work:
 
 ```bash
-cmake --build build --parallel --target \
+cmake --build build --parallel 4 --target \
   ninfer_residual_add_bench ninfer_sigmoid_mul_bench \
   ninfer_gelu_bench ninfer_add_bias_bench
 

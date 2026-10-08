@@ -116,6 +116,11 @@ public:
     void debug_enable_logit_capture(bool enabled);
     [[nodiscard]] std::vector<std::uint16_t> debug_last_round_logits_bf16() const;
 
+    // Debug-only, OFF by default: capture the post-mixer BF16 residual for the final prompt
+    // token after every text layer. Intended for single-lane, one-prefill layer-boundary probes.
+    void debug_enable_layer_capture(bool enabled);
+    [[nodiscard]] std::vector<std::uint16_t> debug_last_prefill_layers_bf16() const;
+
     // Debug-only, OFF by default: at tp == 2 with MTP, compare rank 1's speculative egress record
     // (licensed tokens/counts, accepted drafts, next proposal) with rank 0's after every round.
     // Both ranks run the acceptance Op over bit-identical inputs, which is why rank 1's copy is

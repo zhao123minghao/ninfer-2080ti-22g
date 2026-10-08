@@ -786,6 +786,11 @@ int run_nvfp4() {
 
     int failures = 0;
     failures += run_nvfp4_case(parent, 1, ops::LinearPolicy::A16Only, 2);
+    if (!nvfp4_a4_available()) {
+        std::cout << "SKIP: NVFP4 A4 snapshot cases require an sm_120a device\n";
+        failures += parent.verify_preserved("NVFP4 snapshot parent weight");
+        return failures;
+    }
     failures += run_nvfp4_case(parent, 3, ops::LinearPolicy::AllowA4, 4);
     failures += run_nvfp4_case(parent, 4, ops::LinearPolicy::AllowA4, 5);
     failures += run_nvfp4_case(parent, 17, ops::LinearPolicy::AllowA4, 0);
@@ -825,7 +830,8 @@ int run_nvfp4() {
 
 int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPolicy policy,
                  std::int32_t initial_slot, bool convenience = false,
-                 bool shared_state_selectors = false) {
+                 bool shared_state_selectors = false,
+                 QType qtype = QType::FP8_E4M3FN_ROW_BF16S) {
     constexpr std::int32_t kHidden               = 5120;
     constexpr std::int32_t kValueRows            = 6144;
     constexpr std::int32_t kZRows                = 6144;
@@ -866,7 +872,7 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     Tensor v                          = value.tensor();
     Tensor z_output                   = z.tensor();
     const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-        QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, 1, tokens, tokens);
+        qtype, kRows, kHidden, policy, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     if (convenience) {
@@ -891,9 +897,11 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
     const bool uses_a8                  = policy == ops::LinearPolicy::AllowA8 && tokens >= 10;
     const ReductionCriterion& criterion = uses_a8 ? kFp8GdnInputProjConvSnapshotA8Tolerance
                                                   : kFp8GdnInputProjConvSnapshotA16Tolerance;
+    const char* format = qtype == QType::FP8_E4M3FN_BLOCK128_BF16S ? "block-FP8" : "FP8";
     const std::string suffix =
-        std::string(" FP8 ") + (uses_a8 ? "A8" : "A16") + " T=" + std::to_string(tokens) +
-        " initial=" + std::to_string(initial_slot) + " base=" + std::to_string(snapshot_base_slot);
+        std::string(" ") + format + " " + (uses_a8 ? "A8" : "A16") +
+        " T=" + std::to_string(tokens) + " initial=" + std::to_string(initial_slot) +
+        " base=" + std::to_string(snapshot_base_slot);
     const std::vector<std::uint16_t> state_after = state.bits();
     int failures =
         verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle, criterion);
@@ -941,10 +949,15 @@ int run_fp8() {
     failures += run_fp8_case(parent, 4, ops::LinearPolicy::A16Only, 5);
     failures += run_fp8_case(parent, 6, ops::LinearPolicy::A16Only, 7);
     failures += run_fp8_case(parent, 7, ops::LinearPolicy::A16Only, 8);
-    failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
-    failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
     failures += run_fp8_case(parent, 10, ops::LinearPolicy::A16Only, 11);
     failures += run_fp8_case(parent, 11, ops::LinearPolicy::A16Only, 12);
+    failures += parent.verify_preserved("FP8 parent weight");
+    if (!fp8_a8_available()) {
+        std::cout << "SKIP: FP8 A8 snapshot cases require an sm_100a or sm_120a device\n";
+        return failures;
+    }
+    failures += run_fp8_case(parent, 9, ops::LinearPolicy::AllowA8, 10);
+    failures += run_fp8_case(parent, 10, ops::LinearPolicy::AllowA8, 11);
     failures += run_fp8_case(parent, 17, ops::LinearPolicy::AllowA8, 1);
 
     const auto run_batched = [&](std::int32_t width, std::int32_t batch,
@@ -982,6 +995,52 @@ int run_fp8() {
     failures += run_batched(4, 2, {4, 2}, 937U);
     failures += run_batched(16, 8, {16, 13, 11, 7, 5, 3, 2, 1}, 941U);
     failures += parent.verify_preserved("batched FP8 parent weight");
+    return failures;
+}
+
+int run_block_fp8() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kRows = 16384;
+    constexpr std::int32_t kValueRows = 6144;
+    constexpr std::int32_t kZRows = 6144;
+    constexpr std::int32_t kChannels = 10240;
+    constexpr QType kQType = QType::FP8_E4M3FN_BLOCK128_BF16S;
+    quantized_weight::PatternedWeightOptions options;
+    options.decorrelate_coordinates = true;
+    DevicePackedWeight parent(
+        quantized_weight::make_patterned_weight(kQType, kRows, kHidden, 953U, options));
+
+    int failures = 0;
+    failures += run_fp8_case(parent, 1, ops::LinearPolicy::A16Only, 2, true, true, kQType);
+    failures += run_fp8_case(parent, 17, ops::LinearPolicy::A16Only, 5, false, false, kQType);
+
+    constexpr std::int32_t width = 4;
+    constexpr std::int32_t batch = 2;
+    const std::vector<std::int32_t> valid_columns{4, 2};
+    const std::vector<float> conv_weight = make_conv_weight(kChannels, 967U);
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        kQType, kRows, kHidden, ops::LinearPolicy::A16Only, batch, width, width);
+    failures += run_batched_case(
+        "block-FP8 A16 B=2 W=4 masked", kHidden, kValueRows, kZRows, width, batch,
+        valid_columns, conv_weight, workspace_bytes, kFp8GdnInputProjConvSnapshotA16Tolerance,
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                parent.host, row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](std::int32_t row, std::int32_t flat_column, const std::vector<float>& activation) {
+            return quantized_weight::dot_fp64(
+                parent.host, kChannels + row,
+                activation.data() + static_cast<std::size_t>(flat_column) * kHidden, kHidden);
+        },
+        [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
+            const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+            Tensor& z, WorkspaceArena& workspace) {
+            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
+                                              snapshot_base, q, k, v, z,
+                                              ops::LinearPolicy::A16Only, workspace, nullptr);
+        });
+    failures += parent.verify_preserved("block-FP8 snapshot parent weight");
     return failures;
 }
 
@@ -1048,6 +1107,7 @@ int main() {
     failures += run_w8();
     failures += run_nvfp4();
     failures += run_fp8();
+    failures += run_block_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

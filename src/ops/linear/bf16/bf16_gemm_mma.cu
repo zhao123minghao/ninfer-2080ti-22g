@@ -49,6 +49,22 @@ void launch_geometry(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
 } // namespace
 
 void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    if (weight.n == 5120 && weight.k == 10240) {
+        launch_geometry<Bf16GemvGeometry<5120, 10240>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<5120, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 248320 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<248320, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 124160 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<124160, 5120>>(x, weight, out, stream);
+        return;
+    }
     if (weight.n == 14336 && weight.k == 5120) {
         launch_geometry<Bf16GemvGeometry<14336, 5120>>(x, weight, out, stream);
         return;
@@ -66,6 +82,38 @@ void launch_bf16_mma(const Tensor& x, const Weight& weight, Tensor& out, cudaStr
     }
     if (weight.n == 5120 && weight.k == 3072) {
         launch_geometry<Bf16GemvGeometry<5120, 3072>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 25600) {
+        launch_geometry<Bf16GemvGeometry<5120, 25600>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 1024 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<1024, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 1280 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<1280, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 4096 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<4096, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 4096) {
+        launch_geometry<Bf16GemvGeometry<5120, 4096>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 34816 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<34816, 5120>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 5120 && weight.k == 17408) {
+        launch_geometry<Bf16GemvGeometry<5120, 17408>>(x, weight, out, stream);
+        return;
+    }
+    if (weight.n == 256 && weight.k == 5120) {
+        launch_geometry<Bf16GemvGeometry<256, 5120>>(x, weight, out, stream);
         return;
     }
     throw std::invalid_argument("bf16 linear MMA: unsupported exact problem");

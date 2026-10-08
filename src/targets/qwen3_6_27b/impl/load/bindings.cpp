@@ -23,6 +23,29 @@ namespace {
 
 using artifact::NumericFormat;
 
+artifact::StorageLayout storage_layout_for_weight(NumericFormat format) {
+    switch (format) {
+    case NumericFormat::BF16:
+    case NumericFormat::FP32:
+    case NumericFormat::I32:
+        return artifact::StorageLayout::ContiguousLeV1;
+    case NumericFormat::Q4G64_F16S:
+    case NumericFormat::Q5G64_F16S:
+    case NumericFormat::Q6G64_F16S:
+    case NumericFormat::W8G32_F16S:
+        return artifact::StorageLayout::RowSplitK128V1;
+    case NumericFormat::NVFP4:
+        return artifact::StorageLayout::BlockScaleK16M128x4V1;
+    case NumericFormat::FP8_E4M3FN_ROW_BF16S:
+        return artifact::StorageLayout::RowScaleV1;
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return artifact::StorageLayout::BlockScaleM128K128V1;
+    case NumericFormat::GGML_K:
+        return artifact::StorageLayout::GgmlK256V1;
+    }
+    throw std::logic_error("unhandled weight format");
+}
+
 bool is_full_layer(std::size_t layer) { return layer >= 3 && (layer - 3) % 4 == 0; }
 
 bool is_early_attention_input(std::size_t layer) {
@@ -42,6 +65,8 @@ NumericFormat endpoint_format(WeightsProfile weights_profile) {
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
         return NumericFormat::FP8_E4M3FN_ROW_BF16S;
+    case WeightsProfile::Qwen38Fp8Block128:
+        return NumericFormat::BF16;
     case WeightsProfile::Qwen38GgmlK:
         return NumericFormat::GGML_K;
     }
@@ -67,13 +92,45 @@ void require_positive_finite(std::uint32_t bits, std::string_view label) {
     }
 }
 
+// A weight binds the persistent layout its artifact declares. The format's default documents which
+// layout a recipe normally produces, so it stays the expected value for every format with a single
+// registered arrangement; the block-FP8 format has two, because the same codes and scales can be
+// stored row-major (`blockscale-m128-k128-v1`) or in the Marlin arrangement consumed directly by
+// the tiled and small-token leaves.
+artifact::StorageLayout weight_layout(const artifact::Binder& binder, std::string_view name,
+                                      NumericFormat format) {
+    const artifact::StorageLayout declared = binder.declared_layout(name);
+    if (format == NumericFormat::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (declared != artifact::StorageLayout::BlockScaleM128K128V1 &&
+            declared != artifact::StorageLayout::MarlinFp8Block128V1) {
+            throw std::invalid_argument("block-FP8 weight '" + std::string(name) +
+                                        "' declares unsupported storage layout '" +
+                                        std::string(artifact::layout_name(declared)) + "'");
+        }
+        return declared;
+    }
+    const artifact::StorageLayout expected = storage_layout_for_weight(format);
+    if (declared != expected) {
+        throw std::invalid_argument("weight '" + std::string(name) + "' declares storage layout '" +
+                                    std::string(artifact::layout_name(declared)) +
+                                    "' but its format binds '" +
+                                    std::string(artifact::layout_name(expected)) + "'");
+    }
+    return declared;
+}
+
 WeightPlan bind_weight(artifact::Binder& binder, std::string_view name, NumericFormat format,
-                       std::initializer_list<std::uint64_t> shape) {
+                       std::initializer_list<std::uint64_t> shape,
+                       std::optional<artifact::StorageLayout> requested_layout = std::nullopt) {
     if (format == NumericFormat::NVFP4) {
         throw std::logic_error("NVFP4 weight requires a paired input divisor");
     }
-    return WeightPlan{.object = artifact::bind_device_tensor(binder, name, format, shape),
-                      .format = format};
+    const artifact::StorageLayout layout =
+        requested_layout.value_or(weight_layout(binder, name, format));
+    const auto object = requested_layout ? artifact::bind_device_tensor_layout(
+                                              binder, name, format, layout, shape)
+                                        : artifact::bind_device_tensor(binder, name, format, shape);
+    return WeightPlan{.object = object, .format = format, .layout = layout};
 }
 
 WeightPlan bind_nvfp4_weight(artifact::Binder& binder, std::string_view name, std::int32_t rows,
@@ -105,8 +162,8 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
                            const WeightPlan& plan, std::int32_t rows, std::int32_t columns,
                            int device = 0) {
     if (plan.format != NumericFormat::NVFP4) {
-        return artifact::materialized_weight(materialized, plan.object, plan.format, rows, columns,
-                                             device);
+        return artifact::materialized_weight(materialized, plan.object, plan.format, plan.layout,
+                             rows, columns, device);
     }
 
     const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
@@ -155,6 +212,19 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
         Weight out = block;
         out.qhigh = static_cast<const std::byte*>(block.qhigh) + row_begin * sizeof(std::uint64_t);
         out.n = out.shape[0] = out.padded_shape[0] = row_count;
+        return out;
+    }
+    if (block.layout == QuantLayout::BlockScaleM128K128 && row_begin >= 0 && row_count > 0 &&
+        row_begin + row_count <= block.n && row_begin % 128 == 0 && row_count % 128 == 0) {
+        Weight out = block;
+        out.qdata = static_cast<const std::byte*>(block.qdata) +
+                    static_cast<std::uint64_t>(row_begin) * block.k;
+        out.scales = static_cast<const std::byte*>(block.scales) +
+                     static_cast<std::uint64_t>(row_begin / 128) * block.scale_nb[1];
+        out.n = out.shape[0] = out.padded_shape[0] = row_count;
+        out.scale_ne[1] = row_count / 128;
+        out.scale_nb[2] = out.scale_nb[1] * out.scale_ne[1];
+        out.scale_nb[3] = out.scale_nb[2];
         return out;
     }
     if (row_begin < 0 || row_count <= 0 || row_begin + row_count > block.n ||
@@ -371,8 +441,12 @@ void bind_nvfp4_text_layers(artifact::Binder& binder, BindingPlan& out) {
     }
 }
 
-void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, bool ggml_k) {
-    const NumericFormat matrix_format = ggml_k ? NumericFormat::GGML_K : NumericFormat::FP8_E4M3FN_ROW_BF16S;
+void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, bool ggml_k,
+                                   bool block_fp8 = false) {
+    const NumericFormat matrix_format =
+        ggml_k ? NumericFormat::GGML_K
+               : block_fp8 ? NumericFormat::FP8_E4M3FN_BLOCK128_BF16S
+                           : NumericFormat::FP8_E4M3FN_ROW_BF16S;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
@@ -411,7 +485,7 @@ void bind_qwen38_fused_text_layers(artifact::Binder& binder, BindingPlan& out, b
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
-        if (!ggml_k && layer < 56) {
+        if (!ggml_k && !block_fp8 && layer < 56) {
             target.mlp.gate_up =
                 bind_nvfp4_weight(binder, prefix + "mlp/gate_up", 34816, 5120,
                                   prefix + "mlp/gate_up_projection/input_scale_divisor");
@@ -899,12 +973,17 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
     const bool ggml_k = weights_profile == WeightsProfile::Qwen38GgmlK;
+    const bool block_fp8 = weights_profile == WeightsProfile::Qwen38Fp8Block128;
     if (ggml_k && features.vision) {
         throw std::invalid_argument("qwen3.8-27b/gguf-q4-k-m supports Text and MTP; its preserved GGUF Vision weights are not execution-qualified");
     }
     if (ggml_k) {
         out.draft_format = NumericFormat::GGML_K;
         out.mtp_format = NumericFormat::GGML_K;
+        out.mtp_input_projection_format = NumericFormat::GGML_K;
+    } else if (block_fp8) {
+        out.mtp_format = NumericFormat::FP8_E4M3FN_BLOCK128_BF16S;
+        out.mtp_input_projection_format = NumericFormat::BF16;
     }
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
@@ -923,6 +1002,9 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
         break;
     case WeightsProfile::Qwen38GgmlK:
         bind_qwen38_fused_text_layers(binder, out, true);
+        break;
+    case WeightsProfile::Qwen38Fp8Block128:
+        bind_qwen38_fused_text_layers(binder, out, false, true);
         break;
     default:
         throw std::invalid_argument("qwen3_6_27b: invalid weights profile");
@@ -946,25 +1028,31 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                               std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
-    out.mtp.input_projection =
-        bind_mtp("mtp/input_projection", out.mtp_format, {5120, 10240});
+    // A weight plan carries the layout its object declares; leaving this at the aggregate default
+    // would materialize a block-FP8 MTP MLP weight through the contiguous branch.
+    const auto bind_mtp_weight = [&](std::string_view name, NumericFormat format,
+                                     std::initializer_list<std::uint64_t> shape) {
+        return WeightPlan{.object = bind_mtp(name, format, shape),
+                          .format = format,
+                          .layout = binder.declared_layout(name)};
+    };
+    out.mtp.input_projection = bind_mtp_weight("mtp/input_projection",
+                                               out.mtp_input_projection_format, {5120, 10240});
     out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
     out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
     out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {5120});
-    out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
-                                            out.mtp_format, {14336, 5120});
+    out.mtp.query_key_gate_value =
+        bind_mtp_weight("mtp/layer/attention/query_key_gate_value", out.mtp_format,
+                        {14336, 5120});
     out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
     out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
     out.mtp.output =
-        bind_mtp("mtp/layer/attention/output", out.mtp_format, {5120, 6144});
+        bind_mtp_weight("mtp/layer/attention/output", out.mtp_format, {5120, 6144});
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {5120});
-    out.mtp.mlp.gate_up = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/gate_up", out.mtp_format, {34816, 5120}),
-        .format = out.mtp_format};
-    out.mtp.mlp.down = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/down", out.mtp_format, {5120, 17408}),
-        .format = out.mtp_format};
+    out.mtp.mlp.gate_up =
+        bind_mtp_weight("mtp/layer/mlp/gate_up", out.mtp_format, {34816, 5120});
+    out.mtp.mlp.down = bind_mtp_weight("mtp/layer/mlp/down", out.mtp_format, {5120, 17408});
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
     // Optional Qwen3.8 DFlash2 draft package.  All checkpoint tensors are BF16 and are kept in
@@ -1144,34 +1232,23 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
         //   * attention/output [5120, 6144] and mlp/down are row-parallel (contraction split);
         //     mlp/gate_up is column-parallel. `load_mlp` already encodes both.
         //   * every norm is replicated: full copy per device, only the `device` argument moves.
-        auto& mtp            = runtime.mtp.emplace();
-        mtp.input_projection = artifact::materialized_weight(
-            backing, plan.mtp.input_projection, plan.mtp_format, 5120, 10240 / tp,
-            device);
+        auto& mtp      = runtime.mtp.emplace();
+        mtp.input_projection =
+            materialized_weight(backing, plan.mtp.input_projection, 5120, 10240 / tp, device);
         mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
                                                              NumericFormat::BF16, {5120}, device);
         mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,
                                                              NumericFormat::BF16, {5120}, device);
         mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
                                                              NumericFormat::BF16, {5120}, device);
-        mtp.attention.packed = artifact::materialized_weight(
-            backing, plan.mtp.query_key_gate_value, plan.mtp_format, 14336 / tp, 5120,
-            device);
-        const std::int32_t mtp_query_section = 6144 / tp;
-        const std::int32_t mtp_kv_section    = 1024 / tp;
-        mtp.attention.query = row_view(mtp.attention.packed, 0, mtp_query_section);
-        mtp.attention.key   = row_view(mtp.attention.packed, mtp_query_section, mtp_kv_section);
-        mtp.attention.output_gate =
-            row_view(mtp.attention.packed, mtp_query_section + mtp_kv_section, mtp_query_section);
-        mtp.attention.value = row_view(mtp.attention.packed,
-                                       2 * mtp_query_section + mtp_kv_section, mtp_kv_section);
+        mtp.attention.packed =
+            materialized_weight(backing, plan.mtp.query_key_gate_value, 14336 / tp, 5120, device);
         mtp.query_norm      = artifact::materialized_tensor(backing, plan.mtp.query_norm,
                                                             NumericFormat::BF16, {256}, device);
         mtp.key_norm        = artifact::materialized_tensor(backing, plan.mtp.key_norm,
                                                             NumericFormat::BF16, {256}, device);
-        mtp.output = artifact::materialized_weight(backing, plan.mtp.output,
-                                                   plan.mtp_format, 5120, 6144 / tp,
-                                                   device);
+        mtp.output =
+            materialized_weight(backing, plan.mtp.output, 5120, 6144 / tp, device);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {5120}, device);
         mtp.post_mixer = load_mlp(plan.mtp.mlp, backing, tp, device);

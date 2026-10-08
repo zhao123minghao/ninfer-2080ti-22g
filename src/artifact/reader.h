@@ -28,6 +28,7 @@ enum class NumericFormat {
     W8G32_F16S,
     NVFP4,
     FP8_E4M3FN_ROW_BF16S,
+    FP8_E4M3FN_BLOCK128_BF16S,
     GGML_K,
 };
 
@@ -36,6 +37,8 @@ enum class StorageLayout {
     RowSplitK128V1,
     BlockScaleK16M128x4V1,
     RowScaleV1,
+    BlockScaleM128K128V1,
+    MarlinFp8Block128V1,
     GgmlK256V1,
 };
 
@@ -73,6 +76,35 @@ struct RowSplitGeometry {
 };
 
 RowSplitGeometry row_split_geometry(NumericFormat format, std::span<const std::uint64_t> shape);
+
+struct Fp8BlockScaleGeometry {
+    std::uint64_t rows               = 0;
+    std::uint64_t columns            = 0;
+    std::uint64_t m_tiles            = 0;
+    std::uint64_t k_tiles            = 0;
+    std::uint64_t code_plane_bytes   = 0;
+    std::uint64_t scale_plane_offset = 0;
+    std::uint64_t scale_plane_bytes  = 0;
+    std::uint64_t encoded_bytes      = 0;
+};
+
+struct MarlinFp8BlockGeometry {
+    std::uint64_t rows                = 0;
+    std::uint64_t columns             = 0;
+    std::uint64_t n_tiles             = 0;
+    std::uint64_t k_tiles             = 0;
+    std::uint64_t scale_rows          = 0;
+    std::uint64_t scale_groups        = 0;
+    std::uint64_t code_plane_bytes    = 0;
+    std::uint64_t scale_plane_offset  = 0;
+    std::uint64_t scale_plane_bytes   = 0;
+    std::uint64_t encoded_bytes       = 0;
+};
+
+Fp8BlockScaleGeometry fp8_block_scale_geometry(NumericFormat format,
+                                               std::span<const std::uint64_t> shape);
+MarlinFp8BlockGeometry marlin_fp8_block_geometry(NumericFormat format,
+                                                  std::span<const std::uint64_t> shape);
 
 struct BlockScaleGeometry {
     std::uint64_t rows                  = 0;

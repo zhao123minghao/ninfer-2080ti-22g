@@ -106,26 +106,35 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 
 NInfer is a from-scratch C++/CUDA inference engine for a small set of explicitly registered
 checkpoint artifacts. This checkout's active target is maximum single-request performance on
-two Tesla V100-SXM2 16 GB cards using CUDA 12.8 and `sm_70`. It combines the RTX 3060 TP2 path
-with the Volta implementation from `geoffwatts/ninfer-v100`. Ampere `sm_86` and early Ada `sm_89`
-builds remain available; the RTX 5090 `sm_120a` results are inherited upstream evidence, not
-measurements of this target. The supported identities are
+two RTX 2080 Ti 22 GB cards using CUDA 12.8 and `sm_75`. It combines the RTX 3060 TP2 path
+with the Volta implementation from `geoffwatts/ninfer-v100` and Turing-specific execution paths.
+Volta `sm_70`, Ampere `sm_86` and early Ada `sm_89` builds remain available; V100 and RTX 5090
+results are inherited evidence, not measurements of this target. The registered identities are
 `qwen3.6-27b/groupwise-int`, `qwen3.6-27b/nvfp4`, `qwen3.8-27b/groupwise-int`,
-`qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m`, and `qwen3.6-35b-a3b/groupwise-int`.
-The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
-directory, 180000-token context capacity, INT8 group-64 KV, CUDA Graphs, and MTP with at most
-three drafts; accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
-Its Q4_K/Q6_K codes and scales must remain unchanged. Numerical transformations and inference
-optimizations require evidence against their applicable exact, mathematical, or behavioral oracle;
-preserving packed bytes alone does not prove absence of end-to-end quality loss.
+`qwen3.8-27b/nvfp4`, `qwen3.8-27b/gguf-q4-k-m`, `qwen3.8-27b/fp8-block128`, and
+`qwen3.6-35b-a3b/groupwise-int`. Registration is not an end-to-end qualification claim.
+The active research lane is the official Qwen3.8-27B block-FP8 checkpoint through the public
+`.ninfer` Engine, TP2 devices `0,1` (NVLink), FP16 KV, prefill chunk 4096, CUDA Graphs and MTP3
+with `--lm-head-draft`. The groupwise-int lane remains the qualified control; its 262144-token
+capacity and approximately 54 tok/s result must not be attributed to FP8. FP8 measurements have
+used capacity 100000 and occupied prompts around 32K or 85K; quality and performance acceptance
+remain open. See `todo.md` for current measurements and concrete next checks.
+Preserve source FP8 codes and BF16 multiplier scales; GGUF Q4_K/Q6_K codes and scales also remain
+unchanged. Numerical transformations require the applicable exact, mathematical or behavioral
+oracle; preserved packed bytes alone do not establish end-to-end quality. Accepting zero MTP
+drafts is valid, and capacity must never be confused with prompt occupancy.
 
 The five published identities retain Text, image/video Vision, MTP, prefix reuse, CLI,
 OpenAI/Anthropic serving, and measurement through the same public `.ninfer` Engine route.
 The GGUF-derived identity uses this same route for Text/MTP and rejects Vision; its retained
-Vision objects are validation-only. The 35B-A3B target additionally supports text-only DFlash.
+Vision objects are validation-only. The Qwen3.8-27B groupwise-int and GGUF identities can each
+optionally include the five-layer, all-local DFlash2 package and support text-only DFlash2 at TP1 or
+TP2. The groupwise-int package can be appended to an existing artifact without changing its base
+payloads. The 35B-A3B target separately supports text-only DFlash at TP1, with a growing Full KV
+pool for its global DFlash layer.
 
 One Engine owns one resident model, with one device or TP2 on the 27B package and a startup-fixed
-one to eight active requests. The V100X2 acceptance workload is one active request on two cards.
+one to eight active requests. The active acceptance workload is one request on two 2080 Ti cards.
 The Engine forms one compact decode batch at every round boundary and uses bounded
 FIFO ingress with no request preemption. Large-scale or preemptive continuous batching, priority/QoS
 scheduling, additional checkpoint targets, and additional execution platforms beyond those named
@@ -267,17 +276,24 @@ route is checked directly against the same oracle with a criterion appropriate t
 implementation profile; pairwise implementation parity is supplementary evidence only.
 
 Where relevant to the changed behavior, account for numeric-format decode, BF16 fusion order, FP32
-GDN state, BF16/INT8 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address stability.
+GDN state, FP16/INT8 KV, MTP accept/commit state, arena lifetime, and CUDA Graph address stability.
 This is a risk map, not a checklist for every numerical task.
 
 ## Performance work
 
-The requested V100X2 acceptance is above the user's LM Studio baseline without further quality
-loss: about 45 committed decode tok/s at roughly 85000 occupied context tokens, with a reported
-57 tok/s peak whose occupied context was not specified. The estimate of about 40 tok/s at longer context is not a
-measurement. Both sides use 180000 capacity, Q4_K_M weights, Q8/INT8 KV, and a maximum draft
-window of three. Record actual token counts, sampling, acceptance, and committed throughput.
-Short prompts, draft throughput, or inherited RTX 5090 tables cannot establish this acceptance.
+The active FP8 research workload uses two RTX 2080 Ti 22 GB cards, TP2 devices `0,1`, FP16 KV,
+prefill chunk 4096, and MTP3 with the draft head. Keep capacity, occupied prompt tokens, corpus,
+generated length, sampling, acceptance, round time, and committed throughput separate. The latest
+codechat measurements and earlier prose measurements are different workloads, not an A/B pair.
+Use same-session alternating A/B for performance changes because this host has substantial drift.
+The groupwise-int control's approximately 54 tok/s at 85070 occupied tokens does not qualify FP8.
+
+The published vLLM-2080Ti-Definitive tables are external same-GPU-class references, not local
+same-machine measurements. Their CPU, device IDs, toolchain, prompt, draft width, and KV dtype
+must not be assumed to match this checkout. The inherited V100/LM Studio 45 tok/s comparison is
+not this target's acceptance contract. Resident model bytes divided by whole-round time is not a
+measurement of DRAM utilization. An ablation constrains its measured implementation and shape,
+not every layout or another operator. See `todo.md` for unresolved code-level investigations.
 
 Define a performance claim at the level where it matters: operator, schedule, request phase, or
 end-to-end inference. Measure that level directly when practical. An isolated microbenchmark can
@@ -330,14 +346,20 @@ These are conventional project resources, not a checklist of resources every tas
 |---|---|
 | repository | current checkout |
 | Python 3.11 | `python3` in the selected maintainer environment |
-| Q4_K_M source | `/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf` |
-| companion Vision source | same directory, `mmproj-Qwen3.8-27B-BF16.gguf` |
-| product artifact | `/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer` |
+| FP8 source | `/data/models/qwen3.8-27b/Qwen3.8-27B-FP8` |
+| FP8 research artifact | `/data/models/qwen3.8-27b/qwen3_8_27b_fp8_block128.ninfer` |
+| groupwise-int control | `/data/models/qwen3.8-27b/qwen3_8_27b_v2.ninfer` |
 | conversion report | product artifact path plus `.conversion.json` |
-| normal build | `build-v100/` |
+| normal build | `build/`, explicit `-DCMAKE_CUDA_ARCHITECTURES=75` |
 | private dependency prefix | `build/_deps/install/` |
 | profiler output | `profiles/ncu/`, `profiles/nsys/`, `profiles/bench/` |
-| hardware/toolchain | 2 x Tesla V100-SXM2 16 GB, `sm_70`, CUDA 12.8 |
+| hardware/toolchain | RTX 2080 Ti 22 GB, TP2 `0,1` NVLink, `sm_75`, CUDA 12.8 |
+
+This host has three cards. Pair `0,2` uses host staging and is a separate groupwise-int control;
+do not silently substitute it for the FP8 pair. Use one build process with conservative parallelism
+(normally `-j4`), and verify a relevant object rebuilt when changing headers with stale dependency
+tracking. Hardware-counter profiling has reported `ERR_NVGPUCTRPERM`; use available timeline/SASS
+evidence where sufficient instead of assuming counters were collected.
 
 Use the selected Python 3.11 interpreter explicitly. Do not install or upgrade dependencies unless
 the task requires it. Never select an artifact by glob, modification time, or an unqualified
@@ -346,8 +368,8 @@ do not download or regenerate them unless that work is in scope.
 
 ```bash
 PYTHON=python3
-MODEL=/Models/LM-Studio-models/lmstudio-community/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_K_M.gguf
-NINFER_WEIGHTS=/Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer
+MODEL=/data/models/qwen3.8-27b/Qwen3.8-27B-FP8
+NINFER_WEIGHTS=/data/models/qwen3.8-27b/qwen3_8_27b_fp8_block128.ninfer
 ```
 
 ## Commits

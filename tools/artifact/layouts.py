@@ -20,6 +20,7 @@ import torch
 
 from .numeric import (
     DirectFormat,
+    Fp8BlockFormat,
     Fp8RowFormat,
     Nvfp4Format,
     NumericFormat,
@@ -84,6 +85,31 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class Fp8BlockScaleGeometry:
+    n: int
+    k: int
+    m_tiles: int
+    k_tiles: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class MarlinFp8BlockGeometry:
+    n: int
+    k: int
+    n_tiles: int
+    k_tiles: int
+    groups: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
 Plane: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 Payload: TypeAlias = bytes | bytearray | memoryview | torch.Tensor
 
@@ -116,6 +142,16 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("FP8_E4M3FN_ROW_BF16S",)),
 )
+BLOCKSCALE_M128_K128_V1 = Layout(
+    "blockscale-m128-k128-v1",
+    256,
+    frozenset(("FP8_E4M3FN_BLOCK128_BF16S",)),
+)
+MARLIN_FP8_BLOCK128_V1 = Layout(
+    "marlin-fp8-block128-v1",
+    256,
+    frozenset(("FP8_E4M3FN_BLOCK128_BF16S",)),
+)
 GGML_K256_V1 = Layout("ggml-k256-v1", 256, frozenset(("GGML_K",)))
 
 LAYOUTS = MappingProxyType(
@@ -126,6 +162,8 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCKSCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            BLOCKSCALE_M128_K128_V1,
+            MARLIN_FP8_BLOCK128_V1,
             GGML_K256_V1,
         )
     }
@@ -271,6 +309,57 @@ def row_scale_geometry(
     )
 
 
+def fp8_block_scale_geometry(
+    format: str | Fp8BlockFormat, shape: Sequence[int]
+) -> Fp8BlockScaleGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8BlockFormat):
+        raise ValueError("blockscale-m128-k128-v1 requires block-scaled FP8")
+    n, k = _shape(shape, rank=2)
+    m_tiles = (n + spec.block_rows - 1) // spec.block_rows
+    k_tiles = (k + spec.block_columns - 1) // spec.block_columns
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = m_tiles * k_tiles * 2
+    return Fp8BlockScaleGeometry(
+        n=n,
+        k=k,
+        m_tiles=m_tiles,
+        k_tiles=k_tiles,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
+def marlin_fp8_block_geometry(
+    format: str | Fp8BlockFormat, shape: Sequence[int]
+) -> MarlinFp8BlockGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8BlockFormat):
+        raise ValueError("marlin-fp8-block128-v1 requires block-scaled FP8")
+    n, k = _shape(shape, rank=2)
+    if n % spec.block_rows or k % spec.block_columns:
+        raise ValueError(
+            "marlin-fp8-block128-v1 requires N multiple of 128 and K multiple of 128"
+        )
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = (n // spec.block_rows) * (k // spec.block_columns) * 2
+    return MarlinFp8BlockGeometry(
+        n=n,
+        k=k,
+        n_tiles=n // 32,
+        k_tiles=k // 32,
+        groups=k // spec.block_columns,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -314,6 +403,14 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row-scale-v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is BLOCKSCALE_M128_K128_V1:
+        if not isinstance(numeric_spec, Fp8BlockFormat):
+            raise ValueError("blockscale-m128-k128-v1 requires block-scaled FP8")
+        return fp8_block_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is MARLIN_FP8_BLOCK128_V1:
+        if not isinstance(numeric_spec, Fp8BlockFormat):
+            raise ValueError("marlin-fp8-block128-v1 requires block-scaled FP8")
+        return marlin_fp8_block_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")
 
 
@@ -417,6 +514,14 @@ def _exact_bf16_vector(tensor: torch.Tensor, length: int, label: str) -> torch.T
     return tensor.detach().contiguous().cpu()
 
 
+def _exact_bf16_matrix(
+    tensor: torch.Tensor, shape: tuple[int, int], label: str
+) -> torch.Tensor:
+    if tensor.dtype != torch.bfloat16 or tuple(tensor.shape) != shape:
+        raise TypeError(f"{label} must be BF16 with shape {shape}")
+    return tensor.detach().contiguous().cpu()
+
+
 def _validate_fp8_row_words(codes: torch.Tensor, scales: torch.Tensor) -> None:
     if bool(((codes & 0x7F) == 0x7F).any()):
         raise ValueError("row-scaled FP8 codes must be finite E4M3FN words")
@@ -430,6 +535,30 @@ def _validate_fp8_row_words(codes: torch.Tensor, scales: torch.Tensor) -> None:
     nonzero_code = (codes & 0x7F) != 0
     if bool((zero_scale.unsqueeze(1) & nonzero_code).any()):
         raise ValueError("a zero row scale requires only signed-zero FP8 codes")
+
+
+def _validate_fp8_block_words(
+    codes: torch.Tensor, scales: torch.Tensor, geometry: Fp8BlockScaleGeometry
+) -> None:
+    if bool(((codes & 0x7F) == 0x7F).any()):
+        raise ValueError("block-scaled FP8 codes must be finite E4M3FN words")
+    scale_words = scales.view(torch.int16).to(torch.int32) & 0xFFFF
+    invalid_scales = ((scale_words & 0x8000) != 0) | (
+        (scale_words & 0x7F80) == 0x7F80
+    )
+    if bool(invalid_scales.any()):
+        raise ValueError("block-scaled FP8 scales must be nonnegative finite BF16 words")
+    for m_tile in range(geometry.m_tiles):
+        row_begin = m_tile * 128
+        row_end = min(row_begin + 128, geometry.n)
+        for k_tile in range(geometry.k_tiles):
+            if scale_words[m_tile, k_tile] != 0:
+                continue
+            column_begin = k_tile * 128
+            column_end = min(column_begin + 128, geometry.k)
+            tile_codes = codes[row_begin:row_end, column_begin:column_end]
+            if bool(((tile_codes & 0x7F) != 0).any()):
+                raise ValueError("a zero block scale requires only signed-zero FP8 codes")
 
 
 def encode_fp8_row_scaled(
@@ -458,6 +587,137 @@ def encode_fp8_row_scaled(
         scales, "BF16"
     )
     return bytes(payload)
+
+
+def encode_fp8_block_scaled(
+    code_words: torch.Tensor,
+    block_scales: torch.Tensor,
+    shape: Sequence[int],
+) -> bytes:
+    """Encode exact E4M3FN code words and BF16 128x128 block multipliers."""
+
+    geometry = fp8_block_scale_geometry("FP8_E4M3FN_BLOCK128_BF16S", shape)
+    codes = _exact_uint8_matrix(
+        code_words,
+        (geometry.n, geometry.k),
+        "block-scaled FP8 codes",
+    )
+    scales = _exact_bf16_matrix(
+        block_scales,
+        (geometry.m_tiles, geometry.k_tiles),
+        "block-scaled FP8 scales",
+    )
+    _validate_fp8_block_words(codes, scales, geometry)
+    payload = bytearray(geometry.payload_bytes)
+    payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
+    scale_begin = geometry.scale_plane_offset
+    payload[scale_begin : scale_begin + geometry.scale_plane_bytes] = encode_direct(
+        scales, "BF16"
+    )
+    return bytes(payload)
+
+
+def decode_fp8_block_scaled_words(
+    payload: Payload,
+    shape: Sequence[int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Decode exact E4M3FN code words and BF16 128x128 block multipliers."""
+
+    geometry = fp8_block_scale_geometry("FP8_E4M3FN_BLOCK128_BF16S", shape)
+    if _payload_length(payload) != geometry.payload_bytes:
+        raise ValueError(
+            f"block-scaled FP8 payload has {_payload_length(payload)} bytes, "
+            f"expected {geometry.payload_bytes}"
+        )
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    codes = raw[: geometry.code_plane_bytes].clone().reshape(geometry.n, geometry.k)
+    scale_begin = geometry.scale_plane_offset
+    scale_bytes = raw[scale_begin : scale_begin + geometry.scale_plane_bytes]
+    scales = decode_direct(scale_bytes, "BF16", (geometry.m_tiles, geometry.k_tiles))
+    _validate_fp8_block_words(codes, scales, geometry)
+    return codes, scales
+
+
+def encode_marlin_fp8_block(
+    code_words: torch.Tensor,
+    block_scales: torch.Tensor,
+    shape: Sequence[int],
+) -> bytes:
+    """Persist block-FP8 words in Marlin's 32x32 code tiles.
+
+    Codes remain the source E4M3 byte exactly once; they are reordered into the
+    32x32 tiles the SM75 consumer's fragment loads walk. The BF16 128x128
+    multipliers keep the logical `[N/128, K/128]` plane: the consumer reads one
+    multiplier per row block and K tile, so the persistent form stores each one
+    once.
+    """
+    geometry = marlin_fp8_block_geometry("FP8_E4M3FN_BLOCK128_BF16S", shape)
+    codes = _exact_uint8_matrix(code_words, (geometry.n, geometry.k), "Marlin FP8 codes")
+    scales = _exact_bf16_matrix(
+        block_scales, (geometry.n // 128, geometry.groups), "Marlin FP8 block scales"
+    )
+    _validate_fp8_block_words(
+        codes, scales, fp8_block_scale_geometry("FP8_E4M3FN_BLOCK128_BF16S", shape)
+    )
+    tiled = codes.reshape(geometry.n_tiles, 32, geometry.k_tiles, 32).permute(2, 0, 1, 3)
+    warps = torch.arange(4, dtype=torch.int64).view(4, 1)
+    threads = torch.arange(32, dtype=torch.int64).view(1, 32)
+    rows = (warps // 2) * 16 + threads // 4 + (warps % 2) * 8
+    k0 = (threads % 4) * 4
+    columns = k0.unsqueeze(-1) + torch.arange(4, dtype=torch.int64)
+    first = tiled[:, :, rows.unsqueeze(-1), columns]
+    second = tiled[:, :, rows.unsqueeze(-1), columns + 16]
+    packed = torch.stack((first, second), dim=4).permute(0, 1, 3, 2, 4, 5).contiguous()
+    code_plane = packed.reshape(-1).numpy().tobytes()
+    payload = bytearray(geometry.payload_bytes)
+    payload[: geometry.code_plane_bytes] = code_plane
+    payload[geometry.scale_plane_offset : geometry.scale_plane_offset + geometry.scale_plane_bytes] = (
+        encode_direct(scales.reshape(-1), "BF16")
+    )
+    return bytes(payload)
+
+
+def decode_marlin_fp8_block_words(
+    payload: Payload, shape: Sequence[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    geometry = marlin_fp8_block_geometry("FP8_E4M3FN_BLOCK128_BF16S", shape)
+    if _payload_length(payload) != geometry.payload_bytes:
+        raise ValueError("Marlin FP8 payload has an unexpected size")
+    raw = _payload_tensor(payload, torch.device("cpu"))
+    packed = raw[: geometry.code_plane_bytes].reshape(
+        geometry.k_tiles, geometry.n_tiles, 32, 4, 2, 4
+    )
+    codes = torch.empty((geometry.k_tiles, geometry.n_tiles, 32, 32), dtype=torch.uint8)
+    warps = torch.arange(4, dtype=torch.int64).view(4, 1)
+    threads = torch.arange(32, dtype=torch.int64).view(1, 32)
+    rows = (warps // 2) * 16 + threads // 4 + (warps % 2) * 8
+    k0 = (threads % 4) * 4
+    columns = k0.unsqueeze(-1) + torch.arange(4, dtype=torch.int64)
+    for half in range(2):
+        values = packed[:, :, :, :, half, :].permute(0, 1, 3, 2, 4)
+        target_columns = columns + half * 16
+        codes[:, :, rows.unsqueeze(-1), target_columns] = values
+    codes = codes.permute(1, 2, 0, 3).reshape(geometry.n, geometry.k).contiguous()
+    scale_bytes = raw[geometry.scale_plane_offset : geometry.scale_plane_offset + geometry.scale_plane_bytes]
+    scales = decode_direct(scale_bytes, "BF16", (geometry.n // 128, geometry.groups))
+    _validate_fp8_block_words(
+        codes, scales, fp8_block_scale_geometry("FP8_E4M3FN_BLOCK128_BF16S", shape)
+    )
+    return codes, scales
+
+
+def dequantize_fp8_block_scaled(
+    payload: Payload,
+    shape: Sequence[int],
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Reconstruct a block-scaled FP8 matrix from its exact stored words."""
+
+    codes, scales = decode_fp8_block_scaled_words(payload, shape)
+    rows = torch.arange(codes.shape[0]) // 128
+    columns = torch.arange(codes.shape[1]) // 128
+    tile_scales = scales.float()[rows[:, None], columns[None, :]]
+    return (codes.view(torch.float8_e4m3fn).float() * tile_scales).to(dtype)
 
 
 def decode_fp8_row_scaled_words(
@@ -1102,7 +1362,11 @@ def dequantize_row_split(
 
 __all__ = [
     "BLOCKSCALE_K16_M128X4_V1",
+    "BLOCKSCALE_M128_K128_V1",
+    "MARLIN_FP8_BLOCK128_V1",
     "BlockScaleGeometry",
+    "Fp8BlockScaleGeometry",
+    "MarlinFp8BlockGeometry",
     "CONTIGUOUS_LE_V1",
     "GGML_K256_V1",
     "K_ALIGNMENT",
@@ -1118,18 +1382,25 @@ __all__ = [
     "assemble_row_planes",
     "block_scale_geometry",
     "decode_direct",
+    "decode_fp8_block_scaled_words",
+    "decode_marlin_fp8_block_words",
     "decode_fp8_row_scaled_words",
     "decode_nvfp4_words",
     "decode_row_split_codes",
     "dequantize_fp8_row_scaled",
+    "dequantize_fp8_block_scaled",
     "dequantize_row_split",
     "encode_direct",
+    "encode_fp8_block_scaled",
+    "encode_marlin_fp8_block",
     "encode_fp8_row_scaled",
     "encode_nvfp4",
     "encode_row_split",
     "encoded_size",
     "gather_row_planes",
     "get_layout",
+    "fp8_block_scale_geometry",
+    "marlin_fp8_block_geometry",
     "row_scale_geometry",
     "row_split_geometry",
     "split_row_planes",

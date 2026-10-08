@@ -225,6 +225,62 @@ int run_allgather_case(const char* label, std::int32_t rows_0, std::int32_t rows
     return failures;
 }
 
+int run_rank0_columns_case(const char* label, std::int32_t rows_0, std::int32_t rows_1,
+                          std::int32_t columns, std::uint32_t seed, const ExecutionContext& ec,
+                          const ops::PeerEvents& events) {
+    const std::int32_t rows = rows_0 + rows_1;
+    const std::size_t count_0 = static_cast<std::size_t>(rows_0) * columns;
+    const std::size_t count_1 = static_cast<std::size_t>(rows_1) * columns;
+    std::vector<std::int64_t> source_0(count_0), source_1(count_1);
+    for (std::size_t i = 0; i < count_0; ++i) {
+        source_0[i] = static_cast<std::int64_t>(seed) * 100000 + static_cast<std::int64_t>(i);
+    }
+    for (std::size_t i = 0; i < count_1; ++i) {
+        source_1[i] = static_cast<std::int64_t>(seed + 1) * 100000 + static_cast<std::int64_t>(i);
+    }
+    std::vector<std::int64_t> expected(static_cast<std::size_t>(rows) * columns);
+    for (int column = 0; column < columns; ++column) {
+        std::copy_n(source_0.begin() + static_cast<std::size_t>(column) * rows_0, rows_0,
+                    expected.begin() + static_cast<std::size_t>(column) * rows);
+        std::copy_n(source_1.begin() + static_cast<std::size_t>(column) * rows_1, rows_1,
+                    expected.begin() + static_cast<std::size_t>(column) * rows + rows_0);
+    }
+
+    const std::size_t bytes_0 = count_0 * sizeof(std::int64_t);
+    const std::size_t bytes_1 = count_1 * sizeof(std::int64_t);
+    const std::size_t destination_bytes = expected.size() * sizeof(std::int64_t);
+    set_device(ec, 0);
+    GuardedDeviceBuffer source_device_0(bytes_0), destination_0(destination_bytes);
+    source_device_0.copy_from_host(source_0.data(), bytes_0);
+    destination_0.fill(0xcd);
+    set_device(ec, 1);
+    GuardedDeviceBuffer source_device_1(bytes_1);
+    source_device_1.copy_from_host(source_1.data(), bytes_1);
+
+    const Tensor destination(destination_0.data(), DType::I64, {rows, columns});
+    const std::array<Tensor, 2> part{
+        Tensor(source_device_0.data(), DType::I64, {rows_0, columns}),
+        Tensor(source_device_1.data(), DType::I64, {rows_1, columns})};
+    retire_staging(ec);
+    ops::gather_columns_rank0(destination, part, ec, events);
+    synchronize_both(ec);
+
+    int failures = 0;
+    set_device(ec, 0);
+    failures += verify_exact(label,
+                             from_device<std::int64_t>(destination_0.data(), expected.size()),
+                             expected);
+    failures += verify_exact("rank-0 gather source device 0 unchanged",
+                             from_device<std::int64_t>(source_device_0.data(), count_0), source_0);
+    failures += destination_0.verify_guards("rank-0 gather destination");
+    failures += source_device_0.verify_guards("rank-0 gather source device 0");
+    set_device(ec, 1);
+    failures += verify_exact("rank-0 gather source device 1 unchanged",
+                             from_device<std::int64_t>(source_device_1.data(), count_1), source_1);
+    failures += source_device_1.verify_guards("rank-0 gather source device 1");
+    return failures;
+}
+
 // Regression guard for the cross-call write-after-read hazard.
 //
 // kRounds alternating collectives are issued back-to-back on ONE set of buffers, staging, and
@@ -440,6 +496,11 @@ int main() {
     failures += run_allgather_case("allgather_rows [1,248320]", 124160, 124160, 1, 202u, ec, events);
     failures += run_allgather_case("allgather_rows [5120,3] uneven", 2, 1, 5120, 203u, ec, events);
     failures += run_allgather_case("allgather_rows [7,2] minimal", 1, 1, 7, 204u, ec, events);
+
+    failures += run_rank0_columns_case("gather_columns_rank0 [16,16] top-16 keys", 16, 16, 6,
+                                       301u, ec, events);
+    failures += run_rank0_columns_case("gather_columns_rank0 uneven shards", 5, 11, 3,
+                                       302u, ec, events);
 
     failures += run_chained_case(ec, events);
     failures += run_microbenchmark(ec, events);

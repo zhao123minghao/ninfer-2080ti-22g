@@ -367,6 +367,8 @@ public:
     // engine -- concurrent lanes would overwrite it out of order.
     std::vector<std::uint16_t> logits_capture;
     bool logits_capture_enabled = false;
+    std::vector<std::uint16_t> layer_capture;
+    bool layer_capture_enabled = false;
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_6::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_6::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
@@ -410,6 +412,11 @@ public:
     // logits row count; disabling releases it. Must not be called while a round is in flight (the
     // executor holds its execution mutex across this call).
     void enable_logits_capture(bool enabled);
+
+    [[nodiscard]] std::span<const std::uint16_t> last_prefill_layers_bf16() const noexcept {
+        return layer_capture;
+    }
+    void enable_layer_capture(bool enabled);
 
     // Debug-only, OFF by default: after each MTP decode round at tp == 2, read rank 1's MTP egress
     // back and compare it field for field with rank 0's. The two ranks run the acceptance Op over

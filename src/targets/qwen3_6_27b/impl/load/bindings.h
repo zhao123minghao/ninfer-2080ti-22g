@@ -177,6 +177,7 @@ struct ShardMapping {
 struct WeightPlan {
     artifact::ObjectHandle object;
     artifact::NumericFormat format          = artifact::NumericFormat::BF16;
+    artifact::StorageLayout layout          = artifact::StorageLayout::ContiguousLeV1;
     std::uint32_t weight_scale_divisor_bits = 0;
     std::uint32_t input_scale_divisor_bits  = 0;
     std::vector<Shard> shards; // empty => replicated/full on device 0
@@ -244,14 +245,14 @@ struct TextLayerPlan {
 };
 
 struct MtpPlan {
-    artifact::ObjectHandle input_projection;
+    WeightPlan input_projection;
     artifact::ObjectHandle embedding_norm;
     artifact::ObjectHandle hidden_norm;
     artifact::ObjectHandle input_norm;
-    artifact::ObjectHandle query_key_gate_value;
+    WeightPlan query_key_gate_value;
     artifact::ObjectHandle query_norm;
     artifact::ObjectHandle key_norm;
-    artifact::ObjectHandle output;
+    WeightPlan output;
     artifact::ObjectHandle post_attention_norm;
     MlpPlan mlp;
     artifact::ObjectHandle final_norm;
@@ -287,6 +288,7 @@ struct BindingPlan {
     qwen3_6::StartupFeatures features;
     artifact::NumericFormat draft_format = artifact::NumericFormat::Q4G64_F16S;
     artifact::NumericFormat mtp_format = artifact::NumericFormat::W8G32_F16S;
+    artifact::NumericFormat mtp_input_projection_format = artifact::NumericFormat::W8G32_F16S;
 
     WeightPlan token_embedding;
     std::array<TextLayerPlan, kTextLayers> text_layers;
@@ -366,10 +368,6 @@ struct GdnProjectionPayload {
 
 struct MtpAttentionPayload {
     Weight packed;
-    Weight query;
-    Weight key;
-    Weight output_gate;
-    Weight value;
 };
 
 using RuntimeModelView =

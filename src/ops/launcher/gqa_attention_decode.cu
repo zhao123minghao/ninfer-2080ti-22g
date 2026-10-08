@@ -12,6 +12,7 @@
 // the pre-Ampere GEMM plan fallbacks and the CUTLASS Sm70 sources into an sm_75 build.
 #if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM75)
 #include "ops/kernel/gqa_attention_decode_i8_tc_volta.cuh"
+#include "ops/kernel/gqa_attention_decode_fp8_tc_volta.cuh"
 #include "ops/kernel/gqa_attention_prefill_volta.cuh"
 #endif
 #include "core/device.h" // CUDA_CHECK
@@ -321,6 +322,53 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+void launch_tc_partial_fp8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
+                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
+                           std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
+                           Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+    Tensor& cache_k = cache.k_pages;
+    Tensor& cache_v = cache.v_pages;
+
+#if defined(NINFER_VOLTA_BUILD) || defined(NINFER_SM75)
+    // fp8 has no scale plane, so its tensor-core route is the int8 sibling minus the scale
+    // pointers; the same DimSplit=4, 128-thread tile serves every TokenTile width.
+    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+    gqa_attention_small_t_tc_volta_partial_fp8_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
+                                                      CacheInput><<<grid, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data), input,
+        static_cast<const std::int32_t*>(pos.data), static_cast<std::uint8_t*>(cache_k.data),
+        static_cast<std::uint8_t*>(cache_v.data),
+        static_cast<const std::int32_t*>(cache.block_tables.data),
+        invocation.valid_columns == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+        invocation.table_rows == nullptr
+            ? nullptr
+            : static_cast<const std::int32_t*>(invocation.table_rows->data),
+        cache.block_tables.ne[0], invocation.width, invocation.full_width, invocation.column_begin,
+        logical_capacity, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
+        static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+    CUDA_CHECK(cudaGetLastError());
+#else
+    (void)q;
+    (void)input;
+    (void)pos;
+    (void)scale;
+    (void)cache;
+    (void)invocation;
+    (void)logical_capacity;
+    (void)splits;
+    (void)partial_acc;
+    (void)partial_m;
+    (void)partial_l;
+    (void)stream;
+    (void)cache_k;
+    (void)cache_v;
+    throw std::runtime_error("fp8 KV decode requires a Volta/sm_75 tensor-core target");
+#endif
+}
+
 PagedKVBatchLayerView single_row_batch_view(const PagedKVLayerView& cache) {
     return {
         .k_pages       = cache.k_pages,
@@ -341,7 +389,9 @@ bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tok
 
 std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
                                           DType cache_dtype, GqaExecutionEnvelope envelope) {
-    if (tokens < 1 || tokens > 6 || (cache_dtype != DType::FP16 && cache_dtype != DType::I8) ||
+    if (tokens < 1 || tokens > 6 ||
+        (cache_dtype != DType::FP16 && cache_dtype != DType::I8 &&
+         cache_dtype != DType::FP8_E4M3FN) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
@@ -371,6 +421,10 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
                     implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+            } else if (cache.dtype == DType::FP8_E4M3FN) {                                         \
+                launch_tc_partial_fp8<Geometry, (TOKENS), MultiBatch, Masked>(                     \
+                    q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
+                    partial_acc, partial_m, partial_l, stream);                                    \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \

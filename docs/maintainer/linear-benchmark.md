@@ -36,6 +36,35 @@ Q4/Q5/Q6/W8 和 BF16_CTRL 使用现有 A16 route。以下 NVFP4 exact problem �
 chunk `T=1024` 是 AllowA4 surface 的首要性能点；更大 T 只用于确认正 T 合同和 route
 的可扩展性。
 
+### 当前 SM75 block-FP8 surface
+
+`--qtype FP8BLOCK --policy a16` 构造真正的 `FP8_E4M3FN_BLOCK128_BF16S` /
+`BlockScaleM128K128` payload，经同一 public Linear dispatch 执行。
+`--qtype FP8` 是另一种 row-scaled FP8，不能代理 block128；本节前面的 NVFP4 A4
+示例只适用于其已支持硬件，SM75 不执行 A4/FP8 A8。
+
+```bash
+./build/bench/ninfer_linear_bench \
+  --qtype FP8BLOCK --policy a16 --n 7168 --k 5120 --t 4
+./build/bench/ninfer_linear_bench \
+  --qtype FP8BLOCK --policy a16 --n 34816 --k 5120 --t 4096
+```
+
+当前普通 Linear 的 HMMA 交点为T9，`5120×17408` 为T13；不是旧5/7表。
+阈值由Op生产代码拥有，benchmark不复制selector。`NINFER_FP8_BLOCK_ROUTE=scalar|hmma`
+是Op的诊断环境覆盖，仍经public调用；强制对照需显式记录，生产证据回到auto。
+LinearAdd/SwiGLU另用各自支持 `--qtype fp8block --policy a16` 的闭合benchmark。
+
+模型研究固定TP2 `0,1`、FP16 KV、chunk4096；从实际trace取shard形状与列宽，不将整矩阵
+微基准当作TP2请求收益。用同会话交替A/B区分温度/时钟漂移，性能与独立oracle分开验收。
+RTX5090峰值、逻辑字节/时间和计时消融均不能代替SM75实测DRAM/吞吐归因。
+代表性的同机同源Marlin Linear及layer0真实activation的完整SwiGLU/LinearAdd对照已建立；
+T5台阶、更多窗口/层、最终后端和模型质量仍未闭合，见 [todo.md](../../todo.md)。普通FP8BLOCK点可用`--fp8-data DIR`读取
+共同code/scale及activation输入，`--output-bf16 PATH`在计时后导出输出，说明见
+[bench README](../../bench/README.md)。
+`--epilogue swiglu|add`分别使用实际FP8 shard Op leaf或公开LinearAdd，计时内为完整Op，
+add的原始`residual.bin`恢复位于flush/事件前，避免重复累加污染。
+
 ## 1. 使用场景
 
 新 benchmark 服务四个具体需求。

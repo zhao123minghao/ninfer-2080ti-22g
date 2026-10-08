@@ -35,8 +35,9 @@ template's default. An artifact whose template does not expose effort rejects th
 GPU residency is frozen when the Engine starts:
 
 - no `--spec` omits MTP/DFlash weights and state and the optimized proposal head;
-- `--spec mtp` loads only MTP, while `--spec dflash` loads only the 35B-A3B text-only DFlash
-  backend;
+- `--spec mtp` loads only MTP. `--spec dflash` loads DFlash only when the selected artifact
+  contains its package: optional Qwen3.8-27B DFlash2 for groupwise-int or GGUF identities, or
+  35B-A3B DFlash;
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
@@ -104,9 +105,9 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
-35B-A3B text-only DFlash backend with one to fifteen. `--lm-head-draft` selects the optimized
-proposal head and requires a selected backend:
+Speculative decoding is disabled by default. Select MTP with one to five draft positions, Qwen3.8-27B
+DFlash2 with one to seven, or 35B-A3B DFlash with one to fifteen. `--lm-head-draft` selects the
+optimized proposal head and requires a selected backend:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -117,7 +118,18 @@ proposal head and requires a selected backend:
   --lm-head-draft
 ```
 
-For DFlash:
+For Qwen3.8-27B DFlash2 (the artifact must include its optional package; TP2 is supported):
+
+```bash
+./build/apps/ninfer models/qwen3_8_27b_v2_dflash2.ninfer \
+  --tp 2 --devices 0,1 \
+  --prompt "Write a short explanation of speculative decoding." \
+  --max-context 16384 --max-new 512 \
+  --spec dflash --draft-tokens 3
+```
+
+The five DFlash2 layers use local attention, so they require no growing DFlash Full KV pool. The
+separate 35B-A3B DFlash route is single-device:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -145,7 +157,7 @@ measured recommendation rather than a semantic limit.
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
 | `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
-| `--kv-dtype fp16\|int8` | KV-cache storage | `fp16` |
+| `--kv-dtype fp16\|int8\|fp8` | KV-cache storage | `fp16` |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..15` | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -207,8 +219,9 @@ device used at the default `--tp 1`; when both are given they must agree on the 
 
 Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6-27b` and
 `qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
-`--tp 2` at startup, as do `--spec dflash` and `--vision`. `--spec mtp` is supported at `--tp 2`,
-including compatible-prefix reuse in a resident Engine. Both suffix prefill and exact-frontier
+`--tp 2` at startup. MTP and Qwen3.8-27B DFlash2 (when its optional package is present) are supported
+at `--tp 2`; the 35B-A3B DFlash route remains single-device. Vision is not supported at `--tp 2`.
+Compatible-prefix reuse is supported in a resident Engine. Both suffix prefill and exact-frontier
 sampling restore the complete state on both devices. The HTTP server enables reuse by default;
 separate CLI processes do not share a cache.
 
@@ -232,26 +245,24 @@ tokens; `--yarn-origin` must equal the registered native capacity (262,144); `--
 accepts a finite value in [1.0, 64.0] and defaults to 4.0. YaRN works at either `--tp` width and is
 rejected together with `--vision`, `--spec dflash`, or a target with no YaRN rope domain
 (`qwen3.6-35b-a3b`). The load summary's
-`rope` row reports the resolved mode, factor, origin, effective ceiling and `mscale`. The practical
-allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
-KV-cache type.
-Use `--kv-dtype int8` for large context allocations; at `--max-context 1048576` it is mandatory,
-because a BF16 pool at that window does not fit two RTX 5090s. The 1,048,576-token configuration is
-`--tp 2 --devices A,B --rope yarn --yarn-factor 4.0 --yarn-origin 262144 --kv-dtype int8
---kv-capacity auto`; it reserves 26.93 GiB per device without a speculative backend and 28.42 GiB
-with `--spec mtp --draft-tokens 3`. A full-ceiling prefill takes about 19 minutes on the measured
-host.
+`rope` row reports the resolved mode, factor, origin, effective ceiling and `mscale`. The
+1,048,576-token configuration is `--tp 2 --devices A,B --rope yarn --yarn-factor 4.0
+--yarn-origin 262144 --kv-dtype int8 --kv-capacity auto`; it requires an `int8` KV pool, because a
+16-bit pool at that window does not fit two RTX 5090s, and it reserves 26.93 GiB per device without
+a speculative backend and 28.42 GiB with `--spec mtp --draft-tokens 3`. A full-ceiling prefill takes
+about 19 minutes. Those figures are from the upstream RTX 5090 target, not this checkout.
 
 ### Choosing the KV-cache dtype
 
 The KV cache is the one large allocation whose *precision* belongs to the user rather than to the
-artifact. Both values are complete, supported routes through the same public Engine, both are
-selected with one flag, and neither is a debug or fallback mode:
+artifact. All three values are complete, supported routes through the same public Engine, each is
+selected with one flag, and none is a debug or fallback mode:
 
 | `--kv-dtype` | Stores | Resident KV bytes per element | Accuracy |
 |---|---|---:|---|
 | `fp16` (default) | the widened K/V value, one `half` per element | 2.0 | the K/V projections emit BF16 values, and BF16 -> FP16 is exact over FP16's whole normal range (BF16 carries 8 significand bits, FP16 carries 11) |
-| `int8` | a signed 8-bit code plus one FP16 scale per 64-element group | ~1.03 | lossy by construction; the only route to the largest windows |
+| `fp8` | a plain E4M3FN code with no scale plane | 1.0 | lossy by construction, but with no group scale to add a second rounding |
+| `int8` | a signed 8-bit code plus one FP16 scale per 64-element group | ~1.03 | lossy by construction; the widest `int8` scale costs bytes that `fp8` does not pay |
 
 The unquantized cache stores **`fp16`**, which is the tensor-core operand format on every supported
 target: Volta and Turing `mma.sync` only accept FP16 operands, and the Ampere+ kernels restage their
@@ -266,14 +277,20 @@ the write.
 The tradeoff is bytes against cache precision, and which side wins on decode throughput is a
 property of the target, not a rule: the halved footprint only converts into time where the attention
 path is bandwidth-bound. On a Turing target it measures the other way round -- `fp16` is both the
-more accurate and the *faster* value -- because the attention kernel is latency-bound there and the
-`int8` path pays a dequantization that cancels its byte saving, while the reduced MTP acceptance
-costs more than the round time it saves. See
-[KV-cache dtype on the Turing target](performance.md#kv-cache-dtype-on-the-turing-target).
+more accurate and the *faster* value than `int8` -- because the attention kernel is latency-bound
+there and the `int8` path pays a dequantization that cancels its byte saving, while the reduced MTP
+acceptance costs more than the round time it saves. `fp8` is the strongest of the three on that
+target: it carries the same halved footprint without `int8`'s scale plane, matches `fp16`'s
+acceptance bit-for-bit at 85,000 and 140,000 tokens, and reads back within about 2% of `fp16`'s
+decode rate there. See
+[KV-cache dtype on the Turing target](performance.md#kv-cache-dtype-on-the-turing-target) and
+[FP8-E4M3 KV cache on this target](performance.md#fp8-e4m3-kv-cache-on-this-target).
 
-At a 262,144-token capacity the two choices measured 4.38 GiB (`int8`) and 8.50 GiB (`fp16`) of KV
-payload per device for a 27B target with MTP3 enabled, a ratio of 1.94x. The choice therefore also
-decides which capacities fit: `int8` is mandatory where an fp16 pool is too large.
+At a 262,144-token capacity the three choices measure 4.25 GiB (`fp8`), 4.38 GiB (`int8`) and
+8.50 GiB (`fp16`) of KV payload per device for a 27B target with MTP3 enabled, a ratio of 2.00x.
+The choice therefore also decides which capacities fit: an 8-bit pool is required where an `fp16`
+pool is too large, and on the Turing target `fp8` is what reaches the artifact's full
+262,144-token window.
 
 The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.

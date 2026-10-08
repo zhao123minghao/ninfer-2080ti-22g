@@ -42,6 +42,15 @@ constexpr auto kControlLaunchers = make_launchers<ControlGeometry>(
 constexpr auto kOutputLaunchers = make_launchers<OutputGeometry>(
     std::make_index_sequence<kBf16SmallTMaxTokens - kBf16SmallTMinTokens + 1>{});
 
+#if defined(NINFER_SM75)
+using VocabularyGeometry = Bf16GemvGeometry<248320, 5120>;
+using VocabularyShardGeometry = Bf16GemvGeometry<124160, 5120>;
+constexpr auto kVocabularyLaunchers =
+    make_launchers<VocabularyGeometry>(std::make_index_sequence<3>{});
+constexpr auto kVocabularyShardLaunchers =
+    make_launchers<VocabularyShardGeometry>(std::make_index_sequence<3>{});
+#endif
+
 } // namespace
 
 void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
@@ -54,6 +63,18 @@ void launch_bf16_small_t(const Tensor& x, const Weight& weight, Tensor& out, cud
         kOutputLaunchers[index](x, weight, out, stream);
         return;
     }
+#if defined(NINFER_SM75)
+    if (index < kVocabularyLaunchers.size() && weight.k == 5120) {
+        if (weight.n == VocabularyGeometry::kOutputRows) {
+            kVocabularyLaunchers[index](x, weight, out, stream);
+            return;
+        }
+        if (weight.n == VocabularyShardGeometry::kOutputRows) {
+            kVocabularyShardLaunchers[index](x, weight, out, stream);
+            return;
+        }
+    }
+#endif
     throw std::invalid_argument("bf16 linear small-T: unsupported exact problem");
 }
 

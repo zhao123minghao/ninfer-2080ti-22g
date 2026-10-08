@@ -224,6 +224,17 @@ public:
         instance_.program->enable_logits_capture(enabled);
     }
 
+    [[nodiscard]] std::vector<std::uint16_t> debug_last_prefill_layers_bf16() const {
+        std::scoped_lock lock(execution_mutex_);
+        const std::span<const std::uint16_t> bits = instance_.program->last_prefill_layers_bf16();
+        return std::vector<std::uint16_t>(bits.begin(), bits.end());
+    }
+
+    void debug_enable_layer_capture(bool enabled) {
+        std::scoped_lock lock(execution_mutex_);
+        instance_.program->enable_layer_capture(enabled);
+    }
+
     // Debug-only, OFF by default (see ProgramImplCore::check_peer_mtp_egress): cross-rank
     // comparison of the MTP egress record after every speculative round at tp == 2. Takes the
     // execution mutex for the same reason as the capture toggle above.

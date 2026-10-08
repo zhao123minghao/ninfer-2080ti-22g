@@ -1,16 +1,23 @@
 # NInfer 2080Ti 22G
 
 This fork targets **Qwen3.8-27B text inference on two NVIDIA RTX 2080 Ti 22 GB cards** (`sm_75`,
-Turing) with CUDA 12.8. The qualified configuration runs tensor parallelism across both cards at the
+Turing). The qualified **groupwise-int** configuration runs tensor parallelism across both cards at the
 registered native **262,144-token context capacity**, with a **FP16** KV cache, CUDA Graphs, and MTP
 with up to three draft tokens and the optimized proposal head. Accepted draft counts may be zero
 through three in each round.
+
+The current build tree uses **CUDA 13.2** on `sm_75`; the Volta sibling still builds with CUDA 12.8.
+The active research lane is the official **`qwen3.8-27b/fp8-block128`** checkpoint on TP2 `0,1`,
+chunk 4096, with both FP16 and FP8-E4M3 KV measured. Its capacity, quality and performance evidence
+are separate from the groupwise-int results below; see [FP8 research](#block-fp8-research), the
+[FP8-E4M3 KV measurement](docs/performance.md#fp8-e4m3-kv-cache-on-this-target) and
+[open investigations](todo.md).
 
 NInfer is a from-scratch C++/CUDA engine descended from
 [Neroued/ninfer](https://github.com/Neroued/ninfer). This checkout adapts the dual-GPU TP2 path to
 Turing: it inherits the RTX 3060 fork's TP2 transport and the Volta implementation from
 [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100), and adds the Turing execution
-leaves, the `--kv-dtype fp16|int8` cache contract, and the measurements below. Ampere (`sm_86`) and
+leaves, the `--kv-dtype fp16|int8|fp8` cache contract, and the measurements below. Ampere (`sm_86`) and
 early Ada (`sm_89`) builds remain available, and the Volta `sm_70` build is retained for the sibling
 V100 checkout. The external point this checkout is measured against is the SM75 vLLM stack
 [`weicj/vLLM-2080Ti-Definitive`](https://github.com/weicj/vLLM-2080Ti-Definitive), which is credited
@@ -19,7 +26,7 @@ in [Acknowledgements](#acknowledgements). See [NOTICE](NOTICE) and the
 
 ## Acceptance on this target
 
-The acceptance workload is **one active request on two cards**, **85,070 occupied prompt tokens**,
+The groupwise-int acceptance workload is **one active request on two cards**, **85,070 occupied prompt tokens**,
 `--max-new 64`, TP2, MTP3 with `--lm-head-draft`, greedy sampling, CUDA Graphs and
 `--max-context 262144`. Occupied tokens are stated explicitly because capacity is only an allocation
 limit, never a claim about how much prompt was actually processed.
@@ -31,11 +38,12 @@ limit, never a claim about how much prompt was actually processed.
 
 Both rows are the same artifact, prompt and flags. The `0,2` row is that pair re-measured in one
 session as four runs interleaved with a freshly rebuilt control, which read 53.80 tok/s (see
-`docs/performance.md`); the `0,1` row is the earlier session's value and was not re-measured. The
-single-request baseline they are compared against was reported at roughly the same occupied context
-and measured about **45 committed decode tok/s**, which puts the current `0,2` result **20.5%** above
-it. The reported 57 tok/s peak is not used as a comparison because its occupied context was not
-specified.
+`docs/performance.md`); the `0,1` row is the earlier session's value and was not re-measured on this
+artifact (`0,1` carries the separate `fp8-block128` lane, whose FP16 and FP8 KV numbers are in the
+KV-dtype paragraph below). The historical LM Studio reference was about **45 committed decode
+tok/s** at roughly the same occupied context, but used the V100/Q4_K_M/INT8-KV workload. It is not a
+matched 2080 Ti comparison or proof of equal quality. Its reported 57 tok/s peak also lacks an
+occupied-context count.
 
 The two pairs trade off different things. `--devices 0,1` is the NVLink pair and takes the direct
 peer-to-peer route, which is the faster one for prefill; `--devices 0,2` is host-staged, but this
@@ -47,14 +55,48 @@ so the committed token stream cannot move.
 
 `--kv-dtype fp16` is the default and the dtype used above. Measured at the same 85,070 occupied
 tokens and the same flags, `int8` reads **42.05 tok/s** with **43.75%** acceptance and 2.30
-tok/round: **21.9% slower** than `fp16` and **18.4 acceptance points lower**. `int8` is therefore
-selected only by callers that need its KV capacity (roughly half the bytes per token), not for
-speed. The full comparison, including the
-mechanism and the two refuted explanations for the `int8` deficit, is in
-[KV-cache dtype on the Turing target](docs/performance.md#kv-cache-dtype-on-the-turing-target).
+tok/round: **21.9% slower** than `fp16` and **18.4 acceptance points lower**. `fp8` (E4M3 codes,
+no scale plane) carries the same halved footprint without that deficit: at 85,070 and at 140,000
+tokens it matches `fp16`'s acceptance **bit-for-bit**, reads back within about 1% of `fp16`'s
+decode rate, and raises this target's usable window from **153,984 to the model's native
+262,144 tokens (1.70x)**. The halved footprint is therefore selected through `fp8` on this target,
+not `int8`. The full comparison, the "acceptance is a trajectory quantity" caveat and the two
+refuted explanations for the `int8` deficit are in
+[KV-cache dtype on the Turing target](docs/performance.md#kv-cache-dtype-on-the-turing-target) and
+[FP8-E4M3 KV cache on this target](docs/performance.md#fp8-e4m3-kv-cache-on-this-target).
 
 These are measurements of one machine and the registered artifact below; they are not general
 targets for other hardware, artifacts, prompt content or draft windows.
+
+## Block-FP8 research
+
+The local artifact preserves the official checkpoint's E4M3 codes and BF16 128x128 block
+multiplier scales. This is W8A16 execution on SM75, not the unsupported FP8 A8 leaf.
+Recorded public-Engine measurements use TP2 `0,1` (NVLink), FP16 KV, capacity 100000, prefill
+chunk 4096, CUDA Graphs, MTP3 and `--lm-head-draft`:
+
+| Raw-token codechat workload | Prefill tok/s | Committed decode tok/s | MTP acceptance |
+|---|---:|---:|---:|
+| 32768 prompt / 512 decode tokens | 1065.24 ± 30.51 | 44.60 ± 0.17 | 0.7297 |
+| 84992 prompt / 64 decode tokens | 847.27 ± 1.04 | 44.90 ± 0.08 | 0.8679 |
+
+These are the existing two-repeat results from [history.md](history.md), section 54, not new
+measurements. The same identity carries the FP8-E4M3 KV measurements at 8K-140K occupied tokens in
+[the FP8-E4M3 KV section](docs/performance.md#fp8-e4m3-kv-cache-on-this-target). Earlier prose85K
+results of about 31.9 tok/s had 0.527 acceptance; different corpora are not an optimization A/B. The
+benchmark requests one additional output token in prefill;
+registration and exact artifact preservation do not establish
+end-to-end quality. Capture ordering is now fixed with a reproduced embedding-row exactness
+regression, and representative scalar/HMMA/auto route boundaries pass independent FP64 checks.
+These new diagnostics used the current CUDA 13.2 build, not the historical CUDA 12.8 performance
+build. Real-activation/model-quality validation and post-fix decode attribution remain open;
+[todo.md](todo.md) gives code locations and completion criteria.
+
+The SM75 BF16 vocabulary head now uses GEMV at T1 and exact small-T kernels at T2-T4 instead
+of the general MMA route. A CUDA 13.2 same-binary alternating A/B on the same 32768/512
+codechat workload measured **44.11/43.94 to 50.97/50.94 committed decode tok/s (+15.7%)**,
+with 161 rounds, 0.7297297297 acceptance and zero fallbacks in every run. This does not update
+the historical 85K or CUDA 12.8 rows above. See [head measurements](docs/performance.md#sm75-block-fp8-head-optimization).
 
 ## Concurrent serving on two cards
 
@@ -102,10 +144,11 @@ point, one server per point, only complete `decode batch == C` intervals counted
 | [Qwen3.8-27B](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | `groupwise-int` | `qwen3_8_27b.ninfer` | 18,210,531,328 bytes (16.96 GiB) | `eec39564993d6e9c7d5e383382a760f093465c9d163ec9a1bd6b80199514bf3e` |
 | [Qwen3.8-27B NVFP4](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_8_27b_nvfp4.ninfer` | 21,492,695,040 bytes (20.02 GiB) | `bb3360522a06e136e0367f5703414d26272b7285c8a6ab6194135c17dbd81b32` |
 | Qwen3.8-27B GGUF Q4_K_M (local conversion) | `gguf-q4-k-m` | `qwen3_8_27b_q4_k_m.ninfer` | local conversion | local artifact |
+| Qwen3.8-27B official block-FP8 (local research) | `fp8-block128` | `qwen3_8_27b_fp8_block128.ninfer` | 30,610,987,520 bytes | local artifact |
 | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
 
-Qwen3.6-27B exposes two registered weight profiles, and Qwen3.8-27B adds the local GGUF-derived
-profile to its two published profiles. The version-2 artifact
+Qwen3.6-27B exposes two registered weight profiles, and Qwen3.8-27B adds local GGUF-derived and
+block-FP8 profiles to its two published profiles. The version-2 artifact
 identity selects the profile without a separate runtime flag; Qwen3.8 uses target key
 `qwen3_8_27b` while sharing the 27B execution package. The Qwen3.6 `nvfp4` profile uses W4A4 Tensor
 Core MMA for prefill and A16 NVFP4 kernels for decode. The Qwen3.8 `nvfp4` profile preserves its
@@ -123,6 +166,11 @@ It supports Text and MTP through the same Engine route; its embedded GGUF Vision
 validation-only and `--vision` is rejected for this identity. The artifact is intentionally kept
 outside the repository because it is an 18 GB generated model file.
 
+The independent `fp8-block128` identity preserves the official block-FP8 Text and MTP matrices;
+embedding, full output head and MTP input projection are BF16. It is not the row-scaled FP8
+allocation inside `nvfp4`. The local source and conversion contract are documented in the
+[FP8 artifact reference](docs/maintainer/qwen3.8-27b-artifact.md#15-official-block-fp8-artifact).
+
 ## Inherited results are not this target's results
 
 The maximum-context capacity sweep against LM Studio's CUDA backend, the DFlash2 llama.cpp
@@ -130,27 +178,34 @@ comparison, the RTX 5090 campaigns, the YaRN 1M-context tables, the concurrent a
 serving tables, the cross-engine comparison against vLLM, and the retrieval and soak results were all
 measured on other hardware and other artifacts, mostly on the V100X2 and RTX 5090 forks. They are
 inherited evidence. They do not establish 2080 Ti performance, and they do not update any figure on
-this page. They remain in [Performance](docs/performance.md) with their methodology, variability,
-reproduction commands and per-fixture results.
+this page. The V100X2 tables remain in [Performance](docs/performance.md); the RTX 5090 campaigns are
+reduced there to a one-line-per-campaign summary, with their raw records under
+[`eval/results/`](eval/results).
 
 The sibling V100X2 fork carries its own README and the full V100 measurement programme; the
 measurements that belong to this checkout are the acceptance table above, the
 [concurrent decode](docs/performance.md#concurrent-decode-on-the-turing-target) table, the
-[KV-cache dtype](docs/performance.md#kv-cache-dtype-on-the-turing-target) and
-[TP2 transport](docs/performance.md#tp2-transport-on-this-target) sections, and the
+[KV-cache dtype](docs/performance.md#kv-cache-dtype-on-the-turing-target) and its
+[FP8-E4M3](docs/performance.md#fp8-e4m3-kv-cache-on-this-target) subsection,
+[TP2 transport](docs/performance.md#tp2-transport-on-this-target), and the
 [SM75 external reference](docs/performance.md#external-sm75-reference-vllm-2080ti-definitive)
 comparison against `vLLM-2080Ti-Definitive`.
 
 ## DFlash2 speculative route
 
-DFlash2 is integrated as an optional five-layer BF16 draft route for the registered Qwen3.8-27B
-artifact. It includes dynamic grouped convolution, lattice selection, TP2 replicated verification,
-and graph-stable selector scratch. Enable it with `--spec dflash --draft-tokens 3` (up to seven).
+DFlash2 is an optional five-layer BF16 draft package for the registered
+`qwen3.8-27b/groupwise-int` and `qwen3.8-27b/gguf-q4-k-m` artifacts. Include it during GGUF
+conversion with `--dflash2-model`, or append it to an existing groupwise-int artifact with
+`tools.convert.qwen3_8_27b.attach_dflash2`; all five draft layers use local attention, so this route
+needs no growing DFlash Full KV pool. It includes dynamic grouped convolution, lattice selection,
+TP2 replicated verification, and graph-stable selector scratch. Enable it with
+`--spec dflash --draft-tokens 3` (up to seven), with or without `--tp 2`.
 
 The recorded DFlash2 throughput comparisons come from a temporary llama.cpp build on two V100s and
 the V100X2 artifact. They are **not** measurements of this target and are not reproduced here; see
-[Performance](docs/performance.md). DFlash has not been profiled or acceptance-tested on the 2080 Ti
-pair, and this checkout does not claim a DFlash throughput result for it.
+[Performance](docs/performance.md). A short TP2 functional smoke passed on the local 2080 Ti pair,
+but DFlash2 has not been performance-profiled or acceptance-tested there, and this checkout makes no
+DFlash throughput claim.
 
 ## Evaluation
 
@@ -183,8 +238,9 @@ NInfer currently requires:
 - 64-bit Linux;
 - two NVIDIA GPUs of the same compute capability for the TP2 profile; this checkout is qualified on
   two **RTX 2080 Ti 22 GB** cards (`sm_75`, Turing);
-- NVIDIA driver support for the selected GPU and a CUDA 12.8 toolchain; CUDA 13 no longer compiles
-  Volta;
+- NVIDIA driver support for the selected GPU and a CUDA toolkit for the target architecture; this
+  checkout's current `sm_75` build tree uses CUDA 13.2, and CUDA 12.8 (not 13.x) remains required
+  for the Volta `sm_70` sibling;
 - CMake 3.28 or newer and a C++20-capable host compiler;
 - `pkg-config`;
 - FFmpeg development libraries: `libavformat >= 60`, `libavcodec >= 60`,
@@ -227,7 +283,8 @@ build/apps/ninfer-serve
 
 Tests, benchmarks and maintainer tools are excluded from the default build; see
 [Contributing](CONTRIBUTING.md) for how to build and select them. The inherited `Dockerfile` uses
-CUDA 13.1 and has not been retargeted for Turing; use the CUDA 12.8 source build above.
+CUDA 13.1 and has not been retargeted for Turing; use the source build above. The `build/` tree on
+this machine was configured with `/usr/local/cuda-13.2/bin/nvcc`.
 
 ## Convert a local GGUF instead
 
@@ -301,7 +358,8 @@ disabled by default, so MTP/DFlash state and the optimized proposal head are not
 Vision is also disabled by default, so its weights, Vision scratch phase, and frozen
 request-transient allocation are omitted. Add `--vision` to the CLI or server process that must
 accept image or video input. Disabled capabilities cannot be enabled by a later request. DFlash is
-available only for the 35B-A3B target and is text-only.
+text-only: Qwen3.8-27B groupwise-int or GGUF artifacts can include the optional DFlash2 package,
+while Qwen3.6-35B-A3B uses its separate DFlash package.
 
 ## Run the CLI
 
@@ -313,6 +371,7 @@ flag overrides the injected default:
 scripts/run.sh "Explain prefill and decode in three sentences."
 scripts/run.sh --messages examples/cli/messages/text_smoke_zh.json --max-new 128 --greedy
 NINFER_DEVICES=0,2 scripts/run.sh "..."               # the acceptance pair
+NINFER_KV_DTYPE=fp8 scripts/run.sh "..."              # half footprint without the int8 accuracy loss
 NINFER_KV_DTYPE=int8 scripts/run.sh "..."             # when KV capacity matters more than speed
 ```
 
@@ -432,7 +491,10 @@ product is a whole token count at or below `1,048,576`:
 At 1M the KV pool alone was measured at about **17.7 GiB per device** with INT8 KV on the V100 pair,
 which does not fit alongside the sharded weights on a 22 GB card. **The 1M configuration has not been
 exercised on this target** and is documented here as an available option, not a qualified profile. At
-262,144 tokens both KV dtypes fit: `--kv-capacity N` sizes the shared Main Text pool explicitly,
+262,144 tokens the three KV dtypes fit on the `groupwise-int` artifact; on the larger
+`fp8-block128` artifact only the 8-bit pools reach that window, because its fp16 pool caps at
+153,984 tokens (see [Acceptance on this target](#acceptance-on-this-target)). `--kv-capacity N`
+sizes the shared Main Text pool explicitly,
 `--kv-capacity auto` takes the largest usable capacity from the memory left after weights while
 preserving 1 GiB of sizing headroom, and omission defaults to one `--max-context` worth of pages.
 
@@ -441,15 +503,16 @@ preserving 1 GiB of sizing headroom, and omission defaults to one `--max-context
 - **Vision is `--tp 1` only.** The Vision encoder runs on the primary device against replicated
   weights and has no split path, so `--tp 2 --vision` is rejected at startup. YaRN is likewise
   rejected together with `--vision`, because the encoder ropes 2-D image-grid positions.
-- **DFlash is rejected at `--tp 2`.** It remains a 35B-A3B text-only backend, and that target has no
-  tensor-parallel path at all.
+- **Qwen3.8-27B DFlash2 supports TP2 for groupwise-int and GGUF identities when the optional
+  companion package is present.** The Qwen3.6-35B-A3B DFlash route remains single-device because
+  that target has no tensor-parallel path.
 - **MTP is output-equivalent up to near-tie argmax flips, not bit-identical.** A verify round
   evaluates the target model over `K+1` columns at once and an ordinary round over one, which
   selects different GEMM shapes; greedy MTP-on and MTP-off streams can therefore diverge on a near-tie
   token. Every committed token is still one the target model's own argmax selected.
 - **The NVFP4 A4 and FP8 A8 leaves are unavailable on `sm_75`.** They compile to stubs that throw,
   so NVFP4 W4A4 prefill and FP8 A8 execution are not supported paths on this target. The `nvfp4`
-  artifact's A16 decode kernels are unaffected.
+  artifact's A16 decode kernels and the separate block128 W8A16 path are unaffected.
 - **`--ignore-eos` is a diagnostic flag.** It exists for fixed-length soak and throughput work.
   Generation past the end-of-turn token is off-distribution and is not a product output.
 - The decode split policy was tuned at 262k on this target; it has not been swept elsewhere.
@@ -467,7 +530,7 @@ The five published artifact profiles support:
 - chunked prefill and CUDA Graph decode;
 - startup-bounded small-scale concurrent serving with true batched decode;
 - MTP speculative decoding with draft windows from one to five;
-- FP16 (default) and INT8 group-64 KV cache;
+- FP16 (default), FP8-E4M3 and INT8 group-64 KV cache;
 - model- and thinking-mode-aware official sampling defaults, with explicit greedy, temperature,
   top-k, top-p, min-p, and presence/frequency-penalty overrides;
 - compatible-prefix reuse;
@@ -475,8 +538,9 @@ The five published artifact profiles support:
   usage accounting;
 - prompt-rendered function tools and parsed tool calls.
 
-The 35B-A3B target additionally supports text-only DFlash speculative decoding with draft windows
-from one to fifteen.
+The Qwen3.8-27B groupwise-int and GGUF identities support text-only DFlash2 with one to seven draft
+tokens when the optional package is embedded; both routes support TP1 and TP2. The 35B-A3B target
+separately supports text-only DFlash with one to fifteen draft tokens at TP1.
 
 The local `gguf-q4-k-m` identity supports text and MTP, including the public CLI and HTTP Engine
 route. It rejects Vision. The acceptance workload on this target uses **one active request, native
@@ -485,9 +549,9 @@ three** (`--kv-dtype fp16`, greedy, CUDA Graphs).
 
 ## Current limits
 
-- Only the six `(model_id, weights_id)` artifact identities listed above are accepted product
-  identities. The acceptance measurements on this page use `qwen3.8-27b/groupwise-int`; the other
-  five identities have not been timed on this target.
+- Only the seven `(model_id, weights_id)` artifact identities listed above are registered.
+  The acceptance measurements use `qwen3.8-27b/groupwise-int`; block-FP8 has the separately
+  labeled research results above. Registration does not qualify every identity on this target.
 - This checkout targets Volta, Turing, Ampere and early Ada. One CUDA device is the generic CLI
   default; `scripts/run.sh` selects exactly two with `--tp 2 --devices A,B`.
 - One Engine owns one resident model and supports a startup-fixed capacity of 1–8 active requests.
@@ -506,13 +570,15 @@ three** (`--kv-dtype fp16`, greedy, CUDA Graphs).
   capacity from the memory remaining after weights are loaded while preserving 1 GiB of sizing
   headroom. Omission defaults to one `--max-context` worth of pages. The resolved pool is fixed at
   startup and is not divided statically among request lanes.
-- **Known failing tests on this build.** The NVFP4 A4 and FP8 A8 execution leaves are stubbed out
+- **Historical full-suite snapshot, not a current qualification gate.** The NVFP4 A4 and FP8 A8 execution leaves are stubbed out
   for architectures other than `120a`, so the tests and benchmarks that exercise them abort with
   `NVFP4 A4 execution requires an sm_120a GPU` (or the FP8 A8 equivalent) instead of skipping, and
   the NVFP4-A4 legs of composite suites abort with them. These failures are architectural, not
-  numerical: every `sm_75` code path this target uses passes. The full suite currently reports
+  numerical. The earlier full-suite run reported
   80 passing, 28 failing and 14 not-run of 122; the 28 failures are the arch-stub cases, missing
   local resources, and pre-existing `int8`-g64 reduction and schema cases.
+  It does not establish current block-FP8 route coverage; see the focused checks in
+  [tests/README.md](tests/README.md#block-fp8-checks).
 - Tool calls are parsed and returned to the client; NInfer does not execute tools.
 - The C++ headers are used by the in-tree applications and are not distributed as an installed SDK.
 
@@ -552,17 +618,22 @@ A separate debt is owed to **[weicj/vLLM-2080Ti-Definitive](https://github.com/w
 the SM75-focused vLLM fork for dual RTX 2080 Ti (and for Tesla T10/T40/T4, TITAN RTX and Quadro RTX
 6000/8000). Two things came from studying it:
 
-- **The same-machine external reference.** Its `qwen27b/w8a16/mtp4-fp8kv-1x262K` profile is the
-  outside number this checkout's prefill and decode work was tracked against. It is an order-of-
-  magnitude reference rather than a like-for-like comparison, because it runs FP8 weights, an FP8 KV
-  cache and a four-token draft window while the numbers on this page run Q4/Q5/W8 weights, an FP16
-  KV cache and three drafts.
+- **The external same-GPU-class reference.** Its published 2x2080Ti table was measured on a
+  different host/toolchain and physical GPUs `1,5`, not locally on `0,1`. Its FP8-weight rows
+  include both FP8 KV (1393.94/92.47 prefill/decode tok/s) and FP16 KV (1425.34/95.10), with
+  MTP4. These are directional references, not matched speedups or evidence that FP8 KV explains
+  the local gap. Marlin retains compressed FP8 weights and dequantizes register fragments in the
+  GEMM loop; W8A16 does not mean a resident full-FP16 weight expansion. A local concurrency run of
+  that stack on `0,1` -- FP8 KV, MTP4, one to three simultaneous requests -- is archived under
+  [`eval/results/vllm-fp8-concurrency/`](eval/results/vllm-fp8-concurrency/README.md); it is a
+  concurrency measurement, not a reproduction of the published rows.
 - **The prefill accumulation form.** The `__CUDA_ARCH__ == 750` branches in the Marlin files that
-  fork vendors (upstream vLLM/Marlin code, not the fork's own) accumulate two
-  `m16n8k8.f16.f16.f16.f16` MMAs with a segment-wise fp32 reduction. That combination -- fp16
-  accumulation inside a K segment with an fp32 reduction across segments -- is what pointed this
-  checkout at fp16 segmented accumulation for its prefill GEMM, which landed as a measured **+11.8%**
-  on the then-current 32K prefill probe. Its vendored CUTLASS `m8n8k16.s8` dispatch independently
+  fork vendors (upstream vLLM/Marlin code, not the fork's own) set `use_fp16_accum = true` for the
+  W8A16 route, so `m16n8k8.f16.f16.f16.f16` runs with a **pure fp16 accumulator over the whole K
+  and no fp32 reduction across segments**. This checkout's block-FP8 prefill HMMA now matches that
+  form: dropping the per-segment fp32 fold measured **+10.3% prefill** in same-session alternating
+  A/B (swiglu leaf 44.9 to 54.7 TFLOPS), with the argmax gate bit-identical to the folded engine.
+  Its vendored CUTLASS `m8n8k16.s8` dispatch independently
   corroborated the int8 tensor-core form used here. Credit for those kernels belongs to upstream
   vLLM, Marlin and CUTLASS; the fork's contribution is lowering the Turing gates on the Python side
   so the routes run at all on `sm_75`.

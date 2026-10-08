@@ -1,6 +1,7 @@
 #include "ninfer/ops/linear_pair.h"
 
 #include "ops/linear_pair/w8/w8_pair_plan.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ninfer/ops/linear.h"
 
 #include <array>
@@ -87,6 +88,44 @@ void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weigh
     }
 }
 
+void require_block_nonoverlap(const Tensor& x, const Weight& first_weight,
+                              const detail::Fp8BlockWeightGeometry& first_geometry,
+                              const Weight& second_weight,
+                              const detail::Fp8BlockWeightGeometry& second_geometry,
+                              const Tensor& first_out, const Tensor& second_out) {
+    struct Range {
+        const void* pointer;
+        std::uint64_t bytes;
+        const char* label;
+    };
+
+    const std::uint64_t input_bytes =
+        static_cast<std::uint64_t>(x.ne[0]) * static_cast<std::uint64_t>(x.ne[1]) * 2U;
+    const std::uint64_t output_bytes =
+        1024U * static_cast<std::uint64_t>(x.ne[1]) * 2U;
+    const std::array<Range, 7> ranges{{
+        {x.data, input_bytes, "x"},
+        {first_out.data, output_bytes, "first output"},
+        {second_out.data, output_bytes, "second output"},
+        {first_weight.qdata, first_geometry.code_plane_bytes, "first codes"},
+        {first_weight.scales, first_geometry.scale_plane_bytes, "first scales"},
+        {second_weight.qdata, second_geometry.code_plane_bytes, "second codes"},
+        {second_weight.scales, second_geometry.scale_plane_bytes, "second scales"},
+    }};
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto first_begin = reinterpret_cast<std::uintptr_t>(ranges[i].pointer);
+        const auto first_end = first_begin + ranges[i].bytes;
+        for (std::size_t j = i + 1; j < ranges.size(); ++j) {
+            const auto second_begin = reinterpret_cast<std::uintptr_t>(ranges[j].pointer);
+            const auto second_end = second_begin + ranges[j].bytes;
+            if (first_begin < second_end && second_begin < first_end) {
+                throw std::invalid_argument(std::string("linear_pair: ") + ranges[i].label +
+                                            " overlaps " + ranges[j].label);
+            }
+        }
+    }
+}
+
 } // namespace
 
 void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
@@ -99,6 +138,22 @@ void linear_pair(const Tensor& x, const Weight& first_weight, const Weight& seco
     require_matrix(first_out, 1024, cols, "first output");
     require_matrix(second_out, 1024, cols, "second output");
     if (first_weight.qtype == QType::GGML_K && second_weight.qtype == QType::GGML_K) {
+        linear(x, first_weight, first_out, stream);
+        linear(x, second_weight, second_out, stream);
+        return;
+    }
+    if (first_weight.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S &&
+        second_weight.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        const auto first_geometry =
+            detail::validate_fp8_block_weight(first_weight, "block-FP8 linear_pair first weight");
+        const auto second_geometry = detail::validate_fp8_block_weight(
+            second_weight, "block-FP8 linear_pair second weight");
+        if (first_weight.n != 1024 || second_weight.n != 1024 ||
+            first_weight.k != x.ne[0] || second_weight.k != x.ne[0]) {
+            throw std::invalid_argument("linear_pair: unsupported block-FP8 weight shape");
+        }
+        require_block_nonoverlap(x, first_weight, first_geometry, second_weight, second_geometry,
+                                 first_out, second_out);
         linear(x, first_weight, first_out, stream);
         linear(x, second_weight, second_out, stream);
         return;

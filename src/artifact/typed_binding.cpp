@@ -26,6 +26,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
         return StorageLayout::BlockScaleK16M128x4V1;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return StorageLayout::RowScaleV1;
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return StorageLayout::BlockScaleM128K128V1;
     case NumericFormat::GGML_K:
         return StorageLayout::GgmlK256V1;
     }
@@ -52,6 +54,8 @@ QType qtype_for(NumericFormat format) {
         return QType::NVFP4;
     case NumericFormat::FP8_E4M3FN_ROW_BF16S:
         return QType::FP8_E4M3FN_ROW_BF16S;
+    case NumericFormat::FP8_E4M3FN_BLOCK128_BF16S:
+        return QType::FP8_E4M3FN_BLOCK128_BF16S;
     case NumericFormat::GGML_K:
         return QType::GGML_K;
     }
@@ -158,18 +162,96 @@ Weight row_scale_weight(const MaterializedArtifact& materialized, ObjectHandle h
     return out;
 }
 
+Weight fp8_block_scale_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                             NumericFormat format, std::int32_t rows, std::int32_t columns,
+                             int device) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const Fp8BlockScaleGeometry geometry = fp8_block_scale_geometry(format, shape);
+    require_placement_bytes(materialized, handle, device, geometry.encoded_bytes);
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle, device));
+
+    Weight out{};
+    out.payload          = bytes;
+    out.payload_bytes    = geometry.encoded_bytes;
+    out.qtype            = qtype_for(format);
+    out.layout           = QuantLayout::BlockScaleM128K128;
+    out.group_size       = 128;
+    out.qdata            = bytes;
+    out.scales           = bytes + geometry.scale_plane_offset;
+    out.n                = rows;
+    out.k                = columns;
+    out.group            = 128;
+    out.scale_dtype      = DType::BF16;
+    out.ndim             = 2;
+    out.shape[0]         = rows;
+    out.shape[1]         = columns;
+    out.padded_shape[0]  = rows;
+    out.padded_shape[1]  = columns;
+    out.scale_ne[0]      = static_cast<std::int32_t>(geometry.k_tiles);
+    out.scale_ne[1]      = static_cast<std::int32_t>(geometry.m_tiles);
+    out.scale_nb[0]      = 2;
+    out.scale_nb[1]      = static_cast<std::int64_t>(geometry.k_tiles) * 2;
+    out.scale_nb[2]      = out.scale_nb[1] * static_cast<std::int64_t>(geometry.m_tiles);
+    out.scale_nb[3]      = out.scale_nb[2];
+    return out;
+}
+
+Weight marlin_fp8_block_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                               NumericFormat format, std::int32_t rows, std::int32_t columns,
+                               int device) {
+    const std::array<std::uint64_t, 2> shape = {static_cast<std::uint64_t>(rows),
+                                                static_cast<std::uint64_t>(columns)};
+    const MarlinFp8BlockGeometry geometry = marlin_fp8_block_geometry(format, shape);
+    require_placement_bytes(materialized, handle, device, geometry.encoded_bytes);
+    const auto* bytes = static_cast<const std::byte*>(materialized.device_data(handle, device));
+    Weight out{};
+    out.payload         = bytes;
+    out.payload_bytes   = geometry.encoded_bytes;
+    out.qtype           = qtype_for(format);
+    out.layout          = QuantLayout::MarlinFp8Block128;
+    out.group_size      = 128;
+    out.qdata           = bytes;
+    out.scales          = bytes + geometry.scale_plane_offset;
+    out.n               = rows;
+    out.k               = columns;
+    out.group           = 128;
+    out.scale_dtype     = DType::BF16;
+    out.ndim            = 2;
+    out.shape[0]        = rows;
+    out.shape[1]        = columns;
+    out.padded_shape[0] = rows;
+    out.padded_shape[1] = columns;
+    out.scale_ne[0]     = static_cast<std::int32_t>(geometry.scale_groups);
+    out.scale_ne[1]     = static_cast<std::int32_t>(geometry.scale_rows);
+    out.scale_nb[0]     = 2;
+    out.scale_nb[1]     = static_cast<std::int64_t>(geometry.scale_groups) * 2;
+    out.scale_nb[2]     = out.scale_nb[1] * static_cast<std::int64_t>(geometry.scale_rows);
+    out.scale_nb[3]     = out.scale_nb[2];
+    return out;
+}
+
 } // namespace
 
 ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat format,
                          std::initializer_list<std::uint64_t> shape, TensorPlacement placement) {
     const ObjectHandle handle =
-        binder.require_tensor(name, format, storage_layout_for(format),
+        binder.require_tensor(name, format, binder.declared_layout(name),
                               std::span<const std::uint64_t>(shape.begin(), shape.size()));
     if (placement == TensorPlacement::Device) {
         binder.materialize_on_device(handle);
     } else {
         binder.validate_only(handle);
     }
+    return handle;
+}
+
+ObjectHandle bind_device_tensor_layout(Binder& binder, std::string_view name,
+                                       NumericFormat format, StorageLayout layout,
+                                       std::initializer_list<std::uint64_t> shape) {
+    const ObjectHandle handle = binder.require_tensor(
+        name, format, layout, std::span<const std::uint64_t>(shape.begin(), shape.size()));
+    binder.materialize_on_device(handle);
     return handle;
 }
 
@@ -212,6 +294,13 @@ Tensor materialized_tensor(const MaterializedArtifact& materialized, ObjectHandl
 Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
                            NumericFormat format, std::int32_t rows, std::int32_t columns,
                            int device) {
+    return materialized_weight(materialized, handle, format, storage_layout_for(format), rows,
+                               columns, device);
+}
+
+Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                           NumericFormat format, StorageLayout layout, std::int32_t rows,
+                           std::int32_t columns, int device) {
     if (format == NumericFormat::GGML_K) {
         Weight out{};
         out.payload = materialized.device_data(handle, device);
@@ -233,11 +322,17 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         throw std::invalid_argument(
             "materialized_weight: NVFP4 requires target-validated weight and input divisors");
     }
-    if (storage_layout_for(format) == StorageLayout::ContiguousLeV1) {
+    if (layout == StorageLayout::ContiguousLeV1) {
         return contiguous_weight(materialized, handle, format, rows, columns, device);
     }
-    if (storage_layout_for(format) == StorageLayout::RowScaleV1) {
+    if (layout == StorageLayout::RowScaleV1) {
         return row_scale_weight(materialized, handle, format, rows, columns, device);
+    }
+    if (layout == StorageLayout::BlockScaleM128K128V1) {
+        return fp8_block_scale_weight(materialized, handle, format, rows, columns, device);
+    }
+    if (layout == StorageLayout::MarlinFp8Block128V1) {
+        return marlin_fp8_block_weight(materialized, handle, format, rows, columns, device);
     }
     return row_split_weight(materialized, handle, format, rows, columns, device);
 }

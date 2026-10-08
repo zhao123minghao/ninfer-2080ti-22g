@@ -9,6 +9,7 @@
 #include "ops/common/split_launch.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
@@ -159,6 +160,29 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
+    if (weight.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows = 14336;
+        const std::int32_t cols = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("block-FP8 attn_input_proj admits only A16");
+        }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kKvRows, cols, "k");
+        require_matrix(v, kKvRows, cols, "v");
+        (void)detail::validate_fp8_block_weight(weight, "block-FP8 attn_input_proj");
+        if (weight.n != kRows || weight.k != kHidden) {
+            throw std::invalid_argument("block-FP8 attn_input_proj: unsupported weight shape");
+        }
+        detail::fp8_block_attn_input_dispatch(x, weight, q, gate, k, v, stream);
+        return;
+    }
+
     constexpr std::int32_t kHidden = 2048;
     constexpr std::int32_t kQRows  = 4096;
     constexpr std::int32_t kKvRows = 512;
@@ -210,6 +234,12 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
             throw std::invalid_argument("attn_input_proj workspace: unsupported FP8 profile");
         }
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
+    case QType::FP8_E4M3FN_BLOCK128_BF16S:
+        if (parent_rows != 14336 || input_rows != 5120 || policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported block-FP8 profile");
+        }
+        return detail::fp8_block_linear_workspace_capacity_bytes(
+            parent_rows, input_rows, policy, min_tokens, max_tokens);
     case QType::W8G32_F16S:
         if (parent_rows != 9216 || input_rows != 2048 || policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported W8 profile");
@@ -320,6 +350,13 @@ void validate_fused_column_rank_semantics(const Tensor& x, const Weight& w, cons
                 "attn_input_proj column-parallel: FP8 admits only A16 or A8");
         }
         detail::validate_fp8_weight(w, "fp8 attn_input_proj column-parallel");
+    } else if (w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument(
+                "attn_input_proj column-parallel: block-FP8 admits only A16");
+        }
+        (void)detail::validate_fp8_block_weight(w,
+                                                "block-FP8 attn_input_proj column-parallel");
     } else {
         throw std::invalid_argument(
             "attn_input_proj column-parallel: unsupported fused weight format");
@@ -406,6 +443,10 @@ std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType qtype
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         return detail::fp8_attn_input_workspace_capacity_bytes(policy, min_tokens, max_tokens);
     }
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        return detail::fp8_block_linear_workspace_capacity_bytes(
+            kShardFusedRows, kShardHidden, policy, min_tokens, max_tokens);
+    }
     if (qtype == QType::Q4G64_F16S || qtype == QType::Q5G64_F16S) {
         if (policy != LinearPolicy::A16Only) {
             throw std::invalid_argument("Q4/Q5 attention shard admits only A16");
@@ -451,6 +492,10 @@ void attn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
             detail::nvfp4_attn_input_dispatch_shard(x[slot], w, q_dst[slot], gate_dst[slot],
                                                     k_dst[slot], v_dst[slot], policy,
                                                     workspace[slot], ec.dev[slot]->stream);
+        } else if (w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+            detail::fp8_block_attn_input_dispatch(x[slot], w, q_dst[slot], gate_dst[slot],
+                                                  k_dst[slot], v_dst[slot],
+                                                  ec.dev[slot]->stream);
         } else {
             detail::fp8_attn_input_dispatch_shard(x[slot], w, q_dst[slot], gate_dst[slot],
                                                   k_dst[slot], v_dst[slot], policy, workspace[slot],

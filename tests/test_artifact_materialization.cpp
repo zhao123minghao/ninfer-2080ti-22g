@@ -32,7 +32,10 @@ constexpr std::array<std::byte, 8> kSecondTensor = {
     std::byte{3}, std::byte{3}, std::byte{3}, std::byte{3},
 };
 constexpr std::size_t kFp8TensorBytes = 260;
-constexpr std::size_t kTailReadBytes  = 256 + kFp8TensorBytes;
+constexpr std::uint64_t kBlockFp8Offset = 8960;
+constexpr std::size_t kBlockFp8TensorBytes = 128 * 128 + 2;
+constexpr std::size_t kTailReadBytes =
+    kBlockFp8Offset + kBlockFp8TensorBytes - (8448 - 256);
 
 ninfer::test::artifact_fixture::TemporaryArtifact write_fixture() {
     using Json = ninfer::test::artifact_fixture::Json;
@@ -66,6 +69,13 @@ ninfer::test::artifact_fixture::TemporaryArtifact write_fixture() {
                              {"layout", "row-scale-v1"},
                              {"offset", 8448},
                              {"bytes", kFp8TensorBytes}},
+                               {{"name", "weights/fp8_block"},
+                                {"kind", "tensor"},
+                                {"shape", {128, 128}},
+                                {"format", "FP8_E4M3FN_BLOCK128_BF16S"},
+                                {"layout", "blockscale-m128-k128-v1"},
+                                {"offset", kBlockFp8Offset},
+                                {"bytes", kBlockFp8TensorBytes}},
                         })},
         },
         "materialization");
@@ -104,8 +114,13 @@ int main() {
             "weights/fp8", ninfer::artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S,
             ninfer::artifact::StorageLayout::RowScaleV1, fp8_shape);
         validation_binder.validate_only(validated_fp8);
+        constexpr std::array<std::uint64_t, 2> fp8_block_shape = {128, 128};
+        const auto validated_fp8_block = validation_binder.require_tensor(
+            "weights/fp8_block", ninfer::artifact::NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
+            ninfer::artifact::StorageLayout::BlockScaleM128K128V1, fp8_block_shape);
+        validation_binder.validate_only(validated_fp8_block);
         const auto validation_plan = validation_binder.finish();
-        require(validation_plan.object_count == 4 && validation_plan.host_objects.size() == 1 &&
+        require(validation_plan.object_count == 5 && validation_plan.host_objects.size() == 1 &&
                     validation_plan.device_objects.size() == 1 &&
                     validation_plan.device_capacity_bytes[0] == kSecondTensor.size(),
                 "validate-only tensor was included in the materialization plan");
@@ -166,10 +181,14 @@ int main() {
             "weights/fp8", ninfer::artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S,
             ninfer::artifact::StorageLayout::RowScaleV1, fp8_shape);
         binder.materialize_on_device(fp8);
+        const auto fp8_block = binder.require_tensor(
+            "weights/fp8_block", ninfer::artifact::NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
+            ninfer::artifact::StorageLayout::BlockScaleM128K128V1, fp8_block_shape);
+        binder.materialize_on_device(fp8_block);
 
         const ninfer::artifact::MaterializationPlan plan = binder.finish();
-        require(plan.object_count == 4 && plan.host_objects.size() == 1 &&
-                    plan.device_objects.size() == 3 && plan.device_capacity_bytes[0] == 772,
+        require(plan.object_count == 5 && plan.host_objects.size() == 1 &&
+                    plan.device_objects.size() == 4 && plan.device_capacity_bytes[0] == 17410,
                 "binder produced the wrong materialization plan");
 
         ninfer::DeviceContext device(0);
@@ -190,6 +209,12 @@ int main() {
         require(std::all_of(fp8_copied.begin(), fp8_copied.end(),
                             [](std::byte value) { return value == std::byte{4}; }),
                 "FP8 device tensor payload differs from the artifact");
+        std::array<std::byte, kBlockFp8TensorBytes> fp8_block_copied{};
+        CUDA_CHECK(cudaMemcpy(fp8_block_copied.data(), materialized.device_data(fp8_block),
+                      fp8_block_copied.size(), cudaMemcpyDeviceToHost));
+        require(std::all_of(fp8_block_copied.begin(), fp8_block_copied.end(),
+                    [](std::byte value) { return value == std::byte{5}; }),
+            "block-scaled FP8 device tensor payload differs from the artifact");
 
         const ninfer::Weight fp8_weight = ninfer::artifact::materialized_weight(
             materialized, fp8, ninfer::artifact::NumericFormat::FP8_E4M3FN_ROW_BF16S, 2, 4);
@@ -202,13 +227,31 @@ int main() {
                     fp8_weight.payload_bytes == kFp8TensorBytes,
                 "materialized FP8 Weight metadata is incomplete");
 
+        const ninfer::Weight fp8_block_weight = ninfer::artifact::materialized_weight(
+            materialized, fp8_block, ninfer::artifact::NumericFormat::FP8_E4M3FN_BLOCK128_BF16S,
+            128, 128);
+        require(fp8_block_weight.qtype == ninfer::QType::FP8_E4M3FN_BLOCK128_BF16S &&
+                    fp8_block_weight.layout == ninfer::QuantLayout::BlockScaleM128K128 &&
+                    fp8_block_weight.scale_dtype == ninfer::DType::BF16 &&
+                    fp8_block_weight.n == 128 && fp8_block_weight.k == 128 &&
+                    fp8_block_weight.group == 128 && fp8_block_weight.group_size == 128 &&
+                    fp8_block_weight.qdata == fp8_block_weight.payload &&
+                    fp8_block_weight.qhigh == nullptr &&
+                    fp8_block_weight.scales ==
+                        static_cast<const std::byte*>(fp8_block_weight.payload) + 128 * 128 &&
+                    fp8_block_weight.scale_ne[0] == 1 && fp8_block_weight.scale_ne[1] == 1 &&
+                    fp8_block_weight.scale_nb[0] == 2 && fp8_block_weight.scale_nb[1] == 2 &&
+                    fp8_block_weight.payload_bytes == kBlockFp8TensorBytes,
+                "materialized block-scaled FP8 Weight metadata is incomplete");
+
         const auto retained = materialized.resource_bytes(resource);
         require(std::equal(retained.begin(), retained.end(), kResource.begin(), kResource.end()),
                 "retained resource payload differs from the artifact");
 
         const auto& stats = materialized.stats();
-        require(stats.tensor_count == 3 && stats.resource_count == 1 &&
-                    stats.h2d_bytes == kTensor.size() + kSecondTensor.size() + kFp8TensorBytes &&
+        require(stats.tensor_count == 4 && stats.resource_count == 1 &&
+                stats.h2d_bytes == kTensor.size() + kSecondTensor.size() + kFp8TensorBytes +
+                           kBlockFp8TensorBytes &&
                     stats.retained_resource_bytes == kResource.size() &&
                     stats.file_bytes == kResource.size() +
                                             ninfer::artifact::Reader::direct_io_alignment +

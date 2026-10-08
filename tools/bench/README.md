@@ -21,14 +21,20 @@ Content sources:
 
 - Built-in curated multi-domain prose (Chinese / English / code / math) — the default. It is
   encoded WITHOUT the chat template or special tokens, then tiled (paragraphs rotated each cycle)
-  and truncated to exactly `--tokens`. Repetition only fills length; because prefill/decode
-  throughput is token-count / bandwidth bound, it does not bias the numbers.
+  and truncated to exactly `--tokens`. Repetition can change speculative acceptance and committed
+  decode throughput; it is not an unbiased proxy for diverse text. Keep the corpus fixed in A/B
+  and report acceptance separately from round time.
 - `--source-text <file>` (repeatable) — tokenize your own long meaningful text instead, e.g. a
   downloaded public-domain book or a concatenated document set, for genuinely diverse very long
   content. The committed default is `~64k` tokens; raise `--tokens` and/or pass `--source-text`
   for more.
 
 The binary slices `[0:P]`; the manifest is provenance only.
+
+The current SM75 block-FP8 research uses an explicitly selected codechat or prose corpus, TP2
+`0,1`, FP16 KV and chunk4096. Do not mix their measurements or silently use the default matrix
+artifact/chunk sweep as this research baseline. See [current work](../../todo.md) and
+[performance](../../docs/performance.md#local-block-fp8-research).
 
 ## Requirements
 

@@ -18,6 +18,9 @@ class MaterializedArtifact;
 [[nodiscard]] ObjectHandle bind_device_tensor(Binder& binder, std::string_view name,
                                               NumericFormat format,
                                               std::initializer_list<std::uint64_t> shape);
+[[nodiscard]] ObjectHandle bind_device_tensor_layout(Binder& binder, std::string_view name,
+                                                     NumericFormat format, StorageLayout layout,
+                                                     std::initializer_list<std::uint64_t> shape);
 
 [[nodiscard]] ObjectHandle bind_raw_resource(Binder& binder, std::string_view name);
 
@@ -36,6 +39,10 @@ class MaterializedArtifact;
 [[nodiscard]] Weight materialized_weight(const MaterializedArtifact& materialized,
                                          ObjectHandle handle, NumericFormat format,
                                          std::int32_t rows, std::int32_t columns, int device = 0);
+[[nodiscard]] Weight materialized_weight(const MaterializedArtifact& materialized,
+                                         ObjectHandle handle, NumericFormat format,
+                                         StorageLayout layout, std::int32_t rows,
+                                         std::int32_t columns, int device = 0);
 
 // Shared shape-vs-placement guard, exposed so target-owned wrappers (NVFP4 weights, which the
 // generic `materialized_weight` refuses) can discharge the same obligation.

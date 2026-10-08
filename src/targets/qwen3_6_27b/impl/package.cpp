@@ -99,6 +99,15 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
     if (identity.model_id == qwen3_8_model_id && identity.weights_id == "gguf-q4-k-m") {
         return WeightsProfile::Qwen38GgmlK;
     }
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "fp8-block128") {
+        return WeightsProfile::Qwen38Fp8Block128;
+    }
+    // The same profile also serves the Marlin research artifact: both recipes store the same E4M3
+    // codes and BF16 multiplier scales, and which persistent arrangement an artifact carries is
+    // declared per object and bound by the loader rather than selected by the profile.
+    if (identity.model_id == qwen3_8_model_id && identity.weights_id == "fp8-block128-marlin") {
+        return WeightsProfile::Qwen38Fp8Block128;
+    }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' is not supported by target '" + std::string(target_key) + "'");
 }

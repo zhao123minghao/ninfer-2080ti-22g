@@ -114,18 +114,6 @@ struct Variant {
                                          const std::array<Tensor, 2>& value,
                                          const std::array<WorkspaceArena*, 2>& workspace,
                                          const ExecutionContext& ec);
-    static void mtp_kv_projection(const std::array<Tensor, 2>& hidden,
-                                  const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                  const std::array<Tensor, 2>& key,
-                                  const std::array<Tensor, 2>& value,
-                                  const std::array<WorkspaceArena*, 2>& workspace,
-                                  const ExecutionContext& ec);
-    static void mtp_q_gate_projection(const std::array<Tensor, 2>& hidden,
-                                      const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                      const std::array<Tensor, 2>& query,
-                                      const std::array<Tensor, 2>& gate,
-                                      const std::array<WorkspaceArena*, 2>& workspace,
-                                      const ExecutionContext& ec);
     static void mtp_post_mixer(const std::array<Tensor, 2>& hidden,
                                const std::array<const MtpPostMixerWeights*, 2>& w,
                                const std::array<Tensor, 2>& residual,
@@ -153,12 +141,6 @@ struct Variant {
                                          const MtpAttentionProjectionWeights& weights,
                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                                          WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_kv_projection(const Tensor& hidden,
-                                  const MtpAttentionProjectionWeights& weights, Tensor& key,
-                                  Tensor& value, WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_q_gate_projection(const Tensor& hidden,
-                                      const MtpAttentionProjectionWeights& weights, Tensor& query,
-                                      Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
     static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                      Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
                                      WorkspaceArena& workspace, cudaStream_t stream);
@@ -188,11 +170,8 @@ struct Variant {
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
 
     [[nodiscard]] static std::size_t
-    mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
-    [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                                std::int32_t last);
-    [[nodiscard]] static std::size_t
-    mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    mtp_attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                                      std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                   qwen3_6::TextPhase phase, std::int32_t first,

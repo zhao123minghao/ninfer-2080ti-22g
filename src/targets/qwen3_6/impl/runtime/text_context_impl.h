@@ -141,7 +141,31 @@ private:
 
 } // namespace
 
-void DFlashFeatureSink::begin(const Tensor& value) {
+void LastColumnLayerCapture::begin(const Tensor& value, cudaStream_t stream) {
+    if (value.dtype != DType::BF16 || value.ne[0] <= 0 || value.ne[1] <= 0) {
+        throw std::logic_error("layer capture source is invalid");
+    }
+    if (output.size() < static_cast<std::size_t>(value.ne[0])) {
+        throw std::logic_error("layer capture output is invalid");
+    }
+    column = value.ne[1] - 1;
+    const Tensor final_column = value.slice(1, column, 1);
+    CUDA_CHECK(cudaMemcpyAsync(output.data(), final_column.data, final_column.bytes(),
+                               cudaMemcpyDeviceToHost, stream));
+}
+
+void LastColumnLayerCapture::capture_layer(int layer, const Tensor& value, cudaStream_t stream) {
+    if (layer < 0 || column < 0 || value.dtype != DType::BF16 || value.ne[1] <= column ||
+        output.size() < static_cast<std::size_t>(layer + 2) * value.ne[0]) {
+        throw std::logic_error("layer capture output is invalid");
+    }
+    const Tensor final_column = value.slice(1, column, 1);
+    auto* destination = output.data() + static_cast<std::size_t>(layer + 1) * value.ne[0];
+    CUDA_CHECK(cudaMemcpyAsync(destination, final_column.data, final_column.bytes(),
+                               cudaMemcpyDeviceToHost, stream));
+}
+
+void DFlashFeatureSink::begin(const Tensor& value, cudaStream_t) {
     const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
     const bool batch   = batch_features != nullptr && batch_lanes != nullptr &&
                        batch_valid_columns != nullptr && batch_width > 0 && batch_size > 0;
@@ -569,7 +593,10 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
 
         Tensor k_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
         Tensor v_flat = work_.alloc(DType::BF16, {kCfg.kv_size, T});
-        Variant::mtp_kv_projection(ah, mtp_.payload->attention, k_flat, v_flat, work_, s);
+        Tensor q_flat    = work_.alloc(DType::BF16, {kCfg.q_size, T});
+        Tensor gate_flat = work_.alloc(DType::BF16, {kCfg.q_size, T});
+        Variant::mtp_attention_projection(ah, mtp_.payload->attention, q_flat, gate_flat, k_flat,
+                                          v_flat, work_, s);
         Tensor k  = k_flat.view({kCfg.head_dim, kCfg.n_kv, T});
         Tensor v  = v_flat.view({kCfg.head_dim, kCfg.n_kv, T});
         Tensor kn = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_kv, T});
@@ -594,8 +621,10 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
     if (final_chunk) {
         Tensor q_flat    = work_.alloc(DType::BF16, {kCfg.q_size, 1});
         Tensor gate_flat = work_.alloc(DType::BF16, {kCfg.q_size, 1});
-        Variant::mtp_q_gate_projection(ah_last, mtp_.payload->attention, q_flat, gate_flat, work_,
-                                       s);
+        Tensor k_flat    = work_.alloc(DType::BF16, {kCfg.kv_size, 1});
+        Tensor v_flat    = work_.alloc(DType::BF16, {kCfg.kv_size, 1});
+        Variant::mtp_attention_projection(ah_last, mtp_.payload->attention, q_flat, gate_flat,
+                                          k_flat, v_flat, work_, s);
         Tensor q    = q_flat.view({kCfg.head_dim, kCfg.n_q, 1});
         Tensor gate = gate_flat.view({kCfg.head_dim, kCfg.n_q, 1});
         Tensor qn   = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
@@ -812,7 +841,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor x        = work_.alloc(DType::BF16, {kCfg.hidden, columns});
         Tensor flat_ids = ids.view({columns});
         ops::embedding(flat_ids, *embed_, x, stream);
-        if constexpr (Tap::enabled) { tap.begin(x); }
+        if constexpr (Tap::enabled) { tap.begin(x, ctx_.stream); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
             tap.capture_positions(cache_positions, stream);
@@ -1253,7 +1282,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     1, visual_begin, static_cast<std::int32_t>(local_scatter_indices.size()));
                 ops::scatter(embeddings, indices_device, x, s);
             }
-            if constexpr (Tap::enabled) { tap.begin(x); }
+            if constexpr (Tap::enabled) { tap.begin(x, s); }
             run_layers(x, Phase::Prefill, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
@@ -1425,6 +1454,22 @@ PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std
     const TextPrefill text_prefill{full_ids, begin};
     return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr, sink,
                         finalize_at_end);
+}
+
+PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                                              std::uint32_t nominal_length, bool finalize_at_end,
+                                              LastColumnLayerCapture& layer_capture) {
+    if (begin >= full_ids.size() || nominal_length == 0 ||
+        nominal_length > full_ids.size() - begin) {
+        throw std::invalid_argument("text prefill chunk is outside the prompt");
+    }
+    const TextPrefill text_prefill{full_ids, begin};
+    if (tp2()) {
+        return prefill_impl_tp2(full_ids.subspan(begin, nominal_length), text_prefill,
+                                finalize_at_end, nullptr, &layer_capture);
+    }
+    return prefill_impl(full_ids.subspan(begin, nominal_length), &text_prefill, nullptr,
+                        layer_capture, finalize_at_end);
 }
 
 PrefillChunkResult TextContext::prefill_chunk(const qwen3_6::PreparedPromptData& input,
@@ -1849,8 +1894,14 @@ void TextContext::mlp_tail_tp2(const Tensor* post_norm_0, const Tensor* post_nor
 
 void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
                                  const std::array<Tensor, 2>& staging,
-                                 DFlashFeatureSink* dflash_sink) {
-    if (dflash_sink != nullptr) { dflash_sink->begin(x[0]); }
+                                 DFlashFeatureSink* dflash_sink,
+                                 LastColumnLayerCapture* layer_capture) {
+    if (dflash_sink != nullptr) { dflash_sink->begin(x[0], stream_for(0)); }
+    if (layer_capture != nullptr) {
+        const CurrentDevice restore;
+        CUDA_CHECK(cudaSetDevice(ctx_.device));
+        layer_capture->begin(x[0], stream_for(0));
+    }
     const bool prefill = ph == Phase::Prefill;
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
         if (ModelConfig::is_full(layer)) {
@@ -1902,6 +1953,11 @@ void TextContext::run_layers_tp2(std::array<Tensor, 2>& x, Phase ph,
         }
         if (dflash_sink != nullptr) {
             dflash_sink->capture_layer(layer, x[0], stream_for(0));
+        }
+        if (layer_capture != nullptr) {
+            const CurrentDevice restore;
+            CUDA_CHECK(cudaSetDevice(ctx_.device));
+            layer_capture->capture_layer(layer, x[0], stream_for(0));
         }
     }
     if (dflash_sink != nullptr) {
@@ -1969,7 +2025,8 @@ void TextContext::logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits
 PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                                  const TextPrefill& text_prefill,
                                                  bool finalize_at_end,
-                                                 DFlashFeatureSink* dflash_sink) {
+                                                 DFlashFeatureSink* dflash_sink,
+                                                 LastColumnLayerCapture* layer_capture) {
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill token count exceeds int32");
@@ -2048,7 +2105,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         const ops::GqaExecutionEnvelope chunk_envelope{visible, visible};
         ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
-        run_layers_tp2(x, Phase::Prefill, staging, dflash_sink);
+        run_layers_tp2(x, Phase::Prefill, staging, dflash_sink, layer_capture);
 
         std::array<Tensor, 2> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
@@ -2939,13 +2996,17 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
 
         std::array<Tensor, 2> k_flat;
         std::array<Tensor, 2> v_flat;
+        std::array<Tensor, 2> q_flat;
+        std::array<Tensor, 2> gate_flat;
         for (std::size_t r = 0; r < 2; ++r) {
-            k_flat[r] = ws[r]->alloc(DType::BF16, {kShardKvSize, T});
-            v_flat[r] = ws[r]->alloc(DType::BF16, {kShardKvSize, T});
+            k_flat[r]    = ws[r]->alloc(DType::BF16, {kShardKvSize, T});
+            v_flat[r]    = ws[r]->alloc(DType::BF16, {kShardKvSize, T});
+            q_flat[r]    = ws[r]->alloc(DType::BF16, {kShardQSize, T});
+            gate_flat[r] = ws[r]->alloc(DType::BF16, {kShardQSize, T});
         }
-        Variant::mtp_kv_projection(
+        Variant::mtp_attention_projection(
             ah, {&mtp_weights_for(0).payload->attention, &mtp_weights_for(1).payload->attention},
-            k_flat, v_flat, ws, execution);
+            q_flat, gate_flat, k_flat, v_flat, ws, execution);
         for_each_rank(execution, [&](int rank) {
             const auto r    = static_cast<std::size_t>(rank);
             cudaStream_t s  = stream_for(rank);
@@ -2977,13 +3038,17 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
 
     std::array<Tensor, 2> q_flat;
     std::array<Tensor, 2> gate_flat;
+    std::array<Tensor, 2> k_flat;
+    std::array<Tensor, 2> v_flat;
     for (std::size_t r = 0; r < 2; ++r) {
         q_flat[r]    = ws[r]->alloc(DType::BF16, {kShardQSize, 1});
         gate_flat[r] = ws[r]->alloc(DType::BF16, {kShardQSize, 1});
+        k_flat[r]    = ws[r]->alloc(DType::BF16, {kShardKvSize, 1});
+        v_flat[r]    = ws[r]->alloc(DType::BF16, {kShardKvSize, 1});
     }
-    Variant::mtp_q_gate_projection(
+    Variant::mtp_attention_projection(
         ah_last, {&mtp_weights_for(0).payload->attention, &mtp_weights_for(1).payload->attention},
-        q_flat, gate_flat, ws, execution);
+        q_flat, gate_flat, k_flat, v_flat, ws, execution);
     std::array<Tensor, 2> a;
     std::array<Tensor, 2> o;
     std::array<Tensor, 2> mh;

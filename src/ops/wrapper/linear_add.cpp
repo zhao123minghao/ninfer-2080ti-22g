@@ -4,6 +4,7 @@
 #include "ops/common/split_launch.h"
 #include "ops/linear/fp8/fp8_config.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "ops/linear/linear_dispatch.h" // detail-free validate_linear_semantics / dispatch_linear
 #include "ops/linear/ggml_k/ggml_k.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -205,6 +206,24 @@ void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
         return;
     }
 
+    if (w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        if (policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("block-FP8 linear_add admits only A16");
+        }
+        (void)detail::validate_fp8_block_weight(w, "block-FP8 linear_add");
+        const bool supported_shape =
+            w.n == 5120 && (w.k == 3072 || w.k == 6144 || w.k == 8704 || w.k == 17408);
+        if (!supported_shape) {
+            throw std::invalid_argument("block-FP8 linear_add: unsupported weight shape");
+        }
+        if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16)) {
+            throw std::invalid_argument(
+                "linear_add: block-FP8 requires 16-byte x/residual alignment");
+        }
+        detail::fp8_block_linear_add_dispatch(x, w, residual_out, stream);
+        return;
+    }
+
     throw std::invalid_argument("linear_add: unsupported weight format");
 }
 
@@ -291,6 +310,17 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         return detail::fp8_linear_add_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                                min_tokens, max_tokens);
     }
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        const bool supported_shape =
+            output_rows == 5120 &&
+            (input_rows == 3072 || input_rows == 6144 || input_rows == 8704 ||
+             input_rows == 17408);
+        if (!supported_shape || policy != LinearPolicy::A16Only) {
+            throw std::invalid_argument("linear_add workspace: unsupported block-FP8 profile");
+        }
+        return detail::fp8_block_linear_workspace_capacity_bytes(
+            output_rows, input_rows, policy, min_tokens, max_tokens);
+    }
     throw std::invalid_argument("linear_add workspace: unsupported weight format");
 }
 
@@ -361,7 +391,8 @@ void issue_fused_rank(const Tensor& x, const Weight& w, Tensor& residual, Tensor
         return;
     }
     if (w.qtype == QType::GGML_K || w.qtype == QType::NVFP4 || w.qtype == QType::Q5G64_F16S ||
-        w.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
+        w.qtype == QType::FP8_E4M3FN_ROW_BF16S ||
+        w.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
         // FP8 reaches here through the same "shape alone selects the route" widening as NVFP4/Q5:
         // dispatch_linear_add's FP8 branch (above) already admits the tp2 row-shard extents, and
         // its own fp8_linear_add_dispatch resolves the halved-K geometry via resolve_fp8_problem.

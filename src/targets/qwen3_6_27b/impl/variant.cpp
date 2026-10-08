@@ -207,18 +207,6 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
     ops::mtp_split_attn_in(packed, query_heads, key_heads, gate_heads, value_heads, stream);
 }
 
-void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
-                                Tensor& key, Tensor& value, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
-}
-
-void Variant::mtp_q_gate_projection(const Tensor& hidden,
-                                    const MtpAttentionProjectionWeights& weights, Tensor& query,
-                                    Tensor& gate, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear(hidden, weights.query, query, stream);
-    ops::linear(hidden, weights.output_gate, gate, stream);
-}
-
 void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                    Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
@@ -337,24 +325,32 @@ void Variant::mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& we
     ops::residual_add(delta, residual, stream);
 }
 
-std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                       std::int32_t last) {
+std::size_t Variant::mtp_attention_projection_workspace_capacity_bytes(
+    WeightsProfile weights_profile, std::int32_t first, std::int32_t last) {
     validate_token_interval(first, last);
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::BF16, {TextConfig::mtp_attention_input_rows, last});
-    return layout.peak_bytes(1);
-}
-
-std::size_t Variant::mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                std::int32_t last) {
-    validate_token_interval(first, last);
-    return 0;
-}
-
-std::size_t Variant::mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                    std::int32_t last) {
-    validate_token_interval(first, last);
-    return 0;
+    // The fused leaf projects the whole parent into a [mtp_attention_input_rows, tokens] staging
+    // block and splits it in place; the split itself needs no arena.
+    switch (weights_profile) {
+    case WeightsProfile::Qwen38GgmlK:
+        return ops::linear_workspace_capacity_bytes(QType::GGML_K,
+                                                    TextConfig::mtp_attention_input_rows,
+                                                    TextConfig::hidden,
+                                                    ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::Qwen38Fp8Block128:
+        return ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+                                                    TextConfig::mtp_attention_input_rows,
+                                                    TextConfig::hidden,
+                                                    ops::LinearPolicy::A16Only, first, last);
+    case WeightsProfile::Qwen36GroupwiseInt:
+    case WeightsProfile::Qwen38GroupwiseInt:
+    case WeightsProfile::Qwen36Nvfp4:
+    case WeightsProfile::Qwen38Nvfp4:
+        return ops::linear_workspace_capacity_bytes(QType::W8G32_F16S,
+                                                    TextConfig::mtp_attention_input_rows,
+                                                    TextConfig::hidden,
+                                                    ops::LinearPolicy::A16Only, first, last);
+    }
+    throw std::logic_error("invalid 27B weights profile");
 }
 
 std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
@@ -375,6 +371,10 @@ std::size_t Variant::attention_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38Nvfp4:
         return ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 14336, TextConfig::hidden, kFp8TextPolicy, first, last);
+    case WeightsProfile::Qwen38Fp8Block128:
+        return ops::attn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_BLOCK128_BF16S, 14336, TextConfig::hidden,
+            ops::LinearPolicy::A16Only, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -400,6 +400,10 @@ std::size_t Variant::attention_output_projection_workspace_capacity_bytes(
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::query_size,
                                                         kFp8TextPolicy, first, last);
+    case WeightsProfile::Qwen38Fp8Block128:
+        return ops::linear_add_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_BLOCK128_BF16S, TextConfig::hidden, TextConfig::query_size,
+            ops::LinearPolicy::A16Only, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -422,6 +426,10 @@ std::size_t Variant::gdn_input_projection_workspace_capacity_bytes(WeightsProfil
     case WeightsProfile::Qwen38Nvfp4:
         return ops::gdn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy, first, last);
+    case WeightsProfile::Qwen38Fp8Block128:
+        return ops::gdn_input_proj_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_BLOCK128_BF16S, 16384, TextConfig::hidden,
+            ops::LinearPolicy::A16Only, first, last);
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -452,6 +460,11 @@ std::size_t Variant::gdn_input_projection_snapshot_workspace_capacity_bytes(
                         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
                             batch_size, first, last));
+    case WeightsProfile::Qwen38Fp8Block128:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                            QType::FP8_E4M3FN_BLOCK128_BF16S, 16384, TextConfig::hidden,
+                            ops::LinearPolicy::A16Only, batch_size, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -482,6 +495,11 @@ std::size_t Variant::gdn_input_projection_record_workspace_capacity_bytes(
                         ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
                             QType::FP8_E4M3FN_ROW_BF16S, 16384, TextConfig::hidden, kFp8TextPolicy,
                             batch_size, first, last));
+    case WeightsProfile::Qwen38Fp8Block128:
+        return std::max(kMinimumLeafWorkspaceBytes,
+                        ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+                            QType::FP8_E4M3FN_BLOCK128_BF16S, 16384, TextConfig::hidden,
+                            ops::LinearPolicy::A16Only, batch_size, first, last));
     }
     throw std::logic_error("invalid 27B weights profile");
 }
@@ -504,6 +522,10 @@ std::size_t Variant::gdn_output_projection_workspace_capacity_bytes(WeightsProfi
     case WeightsProfile::Qwen36Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(
             QType::NVFP4, TextConfig::hidden, TextConfig::value_dim, kNvfp4TextPolicy, first, last);
+    case WeightsProfile::Qwen38Fp8Block128:
+        return ops::linear_add_workspace_capacity_bytes(
+            QType::FP8_E4M3FN_BLOCK128_BF16S, TextConfig::hidden, TextConfig::value_dim,
+            ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen38Nvfp4:
         return ops::linear_add_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16S,
                                                         TextConfig::hidden, TextConfig::value_dim,
@@ -539,6 +561,10 @@ std::size_t Variant::post_mixer_workspace_capacity_bytes(WeightsProfile weights_
     case WeightsProfile::Qwen36Nvfp4:
         return post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first,
                                           last);
+    case WeightsProfile::Qwen38Fp8Block128:
+        return post_mixer_workspace_bytes(QType::FP8_E4M3FN_BLOCK128_BF16S,
+                                          QType::FP8_E4M3FN_BLOCK128_BF16S,
+                                          ops::LinearPolicy::A16Only, first, last);
     case WeightsProfile::Qwen38Nvfp4: {
         const std::size_t nvfp4 =
             post_mixer_workspace_bytes(QType::NVFP4, QType::NVFP4, kNvfp4TextPolicy, first, last);
@@ -601,10 +627,11 @@ void for_each_rank(const ExecutionContext& ec, Body&& body) {
     }
 }
 
-// Both registered MTP codecs use A16 projections without transient Linear storage.
+// Registered MTP weight formats use A16 projections without transient Linear storage.
 void require_mtp_shard(const Weight& a, const Weight& b, const char* label) {
     if (a.qtype != b.qtype ||
-        (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K)) {
+        (a.qtype != QType::W8G32_F16S && a.qtype != QType::GGML_K &&
+         a.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S)) {
         throw std::logic_error(std::string(label) +
                                ": unsupported or inconsistent tp2 MTP weight format");
     }
@@ -842,43 +869,14 @@ void Variant::mtp_attention_projection(
     });
 }
 
-void Variant::mtp_kv_projection(const std::array<Tensor, 2>& hidden,
-                                const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                const std::array<Tensor, 2>& key,
-                                const std::array<Tensor, 2>& value,
-                                const std::array<WorkspaceArena*, 2>&, const ExecutionContext& ec) {
-    // The tp1 leaf fuses these two into one `linear_pair`; the shard's key and value row views
-    // are separate blocks of the same packed shard, so at tp2 they are two column-parallel calls.
-    require_mtp_shard(w[0]->key, w[1]->key, "MTP key projection");
-    require_mtp_shard(w[0]->value, w[1]->value, "MTP value projection");
-    ops::linear_column_parallel(hidden, pair_of(w[0]->key, w[1]->key), key, ec);
-    ops::linear_column_parallel(hidden, pair_of(w[0]->value, w[1]->value), value, ec);
-}
-
-void Variant::mtp_q_gate_projection(const std::array<Tensor, 2>& hidden,
-                                    const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                    const std::array<Tensor, 2>& query,
-                                    const std::array<Tensor, 2>& gate,
-                                    const std::array<WorkspaceArena*, 2>&,
-                                    const ExecutionContext& ec) {
-    require_mtp_shard(w[0]->query, w[1]->query, "MTP query projection");
-    require_mtp_shard(w[0]->output_gate, w[1]->output_gate, "MTP gate projection");
-    ops::linear_column_parallel(hidden, pair_of(w[0]->query, w[1]->query), query, ec);
-    ops::linear_column_parallel(hidden, pair_of(w[0]->output_gate, w[1]->output_gate), gate, ec);
-}
-
 void Variant::mtp_post_mixer(const std::array<Tensor, 2>& hidden,
                              const std::array<const MtpPostMixerWeights*, 2>& w,
                              const std::array<Tensor, 2>& residual,
                              const std::array<Tensor, 2>& staging,
                              const std::array<WorkspaceArena*, 2>& workspace,
                              const ExecutionContext& ec, const ops::PeerEvents& ev) {
-    // The MTP post-mixer is composed exactly the way the tp1 leaf above composes it -- separate
-    // `linear` / `silu_mul` / `linear` / `residual_add`, NOT the fused linear_swiglu + linear_add
-    // pair the text post-mixer uses. That is not a stylistic choice: neither
-    // `linear_swiglu_column_parallel` nor `linear_add_row_parallel` registers W8G32_F16S, which
-    // is the format of every MTP object, and the tp1 MTP leaf already avoids both fused Ops for
-    // the same reason. `tests/ops/test_mtp_split.cpp`'s Leg A proves this exact composition at
+    // The MTP post-mixer keeps the same separate `linear` / `silu_mul` / `linear` / `residual_add`
+    // schedule as the tp1 leaf above. `tests/ops/test_mtp_split.cpp`'s Leg A proves this exact composition at
     // tp2 -- column-parallel gate_up, a shard-local silu_mul over the shard's own gate/up halves,
     // then row-parallel down plus the all-reduce.
     require_mtp_shard(w[0]->gate_up, w[1]->gate_up, "MTP post mixer gate/up");

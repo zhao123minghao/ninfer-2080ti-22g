@@ -41,6 +41,22 @@ inline std::vector<float> make_bf16_activation(std::int32_t rows, std::int32_t t
     return values;
 }
 
+inline bool nvfp4_a4_available() {
+    int device = 0;
+    cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+    cudaDeviceProp properties{};
+    cuda_check(cudaGetDeviceProperties(&properties, device), "cudaGetDeviceProperties");
+    return properties.major == 12 && properties.minor == 0;
+}
+
+inline bool fp8_a8_available() {
+    int device = 0;
+    cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+    cudaDeviceProp properties{};
+    cuda_check(cudaGetDeviceProperties(&properties, device), "cudaGetDeviceProperties");
+    return properties.minor == 0 && (properties.major == 10 || properties.major == 12);
+}
+
 class DevicePackedWeight {
 public:
     explicit DevicePackedWeight(quantized_weight::PackedWeight packed)

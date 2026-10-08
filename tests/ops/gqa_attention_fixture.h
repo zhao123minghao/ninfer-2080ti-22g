@@ -65,9 +65,20 @@ constexpr ReductionCriterion kAttentionBf16Criterion{
 };
 
 constexpr ReductionCriterion kAttentionInt8Criterion{
-    /*relative_l2*/ 3.15e-3,
+    /*relative_l2*/ 2.2e-3,
     /*gross_absolute*/ 1.1e-3,
     /*gross_relative_to_max_reference*/ 2.2e-3,
+};
+
+// FP8-E4M3 has a 3-bit mantissa (relative step 2^-4) and no per-group scale, yet its attention
+// output error lands BELOW the INT8-G64 profile at these short windows: the softmax-weighted
+// average cancels the codec error, and there is no per-group scale rounding to add a second
+// error source. Measured relative-L2 is ~2.0-2.4e-3 (vs 3.15e-3 for INT8); the limit keeps a
+// ~17% margin. Fitted at the same short windows as the other two.
+constexpr ReductionCriterion kAttentionFp8Criterion{
+    /*relative_l2*/ 2.8e-3,
+    /*gross_absolute*/ 2.0e-3,
+    /*gross_relative_to_max_reference*/ 1.0e-2,
 };
 
 // --- long-window reduction domain -------------------------------------------------------------
@@ -388,6 +399,65 @@ inline std::int32_t round_even_to_i32(float value) {
     return (lower & 1) == 0 ? lower : lower + 1;
 }
 
+// --- fp8 (E4M3FN) codec -----------------------------------------------------------------------
+//
+// The fp8 KV cache stores K/V as E4M3FN codes with no per-group scale. This is the independent
+// host-side exact codec: encode is round-to-nearest-even into the E4M3 grid (saturating NaN/Inf
+// to +/-448, matching the device cast's SATFINITE), and decode is the exact E4M3FN magnitude
+// formula. It must agree bit-for-bit with the device codec for every input the suite feeds.
+
+inline double e4m3fn_to_double(std::uint8_t code) {
+    const bool negative       = (code & 0x80u) != 0;
+    const std::uint32_t exp   = (code >> 3) & 0x0fu;
+    const std::uint32_t mant  = code & 0x07u;
+    double magnitude          = 0.0;
+    if (exp == 0) {
+        magnitude = mant == 0 ? 0.0 : static_cast<double>(mant) * std::ldexp(1.0, -9);
+    } else {
+        magnitude = (1.0 + static_cast<double>(mant) / 8.0) *
+                    std::ldexp(1.0, static_cast<int>(exp) - 7);
+    }
+    return negative ? -magnitude : magnitude;
+}
+
+inline std::uint8_t f32_to_e4m3fn(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const std::uint32_t sign     = bits >> 31;
+    const std::uint32_t exp      = (bits >> 23) & 0xffu;
+    const std::uint32_t mantissa = bits & 0x007fffffu;
+
+    if (exp == 0xffu) {
+        return static_cast<std::uint8_t>((sign << 7) | 0x7eu); // NaN/Inf -> +/-448
+    }
+
+    // E4M3 normal exponent: e4 = exp - 127 + 7 = exp - 120.
+    const int e4 = static_cast<int>(exp) - 120;
+    if (e4 <= 0) {
+        // Subnormal grid: m * 2^-9. Round value * 2^9 to nearest (ties to even). f32 subnormals
+        // (< 2^-126) are far below the smallest E4M3 subnormal and round to zero.
+        if (exp == 0) { return static_cast<std::uint8_t>(sign << 7); }
+        const double scaled =
+            std::ldexp(1.0 + static_cast<double>(mantissa) / 8388608.0,
+                       static_cast<int>(exp) - 118);
+        const int m = static_cast<int>(std::nearbyint(scaled));
+        if (m <= 0) { return static_cast<std::uint8_t>(sign << 7); }
+        if (m >= 8) { return static_cast<std::uint8_t>((sign << 7) | 0x08u); } // 2^-6 -> e4=1,m=0
+        return static_cast<std::uint8_t>((sign << 7) | static_cast<std::uint8_t>(m));
+    }
+
+    // E4M3 normal: value = 2^(e4-7) * (1 + m/8); m = round(mantissa / 2^20), ties to even.
+    std::uint32_t m = (mantissa + 0x80000u) >> 20;
+    if ((mantissa & 0xfffffu) == 0x80000u && (m & 1u)) { m -= 1; }
+    int rounded_e4 = e4;
+    if (m >= 8) { m = 0; rounded_e4 += 1; }
+    if (rounded_e4 > 15 || (rounded_e4 == 15 && m == 7)) {
+        return static_cast<std::uint8_t>((sign << 7) | 0x7eu); // +/-448
+    }
+    return static_cast<std::uint8_t>((sign << 7) |
+                                     static_cast<std::uint8_t>((rounded_e4 << 3) | m));
+}
+
 struct HostCache {
     Geometry geometry;
     DType dtype;
@@ -399,6 +469,8 @@ struct HostCache {
     std::vector<std::int8_t> v_i8;
     std::vector<std::uint16_t> k_scale;
     std::vector<std::uint16_t> v_scale;
+    std::vector<std::uint8_t> k_fp8;
+    std::vector<std::uint8_t> v_fp8;
 };
 
 inline void encode_group(const std::vector<float>& source, std::size_t source_base,
@@ -435,6 +507,15 @@ inline HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t 
     if (dtype == DType::FP16) {
         cache.k_f16 = to_f16_bits(logical_k);
         cache.v_f16 = to_f16_bits(logical_v);
+        return cache;
+    }
+    if (dtype == DType::FP8_E4M3FN) {
+        cache.k_fp8.assign(elements, 0);
+        cache.v_fp8.assign(elements, 0);
+        for (std::size_t i = 0; i < elements; ++i) {
+            cache.k_fp8[i] = f32_to_e4m3fn(logical_k[i]);
+            cache.v_fp8[i] = f32_to_e4m3fn(logical_v[i]);
+        }
         return cache;
     }
 
@@ -480,6 +561,16 @@ inline void append_cache(HostCache& cache, const std::vector<float>& k, const st
                 }
                 continue;
             }
+            if (cache.dtype == DType::FP8_E4M3FN) {
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    const std::size_t source = kv_input_index(geometry, head, d, token);
+                    const std::size_t target =
+                        cache_index(geometry, cache.logical_capacity, head, position, d);
+                    cache.k_fp8[target] = f32_to_e4m3fn(k[source]);
+                    cache.v_fp8[target] = f32_to_e4m3fn(v[source]);
+                }
+                continue;
+            }
 
             for (std::int32_t group = 0; group < kQuantGroups; ++group) {
                 const std::int32_t d     = group * kQuantGroup;
@@ -500,6 +591,9 @@ inline double cache_value(const HostCache& cache, bool key, std::int32_t head, s
     const std::size_t code = cache_index(cache.geometry, cache.logical_capacity, head, position, d);
     if (cache.dtype == DType::FP16) {
         return static_cast<double>(f16_bits_to_f32(key ? cache.k_f16[code] : cache.v_f16[code]));
+    }
+    if (cache.dtype == DType::FP8_E4M3FN) {
+        return e4m3fn_to_double(key ? cache.k_fp8[code] : cache.v_fp8[code]);
     }
 
     const std::size_t scale =
@@ -597,6 +691,15 @@ public:
                               block_table_host_, physical_pages_);
             k_.copy_from_host(k_physical.data(), k_physical.size() * sizeof(std::uint16_t));
             v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::uint16_t));
+        } else if (dtype_ == DType::FP8_E4M3FN) {
+            const auto k_physical =
+                scatter_paged(cache.k_fp8, kHeadDim, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto v_physical =
+                scatter_paged(cache.v_fp8, kHeadDim, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            k_.copy_from_host(k_physical.data(), k_physical.size() * sizeof(std::uint8_t));
+            v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::uint8_t));
         } else {
             const auto k_physical =
                 scatter_paged(cache.k_i8, kHeadDim, geometry_, logical_capacity_, block_table_host_,
@@ -663,6 +766,13 @@ public:
                                                                 logical_capacity_, block_table_host_);
             cache.v_f16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
                                                                 logical_capacity_, block_table_host_);
+        } else if (dtype_ == DType::FP8_E4M3FN) {
+            const auto k_physical = copy_from_guarded<std::uint8_t>(k_, code_elements_);
+            const auto v_physical = copy_from_guarded<std::uint8_t>(v_, code_elements_);
+            cache.k_fp8          = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
+                                                               logical_capacity_, block_table_host_);
+            cache.v_fp8          = gather_paged<std::uint8_t>(v_physical, kHeadDim, geometry_,
+                                                               logical_capacity_, block_table_host_);
         } else {
             const auto k_physical  = copy_from_guarded<std::int8_t>(k_, code_elements_);
             const auto v_physical  = copy_from_guarded<std::int8_t>(v_, code_elements_);
@@ -902,6 +1012,9 @@ inline int verify_cache(const std::string& label, const HostCache& got, const Ho
     if (expected.dtype == DType::FP16) {
         failures += verify_exact((label + " cache-k").c_str(), got.k_f16, expected.k_f16);
         failures += verify_exact((label + " cache-v").c_str(), got.v_f16, expected.v_f16);
+    } else if (expected.dtype == DType::FP8_E4M3FN) {
+        failures += verify_exact((label + " cache-k-code").c_str(), got.k_fp8, expected.k_fp8);
+        failures += verify_exact((label + " cache-v-code").c_str(), got.v_fp8, expected.v_fp8);
     } else {
         failures += verify_exact((label + " cache-k-code").c_str(), got.k_i8, expected.k_i8);
         failures += verify_exact((label + " cache-v-code").c_str(), got.v_i8, expected.v_i8);
@@ -927,10 +1040,14 @@ inline int verify_positions(const std::string& label, const GuardedDeviceBuffer&
     return failures;
 }
 
-inline const char* cache_name(DType dtype) { return dtype == DType::FP16 ? "fp16" : "int8-g64"; }
+inline const char* cache_name(DType dtype) {
+    return dtype == DType::FP16 ? "fp16" : dtype == DType::FP8_E4M3FN ? "fp8-e4m3" : "int8-g64";
+}
 
 inline ReductionCriterion attention_criterion(DType dtype) {
-    return dtype == DType::FP16 ? kAttentionBf16Criterion : kAttentionInt8Criterion;
+    if (dtype == DType::FP16) { return kAttentionBf16Criterion; }
+    if (dtype == DType::FP8_E4M3FN) { return kAttentionFp8Criterion; }
+    return kAttentionInt8Criterion;
 }
 
 inline ReductionCriterion long_window_attention_criterion(DType dtype, double storage_floor) {

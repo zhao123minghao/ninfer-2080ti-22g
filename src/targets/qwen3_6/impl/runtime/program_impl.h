@@ -729,7 +729,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                 }
                 sequence.mtp_kv_valid = mtp_base;
             } else if (speculative_backend == SpeculativeBackend::DFlash) {
-                if (!dflash || !sequence.kv->backend || sequence.dflash_context_frontier < base) {
+                if (!dflash || (backend_kv_cache() != nullptr && !sequence.kv->backend) ||
+                    sequence.dflash_context_frontier < base) {
                     throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
                 dflash->restore_rewrite_checkpoint(static_cast<std::int32_t>(sequence.lane),
@@ -762,8 +763,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
-            : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
-                                                                : 0U;
+                : speculative_backend == SpeculativeBackend::DFlash &&
+                          backend_kv_cache() != nullptr
+                      ? prompt_tokens
+                      : 0U;
         materialize_sequence_kv(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = prompt.rope_delta;
@@ -788,12 +791,14 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         sequence.prefix_identity.assign(prompt);
 
         if (speculative_backend == SpeculativeBackend::DFlash) {
-            if (!dflash || !io.dflash_decode || !sequence.kv->backend) {
+            if (!dflash || !io.dflash_decode ||
+                (backend_kv_cache() != nullptr && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
             *dflash_host_ingress                         = {};
             dflash_host_ingress->lanes[0]                = static_cast<std::int32_t>(sequence.lane);
-            dflash_host_ingress->dflash_kv_table_rows[0] = sequence.kv->backend->bound_row();
+            dflash_host_ingress->dflash_kv_table_rows[0] =
+                sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
                                        sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                        device.stream));
@@ -1121,20 +1126,24 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
 
 qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        return &*dflash->full;
+    }
     return nullptr;
 }
 
 const qwen3_6::PagedKVCache* ProgramImplCore::backend_kv_cache() const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return decoder->mtp_cache(); }
-    if (speculative_backend == SpeculativeBackend::DFlash && dflash) { return &dflash->full; }
+    if (speculative_backend == SpeculativeBackend::DFlash && dflash && dflash->full) {
+        return &*dflash->full;
+    }
     return nullptr;
 }
 
 std::uint32_t ProgramImplCore::backend_kv_valid(const SequenceState& sequence) const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return sequence.mtp_kv_valid; }
     if (speculative_backend == SpeculativeBackend::DFlash) {
-        return sequence.dflash_context_frontier;
+        return backend_kv_cache() != nullptr ? sequence.dflash_context_frontier : 0;
     }
     return 0;
 }
@@ -1175,7 +1184,7 @@ void ProgramImplCore::reserve_sequence_kv(SequenceState& sequence, std::uint32_t
         qwen3_6::PagedKVCache* peer_backend =
             speculative_backend == SpeculativeBackend::Mtp
                 ? peer->decoder->mtp_cache()
-                : (peer->dflash ? &peer->dflash->full : nullptr);
+                : (peer->dflash && peer->dflash->full ? &*peer->dflash->full : nullptr);
         if (peer_backend != nullptr) {
             peer_reservations[peer_count++] =
                 PagedKVReservation{.pool = &peer_backend->pool(), .page_entitlement = backend_pages};
@@ -1443,8 +1452,8 @@ void ProgramImplCore::prepare_graphs() {
             reserve_rows_in(*p.decoder->mtp_cache(), peer_mtp_capture_allocations, p.device.stream,
                             "peer MTP KV cache");
         });
-    } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        reserve_capture_rows(dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
+    } else if (speculative_backend == SpeculativeBackend::DFlash && dflash->full) {
+        reserve_capture_rows(*dflash->full, dflash_capture_allocations, "DFlash Full KV cache");
     }
     synchronize_all();
 
@@ -1542,7 +1551,9 @@ void ProgramImplCore::prepare_graphs() {
         if (decoder->mtp_cache() != nullptr) {
             zero_capture_pages(*decoder->mtp_cache(), mtp_capture_allocations, batch_size);
         }
-        if (dflash) { zero_capture_pages(dflash->full, dflash_capture_allocations, batch_size); }
+        if (dflash && dflash->full) {
+            zero_capture_pages(*dflash->full, dflash_capture_allocations, batch_size);
+        }
         on_peer([&](PeerRuntime& p) {
             for (std::uint32_t row = 0; row < batch_size; ++row) {
                 p.decoder->linear_attention.zero_slot(
@@ -2074,6 +2085,17 @@ void ProgramImplCore::enable_logits_capture(bool enabled) {
     }
 }
 
+void ProgramImplCore::enable_layer_capture(bool enabled) {
+    layer_capture_enabled = enabled;
+    if (enabled) {
+        layer_capture.assign(static_cast<std::size_t>(TextConfig::layers + 1) * TextConfig::hidden,
+                             0);
+    } else {
+        layer_capture.clear();
+        layer_capture.shrink_to_fit();
+    }
+}
+
 void ProgramImplCore::mark_workspace_usage(std::size_t phase_bytes) noexcept {
     workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
 }
@@ -2089,6 +2111,7 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
 
     std::uint32_t minimum_count = draft_window + 1U;
     std::uint32_t maximum_count = 0;
+    const bool needs_full_cache = backend_kv_cache() != nullptr;
     *dflash_host_ingress        = {};
     for (std::size_t row = 0; row < lanes.size(); ++row) {
         const std::uint32_t lane = lanes[row];
@@ -2101,17 +2124,21 @@ void ProgramImplCore::enqueue_dflash_context_append(std::span<const std::uint32_
         const std::uint32_t start = starts[row];
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
-        if (!sequence.kv || !sequence.kv->backend || sequence.kv->text.bound_row() < 0 ||
-            sequence.kv->backend->bound_row() < 0 || end64 > capacity) {
+        if (!sequence.kv || sequence.kv->text.bound_row() < 0 ||
+            (needs_full_cache && (!sequence.kv->backend ||
+                                  sequence.kv->backend->bound_row() < 0)) ||
+            end64 > capacity) {
             throw std::logic_error("DFlash context append is outside retained target storage");
         }
         dflash_host_ingress->context_frontiers[row] =
             checked_i32(start, "DFlash append context frontier");
         dflash_host_ingress->execution_frontiers[row] =
             checked_i32(end, "DFlash append target frontier");
-        dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
+        dflash_host_ingress->dflash_kv_table_rows[row] =
+            sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
         dflash_host_ingress->lanes[row]                = static_cast<std::int32_t>(lane);
-        materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end), end);
+        materialize_sequence_kv(sequence, std::max(sequence.text_kv_valid, end),
+                                needs_full_cache ? end : 0U);
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
     }
@@ -2166,6 +2193,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     std::uint32_t processed_prompt_tokens = 0;
     const auto started                    = Clock::now();
     try {
+        schedule::LastColumnLayerCapture layer_capture_tap{layer_capture};
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
@@ -2183,7 +2211,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
             LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
             staged.initial_mtp_extent,
-            dflash_host_ingress};
+            dflash_host_ingress,
+            layer_capture_enabled ? &layer_capture_tap : nullptr};
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -2341,7 +2370,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("rewrite checkpoint has no complete MTP prefix");
             }
             if (speculative_backend == SpeculativeBackend::DFlash &&
-                (!dflash || !sequence.kv || !sequence.kv->backend ||
+                (!dflash || !sequence.kv ||
+                 (backend_kv_cache() != nullptr && !sequence.kv->backend) ||
                  sequence.dflash_context_frontier < frontier)) {
                 throw std::logic_error("rewrite checkpoint has no complete DFlash prefix");
             }
@@ -2667,6 +2697,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     }
 
     const std::uint32_t width           = draft_window + 1U;
+    const bool needs_full_cache         = backend_kv_cache() != nullptr;
     std::uint32_t maximum_frontier      = 0;
     std::uint32_t maximum_target_tokens = 1;
     for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -2679,8 +2710,10 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const SequenceState& sequence = sequences[lane];
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
-            budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
-            sequence.kv->text.bound_row() < 0 || sequence.kv->backend->bound_row() < 0 ||
+            budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
+            sequence.kv->text.bound_row() < 0 ||
+            (needs_full_cache && (!sequence.kv->backend ||
+                                  sequence.kv->backend->bound_row() < 0)) ||
             sequence.execution_frontier >= capacity ||
             sequence.text_kv_valid != sequence.execution_frontier ||
             sequence.dflash_context_frontier > sequence.execution_frontier ||
@@ -2735,10 +2768,12 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->proposal_extents[row]     = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             dflash_host_ingress->text_kv_table_rows[row]   = sequence.kv->text.bound_row();
-            dflash_host_ingress->dflash_kv_table_rows[row] = sequence.kv->backend->bound_row();
+            dflash_host_ingress->dflash_kv_table_rows[row] =
+                sequence.kv->backend ? sequence.kv->backend->bound_row() : 0;
             dflash_host_ingress->lanes[row]    = static_cast<std::int32_t>(sequence.lane);
             dflash_host_ingress->sampling[row] = request.sampling_host;
-            materialize_sequence_kv(sequence, frontier + extent + 1U, frontier);
+            materialize_sequence_kv(sequence, frontier + extent + 1U,
+                                    needs_full_cache ? frontier : 0U);
         }
 
         publish_peer_dflash_ingress(lanes);
@@ -2880,7 +2915,9 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.effective_max_context = effective_max_context;
     out.yarn_mscale           = yarn_mscale;
     out.kv_capacity           = kv_capacity;
-    out.kv_cache = kv_dtype == DType::FP16 ? KvCacheStorage::Float16 : KvCacheStorage::Int8Group64;
+    out.kv_cache = kv_dtype == DType::FP16          ? KvCacheStorage::Float16
+                   : kv_dtype == DType::FP8_E4M3FN ? KvCacheStorage::Fp8E4M3
+                                                   : KvCacheStorage::Int8Group64;
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

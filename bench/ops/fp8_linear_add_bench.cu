@@ -32,6 +32,7 @@ constexpr double kFp8Fp32AccumulatePeak = 419.0;
 
 struct Options {
     std::int32_t k           = 0;
+    QType qtype              = QType::FP8_E4M3FN_ROW_BF16S;
     ops::LinearPolicy policy = ops::LinearPolicy::AllowA8;
     std::vector<std::int32_t> t_sweep{1, 2, 4, 8, 16, 20, 21, 22, 24, 25, 32, 48, 1024};
     int warmup   = 5;
@@ -77,6 +78,15 @@ Options parse_options(int argc, char** argv) {
         };
         if (argument == "--k") {
             options.k = std::stoi(std::string(next("--k")));
+        } else if (argument == "--qtype") {
+            const std::string_view value = next("--qtype");
+            if (value == "fp8") {
+                options.qtype = QType::FP8_E4M3FN_ROW_BF16S;
+            } else if (value == "fp8block") {
+                options.qtype = QType::FP8_E4M3FN_BLOCK128_BF16S;
+            } else {
+                throw std::invalid_argument("--qtype must be fp8 or fp8block");
+            }
         } else if (argument == "--policy") {
             const std::string_view value = next("--policy");
             if (value == "a16") {
@@ -97,7 +107,8 @@ Options parse_options(int argc, char** argv) {
         } else if (argument == "--csv-out") {
             options.csv_out = next("--csv-out");
         } else if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: %s --k 6144|17408 [--policy a16|a8] [--t-sweep 1,2,...] "
+            std::printf("Usage: %s --k 6144|17408 [--qtype fp8|fp8block] [--policy a16|a8] "
+                        "[--t-sweep 1,2,...] "
                         "[--warmup N] [--repeat N] [--profile] [--csv-out PATH]\n",
                         argv[0]);
             std::exit(0);
@@ -107,6 +118,10 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.k != 6144 && options.k != 17408) {
         throw std::invalid_argument("FP8 LinearAdd supports N=5120 and K=6144|17408");
+    }
+    if (options.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S &&
+        options.policy != ops::LinearPolicy::A16Only) {
+        throw std::invalid_argument("block-FP8 LinearAdd requires --policy a16");
     }
     if (options.warmup < 0 || options.repeat <= 0) {
         throw std::invalid_argument("--warmup must be nonnegative and --repeat positive");
@@ -121,7 +136,12 @@ const char* policy_name(ops::LinearPolicy policy) {
     return policy == ops::LinearPolicy::AllowA8 ? "A8" : "A16";
 }
 
+const char* qtype_name(QType qtype) {
+    return qtype == QType::FP8_E4M3FN_BLOCK128_BF16S ? "FP8BLOCK" : "FP8";
+}
+
 bool uses_tensor_cores(const Options& options, std::int32_t tokens) {
+    if (options.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) { return false; }
     if (options.policy != ops::LinearPolicy::AllowA8) { return false; }
     return options.k == 6144 ? tokens >= 22 : tokens >= 25;
 }
@@ -136,7 +156,7 @@ void write_csv(const Options& options, const std::vector<Result>& results,
     out << "op,weight_type,policy,N,K,T,weight_bytes,median_us,min_us,p95_us,effective_gbs,"
            "useful_tflops,tensor_peak_percent,warmup,repeat,flush_bytes\n";
     for (const Result& result : results) {
-        out << "linear_add,FP8_E4M3FN_ROW_BF16S," << policy_name(options.policy) << ',' << kRows
+        out << "linear_add," << qtype_name(options.qtype) << ',' << policy_name(options.policy) << ',' << kRows
             << ',' << options.k << ',' << result.tokens << ',' << weight_bytes << ','
             << result.timing.median_us << ',' << result.timing.min_us << ',' << result.timing.p95_us
             << ',' << result.effective_gbs << ',' << result.useful_tflops << ',';
@@ -160,9 +180,12 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
         DeviceBuffer input    = bench::make_bf16(static_cast<std::size_t>(options.k) * max_t);
         DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
-        bench::PackedQuantizedWeight packed  = bench::make_fp8_weight(kRows, options.k);
+        bench::PackedQuantizedWeight packed =
+            options.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S
+                ? bench::make_fp8_block_weight(kRows, options.k)
+                : bench::make_fp8_weight(kRows, options.k);
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16S, kRows, options.k, options.policy, min_t, max_t);
+            options.qtype, kRows, options.k, options.policy, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
 
         const auto launch = [&](std::int32_t tokens, cudaStream_t launch_stream) {
@@ -180,8 +203,9 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             bench::flush_l2(flush, stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
-            std::printf("PROFILE linear_add weight_type=FP8 policy=%s N=%d K=%d T=%d\n",
-                        policy_name(options.policy), kRows, options.k, tokens);
+            std::printf("PROFILE linear_add weight_type=%s policy=%s N=%d K=%d T=%d\n",
+                        qtype_name(options.qtype), policy_name(options.policy), kRows, options.k,
+                        tokens);
             std::fflush(stdout);
             CUDA_CHECK(cudaProfilerStart());
             launch(tokens, stream);

@@ -153,6 +153,28 @@ ninfer_add_test(ninfer_qwen3_8_27b_tp2_real_test
   LIBRARIES ninfer_engine)
 target_link_libraries(ninfer_qwen3_8_27b_tp2_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_tp2_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Opt-in FP8 block128 versus groupwise-int full-vocabulary logit probe. It diagnoses the first
+# greedy divergence before any layer-boundary instrumentation, and intentionally has no fixed
+# cross-artifact threshold: its artifact/env inputs are selected by the maintainer experiment.
+ninfer_add_test(ninfer_qwen3_8_27b_fp8_block_logits_real_test
+  SOURCES targets/qwen3_6_27b/test_fp8_block_logits_real.cpp
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_8_27b_fp8_block_logits_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_fp8_block_logits_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Opt-in target-binder/materializer audit for the real FP8 block128 artifact. The independent
+# block-FP8 slice oracle covers storage geometry; this test verifies that target binding places
+# the resulting shards exactly on both device arenas.
+ninfer_add_test(ninfer_qwen3_8_27b_fp8_block_materialization_real_test
+  SOURCES targets/qwen3_6_27b/test_fp8_block_materialization_real.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_qwen3_8_27b_fp8_block_materialization_real_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer_qwen3_8_27b_fp8_block_materialization_real_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_fp8_block_materialization_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # MTP3 speculative decoding under TP2. Opt-in on the same env/device gate as its siblings; the
 # timeout is larger because every leg runs four engines (tp1/tp2 x MTP/off).
 ninfer_add_test(ninfer_qwen3_8_27b_mtp_tp2_real_test
@@ -196,6 +218,16 @@ ninfer_add_test(ninfer_qwen3_8_27b_tp2_parity_test
   LIBRARIES ninfer_engine ninfer_product_prompt_input)
 target_link_libraries(ninfer_qwen3_8_27b_tp2_parity_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_tp2_parity_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
+# Engine-side half of the source-aligned block-FP8 quality oracle: exports next-token top-k for
+# fixed token-ID prefixes so they can be compared with dump_source_logits.py's source report.
+# Skipped (77) when its arguments or the local artifact are absent.
+ninfer_add_test(ninfer_qwen3_8_27b_engine_logits_probe_test
+  SOURCES ${PROJECT_SOURCE_DIR}/tools/parity/qwen3_8_27b/engine_logits_probe.cpp
+  NEEDS_SOURCE_DIR
+  LIBRARIES ninfer_engine)
+target_link_libraries(ninfer_qwen3_8_27b_engine_logits_probe_test PRIVATE CUDA::cudart)
+set_tests_properties(ninfer_qwen3_8_27b_engine_logits_probe_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -424,6 +456,9 @@ ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cp
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
+ninfer_add_op_test(ninfer_linear_fp8_block_test
+  SOURCES ops/linear/test_fp8_block.cpp
+  LIBRARIES ninfer_ops ninfer_artifact)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES ninfer_ops)

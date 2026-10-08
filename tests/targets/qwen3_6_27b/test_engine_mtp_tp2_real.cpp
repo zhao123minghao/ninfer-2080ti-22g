@@ -827,34 +827,75 @@ int exercise_penalties(const char* artifact, const std::vector<ninfer::TokenId>&
     return 0;
 }
 
-// --- the DFlash guard must survive ----------------------------------------------------------------
-//
-// The startup guard was narrowed, not removed: `--tp 2 --spec mtp` is now legal and
-// `--tp 2 --spec dflash` still is not. The DFlash weights are sharded by the load plan exactly as
-// the MTP ones were, so nothing about loading rejects it -- only the guard does, and a guard with
-// no test is a guard that quietly widens.
-int exercise_dflash_still_rejected(const char* artifact) {
-    ninfer::EngineOptions options    = engine_options(artifact, 2, /*mtp=*/false);
-    options.speculative.backend      = ninfer::SpeculativeBackend::DFlash;
-    options.speculative.draft_tokens = 4;
-    try {
-        ninfer::Engine engine(options);
-    } catch (const std::exception& error) {
-        const std::string message = error.what();
-        if (message.find("DFlash") == std::string::npos) {
-            std::cerr << "tp2 + DFlash was rejected, but not for being DFlash: " << message << "\n";
+int exercise_tp2_fp16(const char* artifact) {
+    const std::array<std::vector<ninfer::TokenId>, 2> prompts{
+        synthetic_prompt(kShortPromptTokens, 0), quadratic_prompt(kShortPromptTokens)};
+    std::array<Run, 2> speculative;
+    const auto options = [&](bool mtp, bool graphs) {
+        auto value = engine_options(artifact, 2, mtp, graphs);
+        value.kv_cache = ninfer::KvCacheStorage::Float16;
+        value.prefill_chunk = 4096;
+        return value;
+    };
+    {
+        ninfer::Engine engine(options(true, true));
+        engine.debug_enable_peer_egress_check(true);
+        for (std::size_t probe = 0; probe < prompts.size(); ++probe) {
+            speculative[probe] = generate(engine, prompts[probe], kOutputTokens);
+            const Run repeat = generate(engine, prompts[probe], kOutputTokens);
+            if (speculative[probe].tokens.size() != kOutputTokens ||
+                repeat.tokens != speculative[probe].tokens) {
+                std::cerr << "TP2 FP16 MTP generation is incomplete or not reproducible\n";
+                return 1;
+            }
+        }
+        const auto egress = engine.debug_peer_egress_check_counts();
+        if (egress.first == 0 || egress.second != 0) {
+            std::cerr << "TP2 FP16 MTP peer egress was not checked or disagreed\n";
             return 1;
         }
-        std::cout << "tp2 + DFlash still rejected: " << message << "\n";
-        return 0;
+        std::cout << "TP2 FP16 MTP peer egress exact over " << egress.first << " rounds\n";
     }
-    std::cerr << "tp2 + DFlash was accepted -- the speculative guard was widened too far\n";
-    return 1;
+    {
+        ninfer::Engine engine(options(true, false));
+        for (std::size_t probe = 0; probe < prompts.size(); ++probe) {
+            if (generate(engine, prompts[probe], kOutputTokens).tokens !=
+                speculative[probe].tokens) {
+                std::cerr << "TP2 FP16 MTP graph/eager generated tokens disagree\n";
+                return 1;
+            }
+        }
+    }
+    {
+        ninfer::Engine oracle(options(false, false));
+        oracle.debug_enable_logit_capture(true);
+        for (std::size_t probe = 0; probe < prompts.size(); ++probe) {
+            const Run ordinary = generate(oracle, prompts[probe], kOutputTokens);
+            const OracleResult control = teacher_force(oracle, prompts[probe], ordinary.tokens);
+            const OracleResult subject =
+                teacher_force(oracle, prompts[probe], speculative[probe].tokens);
+            const float gap_limit = std::max(kNearTieGap, control.worst_gap);
+            if (!control.capture_sane || !subject.capture_sane ||
+                control.positions != kOutputTokens || subject.positions != kOutputTokens ||
+                subject.disagreements > 2 * control.disagreements ||
+                subject.worst_gap > gap_limit) {
+                std::cerr << "TP2 FP16 MTP fixed-prefix target check failed: agreement "
+                          << subject.agreements << '/' << subject.positions
+                          << ", ordinary disagreements " << control.disagreements
+                          << ", worst gap " << subject.worst_gap << ", limit " << gap_limit
+                          << '\n';
+                return 1;
+            }
+            std::cout << "TP2 FP16 MTP probe " << probe << " teacher-forced agreement "
+                      << subject.agreements << '/' << subject.positions << ", ordinary "
+                      << control.agreements << '/' << control.positions << ", worst gap "
+                      << subject.worst_gap << '\n';
+        }
+    }
+    return 0;
 }
 
 int exercise(const char* artifact) {
-    if (const int result = exercise_dflash_still_rejected(artifact); result != 0) { return result; }
-
     // Two synthetic probes. The first is the arithmetic-progression prompt the sibling suite uses;
     // the second is an unrelated quadratic stream, so a prompt-specific knife edge cannot hide a
     // defect in both. The oracle runs on probe A and on the confound control; probe B is the cheap
@@ -934,7 +975,11 @@ int main() {
         std::cout << "skip: tensor-parallel MTP test needs two CUDA devices\n";
         return 77;
     }
-    if (exercise(artifact) != 0) { return 1; }
+    if (std::getenv("NINFER_MTP_TP2_FP16_ONLY") != nullptr) {
+        if (exercise_tp2_fp16(artifact) != 0) { return 1; }
+    } else if (exercise(artifact) != 0) {
+        return 1;
+    }
     std::cout << "ok\n";
     return 0;
 }

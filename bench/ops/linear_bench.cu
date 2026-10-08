@@ -11,6 +11,8 @@
 #include "ninfer/ops/linear.h"
 
 #include "core/device.h"
+#include "ninfer/ops/linear_add.h"
+#include "ops/linear/fp8_block/fp8_block.h"
 #include "direct_bf16_weight.cuh"
 #include "ninfer_bench_common.h"
 #include "quantized_weight.cuh"
@@ -118,6 +120,10 @@ struct Options {
     int repeat                = kDefaultRepeat;
     std::uint64_t flush_bytes = kDefaultFlushBytes;
     std::string csv_out;
+    std::string fp8_data;
+    std::string output_bf16;
+    std::string epilogue = "linear";
+    bool marlin_layout = false;
 };
 
 struct BenchPoint {
@@ -236,6 +242,8 @@ const char* qtype_name(QType qtype) {
         return "NVFP4";
     case QType::FP8_E4M3FN_ROW_BF16S:
         return "FP8";
+    case QType::FP8_E4M3FN_BLOCK128_BF16S:
+        return "FP8BLOCK";
     default:
         break;
     }
@@ -258,6 +266,10 @@ QType parse_qtype(std::string_view text) {
     if (value == "bf16" || value == "bf16_ctrl") { return QType::BF16_CTRL; }
     if (value == "nvfp4") { return QType::NVFP4; }
     if (value == "fp8" || value == "fp8_e4m3fn_row_bf16s") { return QType::FP8_E4M3FN_ROW_BF16S; }
+    if (value == "fp8block" || value == "fp8_block" ||
+        value == "fp8_e4m3fn_block128_bf16s") {
+        return QType::FP8_E4M3FN_BLOCK128_BF16S;
+    }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -324,8 +336,8 @@ Sweep parse_sweep(std::string_view text) {
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "Usage:\n"
-                 "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
-                 "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
+                 "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8|FP8BLOCK --n N --k K --t T [options]\n"
+                 "  %s --qtype Q4|Q5|Q6|W8|BF16|NVFP4|FP8|FP8BLOCK --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
                  "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
                  "Options:\n"
@@ -335,6 +347,10 @@ void usage(const char* argv0) {
                  "  --repeat N         Measured cold-cache samples per point (default %d).\n"
                  "  --flush-mib N      L2 eviction buffer size (default 256 MiB).\n"
                  "  --csv-out PATH     Write all ordinary measurement rows as CSV.\n"
+                 "  --fp8-data DIR     Read FP8BLOCK weight.bin and activation.bin instead of patterns.\n"
+                 "  --output-bf16 PATH Write the exact point's output words after timing.\n"
+                 "  --epilogue linear|swiglu|add  Closed FP8BLOCK replay (default linear).\n"
+                 "  --marlin-layout  Serve FP8BLOCK weights from the marlin-fp8-block128-v1 layout.\n"
                  "  -h, --help         Show this text.\n",
                  argv0, argv0, argv0, kDefaultWarmup, kDefaultRepeat);
 }
@@ -378,6 +394,14 @@ Options parse_args(int argc, char** argv) {
                 checked_mul(parse_u64(next("flush-mib"), "flush-mib"), 1ULL << 20, "flush bytes");
         } else if (arg == "--csv-out") {
             opt.csv_out = next("csv output path");
+        } else if (arg == "--fp8-data") {
+            opt.fp8_data = next("FP8 input directory");
+        } else if (arg == "--output-bf16") {
+            opt.output_bf16 = next("BF16 output path");
+        } else if (arg == "--epilogue") {
+            opt.epilogue = next("epilogue");
+        } else if (arg == "--marlin-layout") {
+            opt.marlin_layout = true;
         } else if (arg == "--help" || arg == "-h") {
             usage(argv[0]);
             std::exit(0);
@@ -413,6 +437,24 @@ Options parse_args(int argc, char** argv) {
     }
     if (opt.profile && !opt.csv_out.empty()) {
         throw std::invalid_argument("--profile does not write timing CSV");
+    }
+    if (!opt.fp8_data.empty() &&
+        (opt.have_suite || opt.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S || opt.profile)) {
+        throw std::invalid_argument("--fp8-data requires an ordinary explicit FP8BLOCK point");
+    }
+    if (!opt.output_bf16.empty() && (!opt.have_t || opt.profile || opt.have_suite)) {
+        throw std::invalid_argument("--output-bf16 requires one ordinary exact point");
+    }
+    if (opt.epilogue != "linear" && opt.epilogue != "swiglu" && opt.epilogue != "add") {
+        throw std::invalid_argument("--epilogue must be linear, swiglu or add");
+    }
+    if (opt.epilogue != "linear" &&
+        (opt.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S || opt.have_suite || opt.profile)) {
+        throw std::invalid_argument("fused replay requires an ordinary explicit FP8BLOCK point");
+    }
+    if (opt.marlin_layout &&
+        (opt.qtype != QType::FP8_E4M3FN_BLOCK128_BF16S || opt.have_suite)) {
+        throw std::invalid_argument("--marlin-layout requires an explicit FP8BLOCK point");
     }
     return opt;
 }
@@ -496,7 +538,7 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
     return groups;
 }
 
-LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
+LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k, bool marlin_layout) {
     if (qtype == QType::BF16_CTRL) {
         bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(n, k);
         const std::uint64_t model_bytes = direct.model_weight_bytes();
@@ -509,6 +551,13 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
     }
     if (qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         bench::PackedQuantizedWeight packed = bench::make_fp8_weight(n, k);
+        const std::uint64_t model_bytes     = packed.model_weight_bytes();
+        return {std::move(packed.storage), packed.weight, model_bytes};
+    }
+    if (qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
+        bench::PackedQuantizedWeight packed = marlin_layout
+                                                  ? bench::make_marlin_fp8_block_weight(n, k)
+                                                  : bench::make_fp8_block_weight(n, k);
         const std::uint64_t model_bytes     = packed.model_weight_bytes();
         return {std::move(packed.storage), packed.weight, model_bytes};
     }
@@ -607,6 +656,15 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
     return result;
 }
 
+void load_binary_prefix(const std::filesystem::path& path, DeviceBuffer& destination) {
+    std::ifstream input(path, std::ios::binary);
+    std::vector<char> data(destination.bytes);
+    if (!input.read(data.data(), static_cast<std::streamsize>(data.size()))) {
+        throw std::runtime_error("unable to read complete benchmark input: " + path.string());
+    }
+    CUDA_CHECK(cudaMemcpy(destination.p, data.data(), data.size(), cudaMemcpyHostToDevice));
+}
+
 std::vector<Result> run_group(const PointGroup& group, const Options& opt, DeviceBuffer& flush,
                               cudaStream_t stream) {
     const std::int32_t max_t =
@@ -619,17 +677,32 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
             ->t;
     const std::uint64_t x_elements =
         checked_mul(static_cast<std::uint64_t>(group.k), max_t, "activation allocation");
+    const std::int32_t output_rows = opt.epilogue == "swiglu" ? group.n / 2 : group.n;
     const std::uint64_t out_elements =
-        checked_mul(static_cast<std::uint64_t>(group.n), max_t, "output allocation");
+        checked_mul(static_cast<std::uint64_t>(output_rows), max_t, "output allocation");
 
-    LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k);
+    LinearBenchWeight weight = make_weight(group.qtype, group.n, group.k, opt.marlin_layout);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
+    DeviceBuffer initial_residual(opt.epilogue == "add" ? out.bytes : 256);
     const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(
         group.qtype, group.n, group.k, group.policy, min_t, max_t);
     DeviceArena workspace(std::max<std::size_t>(workspace_capacity, 256));
-    fill_activation(x, x_elements, stream);
+    if (opt.fp8_data.empty()) {
+        fill_activation(x, x_elements, stream);
+    } else {
+        const std::filesystem::path directory(opt.fp8_data);
+        load_binary_prefix(directory / "weight.bin", weight.storage);
+        load_binary_prefix(directory / "activation.bin", x);
+    }
     CUDA_CHECK(cudaMemsetAsync(out.p, 0, out.bytes, stream));
+    if (opt.epilogue == "add") {
+        if (opt.fp8_data.empty()) {
+            fill_activation(initial_residual, out_elements, stream);
+        } else {
+            load_binary_prefix(std::filesystem::path(opt.fp8_data) / "residual.bin", initial_residual);
+        }
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     std::vector<Result> results;
@@ -639,12 +712,25 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
 
     for (const BenchPoint& point : group.points) {
         Tensor activation(x.p, DType::BF16, {group.k, point.t});
-        Tensor output(out.p, DType::BF16, {group.n, point.t});
+        Tensor output(out.p, DType::BF16, {output_rows, point.t});
         const auto launch = [&](cudaStream_t launch_stream) {
-            ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
+            if (opt.epilogue == "swiglu") {
+                ops::detail::fp8_block_linear_swiglu_dispatch(
+                    activation, weight.weight, output, launch_stream);
+            } else if (opt.epilogue == "add") {
+                ops::linear_add(activation, weight.weight, output, group.policy, workspace, launch_stream);
+            } else {
+                ops::linear(activation, weight.weight, output, group.policy, workspace, launch_stream);
+            }
+        };
+        const auto prepare = [&](cudaStream_t launch_stream) {
+            if (opt.epilogue == "add") {
+                CUDA_CHECK(cudaMemcpyAsync(out.p, initial_residual.p, output.bytes(),
+                                           cudaMemcpyDeviceToDevice, launch_stream));
+            }
         };
         const bench::ColdTiming timing =
-            bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat);
+            bench::measure_cold_launch(launch, flush, stream, opt.warmup, opt.repeat, prepare);
         Result result = make_result(point, weight, timing, opt);
         if (point.t == 1) { t1_median = result.median_us; }
         if (std::isfinite(t1_median)) {
@@ -657,6 +743,15 @@ std::vector<Result> run_group(const PointGroup& group, const Options& opt, Devic
         if (point.sweep_point) { previous_median = result.median_us; }
         results.push_back(std::move(result));
     }
+    if (!opt.output_bf16.empty()) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<char> words(out.bytes);
+        CUDA_CHECK(cudaMemcpy(words.data(), out.p, words.size(), cudaMemcpyDeviceToHost));
+        std::ofstream destination(opt.output_bf16, std::ios::binary);
+        if (!destination.write(words.data(), static_cast<std::streamsize>(words.size()))) {
+            throw std::runtime_error("unable to write BF16 benchmark output");
+        }
+    }
     return results;
 }
 
@@ -666,7 +761,7 @@ void run_profile(const BenchPoint& point, const Options& opt, DeviceBuffer& flus
         checked_mul(static_cast<std::uint64_t>(point.k), point.t, "activation allocation");
     const std::uint64_t out_elements =
         checked_mul(static_cast<std::uint64_t>(point.n), point.t, "output allocation");
-    LinearBenchWeight weight = make_weight(point.qtype, point.n, point.k);
+    LinearBenchWeight weight = make_weight(point.qtype, point.n, point.k, opt.marlin_layout);
     DeviceBuffer x(checked_mul(x_elements, 2, "activation allocation bytes"));
     DeviceBuffer out(checked_mul(out_elements, 2, "output allocation bytes"));
     const std::size_t workspace_capacity = ops::linear_workspace_capacity_bytes(

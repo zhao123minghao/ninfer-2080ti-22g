@@ -56,12 +56,6 @@ struct Variant {
                                          const MtpAttentionProjectionWeights& weights,
                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
                                          WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_kv_projection(const Tensor& hidden,
-                                  const MtpAttentionProjectionWeights& weights, Tensor& key,
-                                  Tensor& value, WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_q_gate_projection(const Tensor& hidden,
-                                      const MtpAttentionProjectionWeights& weights, Tensor& query,
-                                      Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
     static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
                                      Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
                                      WorkspaceArena& workspace, cudaStream_t stream);
@@ -90,11 +84,8 @@ struct Variant {
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t
-    mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
-    [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                                std::int32_t last);
-    [[nodiscard]] static std::size_t
-    mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
+    mtp_attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
+                                                      std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
                                                   qwen3_6::TextPhase phase, std::int32_t first,
@@ -183,13 +174,11 @@ struct Variant {
                                       qwen3_6::TextPhase phase,
                                       const std::array<WorkspaceArena*, 2>& workspace,
                                       const ExecutionContext& ec, const ops::PeerEvents& ev);
-    // MTP split leaves. `mtp_attention_projection` is column-parallel over the packed
-    // [14336, 5120] parent (shard [7168, 5120], whose row order is q | k | gate | v at the
-    // per-rank section widths) and then splits each rank's own packed block in place;
-    // `mtp_post_mixer` is the MTP layer's swiglu pair, identical in shape to `post_mixer`.
-    // `mtp_kv_projection` / `mtp_q_gate_projection` are the prefill-only section subsets, which
-    // the tp1 leaf fuses with `linear_pair` and which split into independent column-parallel
-    // calls because their two outputs are separate row views of the same shard.
+    // MTP attention projection. Both widths consume the fused `query_key_gate_value` parent and
+    // split each rank's own packed block in place, so the MTP layer needs no per-section row views
+    // of a weight and a persistent layout whose rows are not a contiguous byte range stays
+    // consumable. `mtp_post_mixer` is the MTP layer's swiglu pair, identical in shape to
+    // `post_mixer`.
     static void mtp_attention_projection(const std::array<Tensor, 2>& hidden,
                                          const std::array<const MtpAttentionProjectionWeights*, 2>& w,
                                          const std::array<Tensor, 2>& query,
@@ -198,18 +187,6 @@ struct Variant {
                                          const std::array<Tensor, 2>& value,
                                          const std::array<WorkspaceArena*, 2>& workspace,
                                          const ExecutionContext& ec);
-    static void mtp_kv_projection(const std::array<Tensor, 2>& hidden,
-                                  const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                  const std::array<Tensor, 2>& key,
-                                  const std::array<Tensor, 2>& value,
-                                  const std::array<WorkspaceArena*, 2>& workspace,
-                                  const ExecutionContext& ec);
-    static void mtp_q_gate_projection(const std::array<Tensor, 2>& hidden,
-                                      const std::array<const MtpAttentionProjectionWeights*, 2>& w,
-                                      const std::array<Tensor, 2>& query,
-                                      const std::array<Tensor, 2>& gate,
-                                      const std::array<WorkspaceArena*, 2>& workspace,
-                                      const ExecutionContext& ec);
     static void mtp_post_mixer(const std::array<Tensor, 2>& hidden,
                                const std::array<const MtpPostMixerWeights*, 2>& w,
                                const std::array<Tensor, 2>& residual,

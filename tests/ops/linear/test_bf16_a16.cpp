@@ -44,7 +44,8 @@ std::vector<float> materialize(std::span<const std::uint16_t> bits) {
 std::vector<double> oracle_all_rows(const HostWeight& weight, std::span<const float> activation) {
     std::vector<double> result(static_cast<std::size_t>(weight.n));
     const unsigned available   = std::max(1U, std::thread::hardware_concurrency());
-    const std::int32_t threads = std::min(weight.n, static_cast<std::int32_t>(available));
+    const std::int32_t threads =
+        std::min({weight.n, static_cast<std::int32_t>(available), 8});
     std::vector<std::thread> workers;
     workers.reserve(static_cast<std::size_t>(threads));
     for (std::int32_t thread = 0; thread < threads; ++thread) {
@@ -163,6 +164,20 @@ int run_bf16_linear() {
     for (const std::int32_t tokens : {1, 2, 4, 8, 16, 27, 28, 32, 33, 127, 128, 129, 1024, 1536}) {
         failures += run_bf16_linear_case(output_weight, tokens);
     }
+    DeviceWeight mtp_input_projection(make_patterned(5120, 10240, 421U));
+    failures += run_bf16_linear_case(mtp_input_projection, 2);
+    DeviceWeight mtp_input_projection_shard(make_patterned(5120, 5120, 423U));
+    failures += run_bf16_linear_case(mtp_input_projection_shard, 2);
+    DeviceWeight vocabulary_head_shard(make_patterned(124160, 5120, 431U));
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5}) {
+        failures += run_bf16_linear_case(vocabulary_head_shard, tokens);
+    }
+    DeviceWeight vocabulary_head(make_patterned(248320, 5120, 433U));
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5}) {
+        failures += run_bf16_linear_case(vocabulary_head, tokens);
+    }
+    DeviceWeight dflash_feature_projection(make_patterned(5120, 25600, 419U));
+    failures += run_bf16_linear_case(dflash_feature_projection, 4);
     return failures;
 }
 

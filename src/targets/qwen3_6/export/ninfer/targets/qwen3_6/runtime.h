@@ -188,6 +188,9 @@ public:
     [[nodiscard]] std::span<const std::uint16_t> last_round_logits_bf16() const noexcept;
     void enable_logits_capture(bool enabled);
 
+    [[nodiscard]] std::span<const std::uint16_t> last_prefill_layers_bf16() const noexcept;
+    void enable_layer_capture(bool enabled);
+
     // Debug-only, OFF by default: after each MTP decode round at tp == 2, compare rank 1's MTP
     // egress record with rank 0's. The ranks run the acceptance Op over bit-identical inputs, so
     // the records are argued to agree; enabling this measures it instead. Off, execution is

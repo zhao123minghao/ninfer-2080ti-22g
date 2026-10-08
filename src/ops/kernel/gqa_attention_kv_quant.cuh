@@ -13,6 +13,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cstdint>
 
@@ -85,6 +86,57 @@ __device__ __forceinline__ int4 gqa_kv_dequant_i8x8_f16_from(const std::int8_t* 
     for (int i = 0; i < 4; ++i) {
         packed[i] = __floats2half2_rn(static_cast<float>(c[2 * i]) * s,
                                       static_cast<float>(c[2 * i + 1]) * s);
+    }
+    return *reinterpret_cast<const int4*>(packed);
+}
+
+// --- fp8 (E4M3) KV codec ----------------------------------------------------------------
+//
+// The fp8 KV cache stores the bf16 K/V activations as E4M3 codes with no per-group scale plane
+// (the E4M3 exponent already covers the KV activation range). Quantization is one bf16->E4M3
+// cast at append; dequantization is the same ALU bit transform the weight path uses (FP8 exp plane
+// shifted one bit into the fp16 position, then x256 to restore the exponent bias), which is exact
+// for normals and subnormals and maps the 0x7f/0xff NaN payloads to +/-Inf.
+
+__device__ __forceinline__ std::uint8_t gqa_kv_quant_fp8(float x) {
+    return __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+}
+
+// Quantize 8 consecutive bf16 activations (16 bytes, one int4) into 8 packed fp8 codes
+// (8 bytes, one int2), in d order. Mirrors the bf16 prefill fill kernel's 8-element vector
+// granularity so the fp8 fill kernel writes one cache-aligned 8-byte vector per element.
+__device__ __forceinline__ int2 gqa_kv_quant_fp8x8_bf16(const int4 raw_bf16x8) {
+    const __nv_bfloat16* b = reinterpret_cast<const __nv_bfloat16*>(&raw_bf16x8);
+    int2 out;
+    std::uint8_t* o = reinterpret_cast<std::uint8_t*>(&out);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        o[i] = gqa_kv_quant_fp8(__bfloat162float(b[i]));
+    }
+    return out;
+}
+
+__device__ __forceinline__ __half2 gqa_kv_dequant_fp8x2_f16(std::uint16_t packed) {
+    const unsigned q = packed;
+    constexpr unsigned kMask = 0x7F007F00u;
+    const unsigned first = (q & 0x80008000u) | ((q & kMask) >> 1);
+    const unsigned second = ((q << 8) & 0x80008000u) | (((q << 8) & kMask) >> 1);
+    const unsigned combined = (second & 0xFFFFu) | ((first & 0xFFFFu) << 16);
+    const __half2 shifted = *reinterpret_cast<const __half2*>(&combined);
+    return __hmul2(shifted, __half2half2(__ushort_as_half(0x5C00u)));  // x 2^8
+}
+
+// Dequantize 8 consecutive fp8 codes into 8 fp16 packed as an int4 (one 64-bit load). No scale
+// plane: the fp8 storage is the only plane. Volta/Turing mma.sync takes fp16 operands.
+__device__ __forceinline__ int4 gqa_kv_dequant_fp8x8_f16_from(const std::uint8_t* codes8) {
+    const int2 raw            = load_vec<int2>(codes8);
+    const std::uint8_t* c     = reinterpret_cast<const std::uint8_t*>(&raw);
+    __half2 packed[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const std::uint16_t pair = static_cast<std::uint16_t>(c[2 * i]) |
+                                   (static_cast<std::uint16_t>(c[2 * i + 1]) << 8);
+        packed[i] = gqa_kv_dequant_fp8x2_f16(pair);
     }
     return *reinterpret_cast<const int4*>(packed);
 }

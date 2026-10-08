@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -422,32 +423,37 @@ int run_batch_case(const Geometry& geometry, DType dtype, const BatchAttentionCa
     return failures;
 }
 
-int run_batch_cases() {
+int run_batch_cases(bool fp16_only) {
     int failures = 0;
-    failures += run_batch_case(kGeometries[0], DType::I8,
-                               {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
+    if (!fp16_only) {
+        failures += run_batch_case(kGeometries[0], DType::I8,
+                                   {6, {127}, {3}, {0}, MappingPattern::Identity, 499u});
+    }
     failures += run_batch_case(kGeometries[0], DType::FP16,
                                {16, {49}, {7}, {0}, MappingPattern::Identity, 500u});
     failures += run_batch_case(kGeometries[0], DType::FP16,
                                {1, {63, 2048}, {1, 1}, {1, 0}, MappingPattern::Fragmented, 501u});
-    failures += run_batch_case(kGeometries[1], DType::I8,
+    if (!fp16_only) {
+        failures += run_batch_case(kGeometries[1], DType::I8,
                                {1,
                                 {0, 31, 63, 127, 511, 1023, 2047, 4095},
                                 {1, 1, 1, 1, 1, 1, 1, 1},
                                 {7, 0, 5, 2, 6, 1, 4, 3},
                                 MappingPattern::Identity,
                                 502u});
-    failures +=
-        run_batch_case(kGeometries[0], DType::I8,
-                       {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
+        failures += run_batch_case(
+            kGeometries[0], DType::I8,
+            {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
+    }
     failures += run_batch_case(kGeometries[1], DType::FP16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
     return failures;
 }
 
-int run_geometry(const Geometry& geometry) {
+int run_geometry(const Geometry& geometry, bool fp16_only) {
     int failures = 0;
-    for (const DType dtype : {DType::FP16, DType::I8}) {
+    for (const DType dtype : {DType::FP16, DType::I8, DType::FP8_E4M3FN}) {
+    if (fp16_only && dtype != DType::FP16) { continue; }
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
             failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
@@ -511,7 +517,7 @@ int run_int8_split_policy_cases() {
 
 int verify_workspace_capacity_contract() {
     int failures = 0;
-    for (const DType dtype : {DType::FP16, DType::I8}) {
+    for (const DType dtype : {DType::FP16, DType::I8, DType::FP8_E4M3FN}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
             ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 1, 17);
@@ -550,11 +556,18 @@ int main() {
     }
 
     int failures = 0;
+    const bool fp16_only = std::getenv("NINFER_GQA_FP16_ONLY") != nullptr;
     failures += verify_workspace_capacity_contract();
-    for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
-    failures += run_int8_split_policy_cases();
-    failures += run_batch_cases();
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_geometry(geometry, fp16_only);
+    }
+    constexpr Geometry tp2_geometry{"qwen3_6_27b_tp2", 12, 2};
+    failures += run_a1_case(tp2_geometry, DType::FP16, {129, 127, 256, 701u},
+                            MappingPattern::Fragmented);
+    if (!fp16_only) { failures += run_int8_split_policy_cases(); }
+    failures += run_batch_cases(fp16_only);
     std::cout << (failures == 0 ? "PASS" : "FAIL")
-              << " gqa_attention public-contract correctness\n";
+              << " gqa_attention public-contract correctness"
+              << (fp16_only ? " (FP16 slice)\n" : "\n");
     return failures == 0 ? 0 : 1;
 }

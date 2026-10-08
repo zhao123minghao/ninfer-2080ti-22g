@@ -138,6 +138,16 @@ struct NullTap {
     static constexpr bool enabled = false;
 };
 
+struct LastColumnLayerCapture {
+    static constexpr bool enabled = true;
+
+    std::span<std::uint16_t> output;
+    std::int32_t column = -1;
+
+    void begin(const Tensor& value, cudaStream_t stream);
+    void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
+};
+
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
@@ -159,7 +169,7 @@ struct DFlashFeatureSink {
     std::uint32_t captured_mask = 0;
     std::int32_t active_tokens  = 0;
 
-    void begin(const Tensor& value);
+    void begin(const Tensor& value, cudaStream_t stream);
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
     void capture_positions(const Tensor& source, cudaStream_t stream);
     void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
@@ -265,6 +275,10 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
+                  std::uint32_t nominal_length, bool finalize_at_end,
+                  LastColumnLayerCapture& layer_capture);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_6::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
@@ -403,7 +417,8 @@ private:
                       const std::array<Tensor, 2>& staging);
     void run_layers_tp2(std::array<Tensor, 2>& x, Phase phase,
                         const std::array<Tensor, 2>& staging,
-                        DFlashFeatureSink* dflash_sink = nullptr);
+                        DFlashFeatureSink* dflash_sink = nullptr,
+                        LastColumnLayerCapture* layer_capture = nullptr);
     // Vocabulary-split head: each rank computes its own half of the logits, then one allgather
     // per column leaves the FULL logits on both ranks. Sampling then runs on rank 0 alone.
     void logits_tp2(const std::array<Tensor, 2>& hidden, Tensor& logits,
@@ -502,7 +517,8 @@ private:
     [[nodiscard]] PrefillChunkResult prefill_impl_tp2(std::span<const int> ids,
                                                  const TextPrefill& text_prefill,
                                                  bool finalize_at_end,
-                                                 DFlashFeatureSink* dflash_sink = nullptr);
+                                                 DFlashFeatureSink* dflash_sink = nullptr,
+                                                 LastColumnLayerCapture* layer_capture = nullptr);
     DeviceContext& ctx_;
     const LoadedModelData& weights_;
     WorkspaceArena& work_;

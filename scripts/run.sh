@@ -8,7 +8,8 @@
 #   DEVICES      0,1                    (env NINFER_DEVICES)
 #   TP           2                      (env NINFER_TP)
 #   MAX_CONTEXT  262144                 (env NINFER_MAX_CONTEXT)
-#   KV_DTYPE     fp16                   (env NINFER_KV_DTYPE; int8 for more KV capacity)
+#   KV_DTYPE     fp16                   (env NINFER_KV_DTYPE; fp8 halves the footprint without
+#                                         int8's accuracy loss; int8 when capacity matters most)
 #
 # Usage:
 #   scripts/run.sh "your prompt"                 # greedy-ish defaults, your prompt

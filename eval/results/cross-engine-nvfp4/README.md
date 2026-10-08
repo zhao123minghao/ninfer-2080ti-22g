@@ -1,19 +1,20 @@
 # Cross-engine NVFP4 long-context throughput artifacts (500 W per GPU)
 
-The measured artifacts behind the cross-engine section of
-[`docs/performance.md`](../../../docs/performance.md): NInfer `--tp 2` with YaRN x4 against vLLM
-0.25.1 `--tensor-parallel-size 2`, on the same pair of RTX 5090s, at three context tiers
-(250k / 653k / 700k tokens) on byte-identical prompts.
+The measured artifacts behind the cross-engine campaign (one line of which is retained in
+[`docs/performance.md`](../../../docs/performance.md#inherited-rtx-5090-campaigns-archived)): NInfer
+`--tp 2` with YaRN x4 against vLLM 0.25.1 `--tensor-parallel-size 2`, on the same pair of RTX 5090s,
+at three context tiers (250k / 653k / 700k tokens) on byte-identical prompts. This directory is the
+authoritative record for that comparison.
 
 **Power condition.** Every row here was taken with **both GPUs capped at 500 W**. That is a third
-power condition, distinct from the 400 W campaign and the 575 W re-measurement that produce the
-other numbers in `docs/performance.md`. Rows from the three conditions are not comparable with each
+power condition, distinct from the 400 W campaign and the 575 W re-measurement archived under
+`eval/results/`. Rows from the three conditions are not comparable with each
 other, and no figure from this directory should be quoted without its 500 W label. The cap was
 captured from `nvidia-smi` before every server launch (`*.power.txt`) and sampled every 3 s
 throughout each run (`*.vram.csv`).
 
-**Read the caveats first.** [`summary.md`](summary.md) section 5 is the binding caveat list, and
-`docs/performance.md` repeats it. In short: the two engines ran different NVFP4 quantizations of
+**Read the caveats first.** [`summary.md`](summary.md) section 5 is the binding caveat list. In
+short: the two engines ran different NVFP4 quantizations of
 different Qwen3.8-27B fine-tunes and different KV dtypes (FP8 against INT8), the prefill chunk sizes
 differ and were not swept, vLLM has no MTP-off row, there is one measurement per cell, and no
 quality or correctness claim is made — this is throughput only.
@@ -41,7 +42,7 @@ quality or correctness claim is made — this is throughput only.
 
 The `.log` files these runs wrote — both engines' server logs and the run driver logs — stay on the
 measurement host and are not tracked here, under the repository-wide `*.log` ignore rule. Every
-figure quoted in `summary.md` and in `docs/performance.md` comes from the tracked `.txt`, `.jsonl`
+figure quoted in `summary.md` comes from the tracked `.txt`, `.jsonl`
 and `.csv` files above.
 
 ## Reproducing

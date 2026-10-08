@@ -239,6 +239,16 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
 void allgather_rows(const std::array<Tensor, 2>& destination, const std::array<Tensor, 2>& part,
                     const ExecutionContext& ec, const PeerEvents& events);
 
+/**
+ * Exact one-way gather of column-major shards to rank 0. `destination` is `[C0+C1,T]` on rank 0
+ * and `part[r]` is `[Cr,T]` on rank r. Each output column concatenates rank 0's leading rows and
+ * rank 1's trailing rows. The source tensors remain unchanged; rank 1's stream is ordered after
+ * rank 0 has consumed its shard, including with pinned host staging and CUDA Graph capture.
+ * Requires `ec.tp == 2` and live `events`; all storage is caller-owned.
+ */
+void gather_columns_rank0(const Tensor& destination, const std::array<Tensor, 2>& part,
+                          const ExecutionContext& ec, const PeerEvents& events);
+
 // Exact one-way relocation from rank 0 to rank 1. Both tensors have the same contiguous
 // dtype and shape. Uses the qualified direct/staged transport and orders rank 0's next
 // overwrite after rank 1 has consumed the source, including under CUDA Graph capture.
