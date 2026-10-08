@@ -35,6 +35,34 @@
   其中基座轮 57.40 → 64.06 ms）。我们的长度相关成本 ≈0.125 ns/context-token，是 FP16 KV
   纯字节下限（34.8 KB/token/卡 ÷ 616 GB/s ≈ 0.055）的 2.2×，多出的 ~3.7 ms/轮不在 KV 字节。
   ⇒ **下一个靶子：长上下文 decode 的长度相关段（attention / draft 侧）**。
+- **§110 decode 归因（已完成，量化到内核）**：长度相关成本**100% 是 decode attention 一个内核**
+  （85k→139k：attention 14.54→22.30 ms/轮 = +7.76，占窗口增长 +7.63 的 102%；fp8 linear/swiglu
+  完全平：23.97→24.03 / 16.06→16.07）。而它**只跑到 KV 字节下限的 5.7×**：达成带宽
+  101.8→108.4 GB/s = 峰值的 17%，**且不随长度变化** ⇒ 不是带宽受限，是一个固定速率的引擎。
+  发射几何实测 `grid=(2,136)`、regs=182、static smem=25,832 B ⇒ 2 blocks/SM = 8 warp/SM = 25%
+  理论占用，`Br=32` 被 mma.m8n8k4 的 quadpair 钉死。量化上限：139k 时 18.4 ms/轮 ≈ 轮长 23%。
+- **§110 跨引擎基座轮逐项对拍（已完成，85k、双方无投机 + fp16 KV）**：窗口/步 我们 57.95 vs
+  他们 38.50 = **1.51×**；增长 19.45 ms 的构成 = **权重 GEMM +13.31（68%，1.57×）** +
+  **attention +5.53（28%，1.97×）** + 空隙 +4.14 − 其它内核 3.53；LM head 两边都是 2.17 ms。
+  ⇒ **孤立叶子只差 1.09× 而在位权重 GEMM 是 1.57×** —— 悬案从"叶子速率"转到"64 层链的每次
+  发射/结构开销"；attention 在位 1.97× 是第二个独立靶子。
+  ⇒ **下一批动作（按证据）：①在位权重 GEMM 的 13.3 ms 分解（内核级分开"字节地板/发射次数/
+  依赖链"）；②attention 的 3 blocks/SM 候选（`Bc` 8→4 + 削 pad 到 ≤20,821 B，或 warp 间 split-K）。**
+- **§110 项 1 收口：`DecodeSplitScale = 2` 不需要 A/B。** 实测 grid=(2,136) = 272 CTAs，而驻留
+  136 块 ⇒ 恰好两个满波、零尾波浪费，与该头文件自己的推导一致；可动项只剩 reduce（1.03 ms/轮
+  = attention 的 7%），splits 减半最多省 ~0.7%。**从"几个百分点"降级为 <1%。**
+- **§111 修正 + 定位 + 一条已否证的修复**：
+  ① **§104 的"孤立叶子 1.09×"是在大 T（计算受限）形状上量的，而 decode 权重 GEMM 是 T=1
+  纯带宽受限（2 FLOP/byte），两者不可比** —— 这是本轮修正的一个体制错误。
+  ② **在位带宽：我们 385 GB/s = 峰值的 62.5%，他们 576 GB/s = 93.5%**（他们权重只少 4.4%，
+  取自其 server 日志 14.28 GiB）⇒ 权重 GEMM 的 1.57× 就是 DRAM 利用率差。
+  ③ **ncu 定位：叶子卡在 L1/TEX（74.5%）而不是 DRAM（51.6%）**，L1 命中率 79.7% 说明请求量
+  约为 DRAM 流量的 5 倍；机制是**激活地址不含 row**，每个 warp / 每个 row-block 重读同一份激活
+  （每 K-tile：权重 4 sectors vs 激活 32 sectors）。
+  ④ **修复"每 warp 多行、共享激活读"已实测否证并回退**：内核级完全按设计生效（L1 74.6→65.4%、
+  命中 79.7→67.8%、同形状 Duration −3.7%、数值逐位不变），但引擎级 **R=2 慢 2.3%**，因为
+  `n=5120` 形状退 **+15.8%**，吃掉其余形状全部收益。选择性启用净值仅 −0.64%（在 ±3% 噪声内），
+  **不值得加形状条件分支**。⚠️ 下一步必须先解释 `n=5120` 为何退 15.8%，再碰这个叶的粒度。
 - **§107 q4（groupwise-int）控制组复验：未受影响。** FP8 的改动只在
   `src/ops/linear/fp8_block/`（未跟踪新文件）与文档里，所有 `NINFER_FP8_BLOCK_*` 旋钮都是
   fp8_block 私有；Q4/Q5/W8 端到端 32,066 token prefill **1221.45 t/s**（控制值 1,220.70）、
@@ -47,8 +75,31 @@
      65,536 B ⇒ `cudaFuncSetAttribute` 失败后 abort（**5..32 token 必崩**）。需像
      `gqa_attention_prefill_common.cuh` 那样加 `NINFER_SM75` 变体。本机磁盘 artifact 走不到
      （groupwise-int 绑 Q5），但是 `nvfp4` 身份的潜在崩溃点。
-  3. 另有 24 项失败落在工作树其它已改区域（三个协议 schema 测试、int8 attention 判据、
-     chat template、UTF-8 decoder、bench support、swiglu split 的 NVFP4 T=17 断言），未逐条定位。
+  3. 另有 23 项失败落在工作树其它已改区域（三个协议 schema 测试、int8 attention 判据、
+     chat template、UTF-8 decoder、swiglu split 的 NVFP4 T=17 断言），未逐条定位。
+     （原 24 项里的 `ninfer_bench_support_test` 已由 §109 证实是**过期断言**并清除。）
+- **§109 YaRN 核查与扩展窗口实测（已交付）**：YaRN 早已完整实现（独立 kernel + 家族运行时
+  建表 + fp16/int8/fp8 三条 decode KV 的 split bound 重定标），FP8 block128 身份本来就准入
+  `--rope yarn`，**模型侧零改动**。本目标真实缺的是接口：`--kv-dtype fp8` 被 CLI 拒绝，
+  而 README/docs 都把它记为已交付契约、`ninfer_bench`/`ninfer-serve` 都接受 ⇒ 已修 CLI、
+  修正 fp8 的汇报串（原会误报 `int8-group64`）、清掉一条过期 bench 断言（§108 表减一条）、
+  并补上 `--yarn-origin × --yarn-factor` 必须落在整数 token 的文档。
+  **容量（实测，投机后端必须分开列）**：fp16 KV 上限 153,984 **低于**原生 262,144 ⇒ YaRN 在该
+  配置下无用；fp8 KV **无投机** 300,000（320,000 需 7.13 GB、只有 6.89 GB 可用）；fp8 KV +
+  **MTP3 + `--lm-head-draft`** 只剩 **254,000**（开 MTP3 先吃 417 MB 运行时预算）。
+  ⇒ **254,000 < 原生 262,144：在本项目的验收 lane 上 `--rope yarn` 一点窗口都买不到**，因为是
+  显存够不到原生窗口，不是 YaRN 扩展不足；+14.4% 只属于无投机配置。254,000 是贴边值（剩
+  172 MiB），实用取 250,000。
+  ⇒ **瓶颈是 22 GB 显存而不是 RoPE 上限**；32 GB 卡上的 1M 是显存差异，不是能力差异。
+  ⚠️ 顶端失败模式会换手：259,200/260,000 被规划器的预留检查拒绝，而 **256,000 通过检查后死在
+  `cudaMalloc`** ⇒ 显式 `--max-context` 的预留估算比真实分配乐观几 MB。
+  **检索（实测）**：native 261,000 / yarn×1.125 272,000 / yarn×4 272,000 / **MTP3 lane 244,000
+  （容量 254,000）** 四点全 PASS。证据边界：单 needle、单深度、粗门 ⇒ 只证明「跨过原生上限后
+  检索未被破坏」，**不能**分辨因子好坏（×4 也过）。
+  ⚠️ 探针陷阱已修：prompt 占满窗口时引擎 `finish reason context-capacity` 只出 1 token，那是
+  构造错误不是检索失败；`.scratch/yarn_needle.sh` 现在判 `NOWINDOW`。
+  **下一靶子：因子—窗口匹配的质量判据（多深度/多 needle 或困惑度），以及 YaRN 的同会话
+  A/B prefill 开销。**
 
 ## 为什么推翻：sm_75 没有 cp.async，staging 模型是错的
 

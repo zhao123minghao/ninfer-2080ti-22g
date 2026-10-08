@@ -411,6 +411,7 @@ CSVs carry their own power condition; the earliest campaign CSVs do not.
 | Concurrency C=2 at 575 W | Not re-measured; C=1 and C=4 were |
 | A seeded temperature > 0 soak | Not run. The soak is greedy, which is what makes its two passes hash-comparable; a sampled soak needs a seeded run and a different determinism criterion |
 | Decode split policy at 1M | Tuned at 262k. Smooth rather than pathological at 1M, but the last graph profile spans [32768, 1,048,575] with a fixed `gridDim.y = 85` and has not been swept at that length |
+| Factor-to-window matching | Open, and newly owned by this note. YaRN works in both directions from the window it was tuned for, but the factor is expected to matter: a factor chosen for 1M applied to a 272K prompt compresses positions against a frequency table built for a 4x longer domain. The 22 GB target's single-needle probe passes at both x1.125 and x4 and therefore cannot discriminate, so this needs a multi-depth or multi-needle criterion |
 | Attention `DecodeSplitScale = 2` at tp2 | Derived, not benchmarked |
 | `kernel_attr_once`'s per-launch cost on tp1 | Estimated negligible against an ~8 ms decode step; never measured |
 
@@ -496,6 +497,15 @@ capture and transport probes all live in `tools/tp2/`. The 1M needle, soak and p
 - **1,048,576 tokens is a one-slot configuration**, by arithmetic rather than policy: the per-slot
   sequence cost is 16.66 GiB per device, so a second slot cannot fit on a 32 GiB card. Concurrency
   at extended context requires coming down from the ceiling — roughly 500k for two slots at INT8 KV.
+- **On a 22 GB card the same arithmetic gives a much lower ceiling, and the KV dtype decides it.**
+  Measured on the two-2080-Ti target: an FP16 pool caps the window at 153,984 tokens, *below* the
+  artifact's own 262,144, so YaRN cannot engage at all there; an FP8-E4M3 pool reaches 300,000, and
+  320,000 misses by 239 MB. The speculative backend is part of that budget rather than a free
+  addition: enabling MTP3 with the draft head costs 417 MB of runtime reservation, which drops the
+  FP8 ceiling to **254,000** -- again *below* the native 262,144 window, so on that pair YaRN adds no
+  window in the acceptance lane at all and only the no-speculation configuration gains the ~14%. The
+  binding constraint is device memory rather than the rope domain. See
+  [Performance](../performance.md) and `history.md` section 109.
 
 ---
 

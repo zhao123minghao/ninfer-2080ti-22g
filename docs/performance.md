@@ -744,6 +744,107 @@ an artefactually fast prefill (time-to-first-token moved only 77.2 to 79.2 s fro
 runs here disable prefix caching explicitly. The external profiling tool also defaults to a
 time-to-first-token read timeout near 90 s, which 139K exceeds.
 
+### Base round against the external stack on this target
+
+The 1.504x base-round gap at 32K/512 was measured long before its cause was located. This is the
+matched decomposition at 85,070 occupied tokens, **both stacks without speculation and both on
+FP16 KV**, so the two columns are the same workload:
+
+| Component | NInfer ms/step | External ms/step | Ratio |
+|---|---:|---:|---:|
+| Weight GEMM | **36.69** | **23.38** | **1.57x** |
+| Decode attention | **10.92** | **5.54** | **1.97x** |
+| LM head | 2.17 | 2.17 | 1.00x |
+| Other kernels | 2.16 | 5.69 | 0.38x |
+| Kernel total | 51.94 | 36.63 | 1.42x |
+| In-window gap | 6.01 | 1.87 | 3.2x |
+| **Window per step** | **57.95** | **38.50** | **1.51x** |
+
+The external column is its own no-speculation profile (`nomtp-fp16kv-1x176K-text-only.env`) driven by
+its `profile_request.py --pure-filler` (ttft 77.42 s, prefill 1,098.8 tok/s, decode 26.64 tok/s =
+37.5 ms/step); the local column is this checkout's CLI on the same generated prompt (prefill
+1,032.9 tok/s, decode 17.32 tok/s). Its steps are delimited by the per-step sampling kernel and only
+the settled suffix (gaps under 0.1 s) is used, which is the conservative choice -- the earlier steps
+are inflated by CUDA-graph capture.
+
+Of the 19.45 ms difference, **weight GEMM carries +13.31 ms (68%)**, **attention +5.53 ms (28%)**,
+the in-window gap +4.14 ms, and the external side's other kernels are 3.53 ms *larger* than ours.
+Three things follow:
+
+- **The isolated leaf is 1.09x but the in-situ weight GEMM is 1.57x.** The 13.31 ms is therefore
+  mostly not the leaf's MIO rate; it is per-launch and structural cost inside the 64-layer chain.
+  This closes the old "1.504x base round but 1.09x leaf" puzzle as an in-situ effect, and it says
+  the next weight-side work must be measured at the round level, not at the leaf level.
+- **Attention is 1.97x in situ**, far worse than any leaf figure, and it agrees with the length
+  scaling above where attention is the only component that grows with context and runs at ~17% of
+  achievable bandwidth. It is the second independent target.
+- The gap column is not a like-for-like split of kernel versus bubble: this checkout's all-reduce is
+  a device-to-device copy rather than a kernel, so it does not appear in kernel time, while the
+  external stack's `cross_device_reduce_1stage` does (2.48 ms/step, 129 launches/step). The ratio in
+  that row alone is therefore not a conclusion. The LM head matching exactly at 2.17 ms on both
+  sides is the independence check.
+
+See `history.md` section 110 for the profiles, the step-window method and the raw per-family rows.
+
+### YaRN on this target
+
+`--rope yarn` is already a complete route for the registered 27B identities, including the
+block-FP8 one: the family runtime builds the corrected inverse-frequency table
+(`src/targets/qwen3_6/impl/runtime/yarn_rope.cpp`), a dedicated kernel applies it
+(`rope_yarn_text_kernel`, deliberately not a mode inside the native rope), the `mscale` reaches the
+rope path only, and all three decode-KV variants -- FP16, INT8-G64 and FP8-E4M3 -- carry per-split
+bounds rescaled for the post-YaRN key domain. Nothing on the model side had to change to enable it
+here; [history.md](../history.md) section 109 records the audit.
+
+**The window this target gains is set by memory, not by the RoPE ceiling**, and the speculative
+backend is part of that budget. Short prompt, FP8 KV, TP2 `0,1`:
+
+| KV dtype | Speculative backend | Extended ceiling on 2x22 GB | Runtime available |
+|---|---|---:|---:|
+| `fp16` | -- | **153,984** -- below the native 262,144, so YaRN never engages | -- |
+| `fp8` | none | **300,000** (320,000 needs 7,131,949,056 B against 6,892,808,192) | 6,892,808,192 B |
+| `fp8` | MTP3 + `--lm-head-draft` | **254,000** fits, 256,000 does not | 6,475,399,424 B |
+
+Enabling MTP3 costs 417 MB of runtime budget before a single token is cached, so the same cards hold
+about 15% fewer tokens with it than without -- and the resulting 254,000-token lane sits **below the
+artifact's own 262,144-token window**. In the acceptance lane `--rope yarn` therefore buys no window
+at all: the limit is not that YaRN extends too little, it is that memory does not reach even the
+native ceiling. YaRN's +14% belongs to the no-speculation configuration only. A 16-bit pool cannot
+reach the native window in any configuration, which is why `fp8` is the dtype of interest here. For
+scale, the [inherited campaign](maintainer/tp2-yarn-1m.md) recorded a 4x window on the 32 GiB
+RTX 5090.
+
+Two edges to know before using the top of that range. 254,000 is a razor-thin fit -- 172 MiB free
+after startup, 85.89 MiB of planned slack -- so treat 250,000 (238 MiB free) as the working setting
+rather than the last value that boots. And the failure changes character at the top: 259,200 and
+260,000 are rejected by the planner's own reservation check with the exact byte shortfall, while
+256,000 passes that check and then fails in `cudaMalloc` during peer transport startup (with the
+devices otherwise empty), so the explicit `--max-context` reservation estimate is a few MB
+optimistic against real allocation.
+
+**Retrieval survives the crossing.** One needle at 50% depth in a `" the"` haystack (exact token
+counts: N repetitions report N+49 prompt tokens), greedy, thinking disabled, passphrase required in
+the answer:
+
+| Rope | Speculative backend | Ceiling | Prompt tokens | Prefill tok/s | Result |
+|---|---|---:|---:|---:|---|
+| native | none | 262,144 | 261,000 | 518.5 | pass |
+| yarn x1.125 | none | 294,912 | 272,000 | 502.3 | pass |
+| yarn x4.0 | none | 1,048,576 | 272,000 | 501.4 | pass |
+| yarn x4.0 | MTP3 | 1,048,576 (capacity 254,000) | 244,000 | 540.1 | pass |
+
+All rows use FP8 KV on TP2 `0,1`; the native row is the in-window control, and every YaRN row sits
+above the 262,144 native ceiling. The MTP3 row is the acceptance lane and is shorter because that
+lane's capacity is lower; its 540.1 tok/s is length, not a YaRN or MTP benefit -- the length trend
+across the four rows is monotone. Decode in the MTP3 row is 38.5 tok/s against 12.4 for the same
+length without speculation, which is what MTP3 itself buys. Every row leaves generation room: a
+prompt that already fills `--max-context` generates one token and stops with `finish reason
+context-capacity`, which is not a retrieval result. **Scope of this evidence:** these are single
+needles at a single depth, so they establish that retrieval is not destroyed by the crossing -- they
+do **not** discriminate factor quality, because the x4 factor (a 1M setting, applied to a 272K
+prompt) passes the same probe. Matching factor to window remains an open quality question. No
+same-session A/B of YaRN prefill against native at equal length was taken.
+
 ## Concurrent decode on the Turing target
 
 A decode round is formed over every active request, so a round's width is

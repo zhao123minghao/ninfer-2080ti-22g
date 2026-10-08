@@ -10695,3 +10695,336 @@ NVFP4 A4 / FP8 A8 需要 sm_120a / sm_100a：`linear_split`、`linear_add_split`
 exp 落到 15..10、mantissa 落到 9..7、2^8 偏折进 scale），normal 与 subnormal 均精确，
 与文档一致；`launch_hmma` / `launch_swiglu_hmma` 的 `Stages×NoFold×AluDecode` 枚举完整无缺支；
 fp8_block 的 `MaxDynamicSharedMemorySize` 申请值（swiglu 49.15 KB 等）都在 sm_75 上限内。
+
+---
+
+## §109 YaRN 核查：能力早已存在，本目标的瓶颈是显存而不是 RoPE；顺带修复 CLI 的 fp8 KV 契约（2026-10-08）
+
+本轮起点是「把 YaRN 集成到我们的模型中」。核查结果是：**YaRN 不是待集成功能**，
+模型侧不需要任何改动；本目标真正缺的是两处接口契约。
+
+### 109.1 实现面核查（YaRN 已完整接线）
+
+| 组成 | 位置 |
+|---|---|
+| 独立 YaRN kernel | `src/ops/kernel/rope.cuh:117-135`（`rope_yarn_text_kernel`，刻意不做成 native rope 的 mode 分支） |
+| launcher | `src/ops/launcher/rope.cu:170-248`（`launch_yarn` / `launch_yarn_text`，TextMrope 与 Text1D 两态） |
+| 建表与准入 | `src/targets/qwen3_6/impl/runtime/yarn_rope.{h,cpp}` |
+| decode KV per-split bound | fp16/int8/fp8 三条都已按 YaRN 后的 key 域重定标：`gqa_attention_decode.cuh:66`、`..._i8_tc_volta.cuh:131`、`..._fp8_tc_volta.cuh:132` |
+| 身份准入 | `qwen3_6_27b/impl/variant.h:43` `supports_yarn_rope = true`（覆盖该 package 全部身份，含 FP8 block128）；35B-A3B 无 YaRN 域，按设计拒绝 |
+| CLI / serve | `--rope native\|yarn`、`--yarn-factor`、`--yarn-origin` 两侧都有；`mscale` 全在 rope 路径内 |
+
+无 TODO / stub。`--rope yarn` 与 `--vision`、`--spec dflash` 互斥是既有设计约束，不是缺口。
+
+### 109.2 结论一：本目标的 YaRN 收益被显存吃掉
+
+容量实测（FP8 block128，TP2 `0,1`，`--rope yarn`，短 prompt 只测容量）。**投机后端是显存预算的一部分，必须分开列**：
+
+| KV dtype | 投机后端 | 扩展上限（2×22 GB） | 运行时可用 |
+|---|---|---:|---:|
+| `fp16` | — | **153,984** | — |
+| `fp8` | 无 | **300,000** | 6,892,808,192 B |
+| `fp8` | MTP3 + `--lm-head-draft` | **254,000** | 6,475,399,424 B |
+
+`--max-context 320000 --kv-dtype fp8`（无投机）需 `7,131,949,056 B`，只有 `6,892,808,192 B`
+可用（差 239 MB）；`--max-context 300000` 通过：KV payload 4.58 GiB、`planned device total`
+21.24 GiB、启动后仅剩 186 MiB。
+
+**MTP3 修正了结论**。开 MTP3 + `--lm-head-draft` 先吃掉 **417 MB** 运行时预算（6,892,808,192 →
+6,475,399,424 B），于是同样的卡少装约 15% 的 token：无投机 300,000，MTP3 只有 **254,000**
+（254,000 成立 / 256,000 不成立）。**而 254,000 < artifact 自己的原生 262,144** —— 也就是说在
+本项目的验收 lane 上 `--rope yarn` **一点窗口都买不到**：不是 YaRN 扩展不足，而是连原生窗口都
+够不到，+14.4% 只属于无投机配置。
+
+两个上界处的事实：254,000 是**贴边**配置（启动后剩 172 MiB、planned slack 85.89 MiB），
+实用值应取 250,000（剩 238 MiB）；且失败模式在顶端会换手—— 259,200 / 260,000 被规划器自己的
+预留检查拒绝并给出精确字节差，而 **256,000 通过检查后死在 `cudaMalloc`**（`peer transport
+startup: cudaErrorMemoryAllocation`，GPU 残留为 0 时也一样）⇒ 显式 `--max-context` 的预留
+估算比真实分配乐观几 MB。
+
+即：29 GiB / 32 GiB 卡上的 1,048,576 是**显存**差异，不是能力差异。`docs/maintainer/tp2-yarn-1m.md`
+§9 的「1M 是单槽配置」在本目标上退化为「无投机约 300k、MTP3 约 254k 是单槽配置」。
+
+### 109.3 结论二：跨过原生上限后检索仍然成立
+
+探针（`.scratch/yarn_needle.sh`）：haystack = `" the"×N`（token 数精确可控，N+49 即 prompt
+tokens；8,000 填充实测 8,049），needle 为唯一口令 `ZQ-7731-KXR`，插在 50% 深度，greedy +
+`--no-thinking`，输出含口令即 PASS。全部 FP8 block128、TP2 `0,1`、`--kv-dtype fp8`。
+
+| run | rope | 投机 | ceiling | prompt tokens | prefill t/s | decode tok/s | planned device | 结果 |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| smoke | yarn ×4 | 无 | 1,048,576 | 8,049 | 1583.97 | 22.19 | 16.80 GiB | PASS |
+| A | native | 无 | 262,144 | 261,000 | 518.54 | 12.57 | 20.67 GiB | PASS |
+| B2 | yarn ×1.125 | 无 | 294,912 | 272,000 | 502.28 | 12.35 | 21.17 GiB | PASS |
+| B1 | yarn ×4 | 无 | 1,048,576 | 272,000 | 501.41 | 12.35 | 21.24 GiB | PASS |
+| C2 | yarn ×4 | **MTP3** | 1,048,576（容量落在 254,000） | 244,000 | **540.06** | **38.48** | 21.24 GiB | PASS |
+
+A 是原生上限内的对照（261,000 < 262,144），B1/B2 都**跨过了原生上限**且检索成立，**C2 证明
+验收 lane（MTP3 + `--lm-head-draft`）在自己的 254,000 容量下同样成立**。prefill 501–540 t/s：
+C2 的 540 并不比 B1/B2 的 501 好，它只是短了 10%（244k vs 272k），趋势一致。C2 的 decode 38.48
+tok/s 对比同长度的无投机 12.4 t/s，是 MTP3 本身的收益（约 3×），与 YaRN 无关。
+
+**证据边界（必须一起引用）**：单条 needle、单深度、粗门。B1（×4，为 1M 调的因子）在同一条
+needle 上也 PASS，所以本证据**不能**支持「因子必须匹配实际窗口」这一说法；因子—窗口的匹配
+质量仍是 open item，需要多深度 / 多 needle 或困惑度类判据。
+
+decode 12.35–12.57 tok/s 是**无投机后端**的读数（A/B1/B2 均未开 MTP），与 §106 的基座轮在 139k
+的 64 ms 外推一致，不是 YaRN 的成本；开了 MTP3 的 C2 是 38.48 tok/s。
+
+⚠️ **探针陷阱（已修）**：第一版 C 跑把填充量正好铺满整个窗口（`prompt tokens 250000` =
+`max context 250000`），引擎在 `finish reason context-capacity` 下只生成 1 个 token，于是报
+FAIL —— 那是**构造错误不是检索失败**。`.scratch/yarn_needle.sh` 已加守卫：prompt ≥ max context
+时判 `NOWINDOW` 而非 `FAIL`，并打印原因。**凡是要判「长文能力」的 run，都必须留出生成空间。**
+
+### 109.4 顺带修复：CLI 的 `--kv-dtype fp8` 契约破损
+
+`README.md:20` 把 `--kv-dtype fp16|int8|fp8` 列为已交付契约，`docs/cli.md:160` 与 §「Choosing
+the KV-cache dtype」整节都按 CLI 选项描述，并写明「on the Turing target `fp8` is what reaches
+the artifact's full 262,144-token window」。实际：
+
+| 工具 | `--kv-dtype fp8` |
+|---|---|
+| `ninfer_bench`（`bench/targets/qwen3_6_27b/ninfer_bench_support.cpp:54`） | 接受（§97 的 fp8-KV 数据就是它测的） |
+| `ninfer-serve`（`src/serve/serve_options.cpp:72`） | 接受 |
+| `ninfer` CLI（`apps/cli/options.cpp:100-102`） | **拒绝** |
+
+于是 CLI —— 五个已发布身份里明确列出的产品通路 —— 无法驱动 fp8 KV，也就无法在本目标上到达
+262,144 或 YaRN 的扩展窗口。已修：
+
+- `apps/cli/options.cpp`：`parse_kv_cache` 接受 `fp8`；usage 行改 `fp16|int8|fp8` 并新增一段
+  三种存储的说明；
+- `apps/cli/main.cpp`：`format_kv_cache` 三态化，fp8 报 `fp8-e4m3`。原实现是二元的，会把
+  fp8 **误报**成 `int8-group64`（与 `src/serve/request_log.cpp:97` 不一致）；
+- `tests/test_ninfer_bench_support.cpp:180-185`：该处断言 `--kv-dtype fp8` 必须抛
+  `invalid_argument`，是**过期**断言（bench 早已支持 fp8），改为用无效值 `fp4` 继续守护该
+  分支。`ninfer_bench_support_test` 转绿，§108 表内一条消除。
+
+### 109.5 顺带补齐：`--yarn-factor` 的整数 ceiling 约束未文档化
+
+`src/targets/qwen3_6/impl/runtime/yarn_rope.cpp:140-143` 要求 `--yarn-origin × --yarn-factor`
+**落在整数 token 上**，否则加载期抛
+`--yarn-origin x --yarn-factor must land on a whole number of tokens`。`docs/cli.md` 与 CLI
+`--help` 原来只写了取值范围 [1.0, 64.0]，于是 `--yarn-factor 1.15`（262144×1.15 = 301465.6）
+这类完全合理的意图会在加载期才失败（本轮首次实测就撞上）。已在两处补记该约束并给出可用例子
+（262144×1.125 = 294,912）。
+
+### 109.6 未做
+
+- 未做 YaRN 本目标的同会话 A/B 性能对拍（只做了容量与检索）。
+- 未做因子—窗口匹配质量判据（见 109.3 的证据边界）。
+- 未动 §108 的两条真实缺陷（block-FP8 conv snapshot 判据基线、sm_75 下 `Bf16MmaSchedule`
+  的 96 KiB shared 申请）。
+
+---
+
+## §110 decode 长度相关成本的归因：**100% 是 decode attention，而它跑在 KV 字节下限的 5.7×**（2026-10-08）
+
+### 110.1 方法与口径
+
+两个 nsys 剖面（`profiles/nsys/dec_{85k,139k}`）：CLI、同一批 prompt 文件
+（`.scratch/synth_the_{85070,138933}.json`，即 §106 用的同一份 `" the"` 填充）、**fp8 KV**、
+MTP3 + `--lm-head-draft`、`--max-context 147456`、`--max-new 128`、greedy、
+`--cuda-graph-trace=node`（**不加这个参数图内节点全部丢失**，见 110.6）。
+
+| 占用 | prefill t/s | decode t/s | 轮 | accepted | acceptance | 轮长 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 85,122 | 981.83 | 41.42 | 43 | 84 | 65.62% | 71.87 ms |
+| 138,985 | 759.76 | 37.45 | 43 | 84 | 66.14% | 79.49 ms |
+
+轮长 71.87 → 79.49 ms（+7.62 ms，+10.6%），与 §106 记录的 71.77 → 79.69 实质吻合
+（+0.1% / −0.3%）⇒ 轮长那条记录可复现。
+
+### 110.2 结论：增长几乎全部集中在**一个内核**
+
+按 kernel 名归族，**每轮** device 0 时间（窗口 = 最后一个 prefill attention 之后，÷43 轮）：
+
+| 族 | 85k ms/轮 | 139k ms/轮 | Δ |
+|---|---:|---:|---:|
+| **decode attention（partial + reduce）** | **14.54** | **22.30** | **+7.76** |
+| fp8 linear（scalar） | 23.97 | 24.03 | +0.05 |
+| fp8 swiglu（scalar） | 16.06 | 16.07 | +0.01 |
+| bf16 head（gemm + small-t inner） | 4.44 | 4.45 | +0.01 |
+| 其余（rmsnorm/residual/gdn/rope/…） | ~2.3 | ~2.3 | ~0.00 |
+| 内核合计 | 62.85 | 70.75 | +7.90 |
+
+窗口本身 +7.63 ms ⇒ **decode attention 占增长的 102%**（其余净和为零）。**权重叶完全与长度
+无关**（这一点必然是，但它现在有了直接证据），所以"长度相关成本"不是一个分布量，而是一个内核。
+
+### 110.3 它只跑到 KV 字节下限的 5.7×，且达成带宽**与长度无关**
+
+fp8 KV 实测成本 17,395 B/token/卡：
+
+| 占用 | KV/轮 | 字节下限 | 实测 attention | 倍数 | 达成带宽 |
+|---:|---:|---:|---:|---:|---:|
+| 85,122 | 1.481 GB | 2.40 ms | 14.54 ms | **6.0×** | **101.8 GB/s** |
+| 138,985 | 2.418 GB | 3.92 ms | 22.30 ms | **5.7×** | **108.4 GB/s** |
+| 增量 | 0.937 GB | 1.52 ms | +7.76 ms | **5.1×** | — |
+
+达成带宽 101.8 → 108.4 GB/s = 616 GB/s 的 **17%**，**且不随长度变化** ⇒ 这个内核**不是带宽
+受限**，它是一个固定速率的引擎，而那个速率就是轮长随上下文线性增长的全部原因。
+
+发射几何（实测，device 0）：partial `grid=(2,136)`、blk=128、**regs=182、static smem=25,832 B**、
+**19 次/轮**（16 verify + 3 draft）；reduce `grid=(12,4)`、blk=256、regs=32、19 次/轮、54 µs/次
+（1.03 ms/轮）。85k 单次 717.8 µs → 139k 单次 1129.4 µs，同一形状。
+
+### 110.4 项 1 据此收口：`DecodeSplitScale = 2` 已经落在推导出来的点上
+
+- 实测 `gridY = 136 = 68 × 2`，`gridX = KVHeads = 2` ⇒ **272 CTAs**，而驻留块 = 2 blocks/SM ×
+  68 SM = 136 ⇒ **恰好两个满波、零尾波浪费**，与 `gqa_attention_geometry.cuh` 自己的推导一致
+  （该文件把"splits 取 68×Scale"写成"为本目标重新推导"的规则，tp2 几何的 Scale=2 给出的正是这个数）。
+- 因此该项**不需要重编译 + A/B**：可动项只剩 reduce（1.03 ms/轮 = attention 的 7%），splits 减半
+  最多省约 0.5 ms/轮 ≈ 0.7%。**从"几个百分点"降级为 <1%，未做 A/B**（已用发射几何核实，不是推断）。
+
+### 110.5 项 4 的框架被本测量改写：真正的杠杆是 attention 的占用，不是权重搬运重叠
+
+- 原表述把 decode 的大头归给"sm_75 无 cp.async ⇒ 权重流搬运不能与计算重叠"。本测量显示
+  **权重叶是平的**（fp8 linear + swiglu = 40.03 ms/轮 在两个占用点完全相同），而**唯一随长度
+  增长的是 attention**，且它只跑到 17% 带宽 ⇒ **sm_75 上剩余的最大 decode 杠杆是 decode
+  attention 的占用/延迟结构**。
+- 结构阻塞点（实测）：regs=182、static smem=25,832 B ⇒ **2 blocks/SM = 8 warp/SM = 25% 理论占用**
+  （历史实测约 21.8%）。要到 3 blocks/SM 需 smem ≤20,821 B **且** regs ≤170；而 `q_s` 一项
+  （32×264×2 = 16,896 B）就占掉大头，`Br=32` 被 `mma.m8n8k4` 的 quadpair 与 masking 映射钉死。
+- 候选（带机制，**未做**）：①`Bc` 8→4 再把 pad 削到 ≤20,821 B（历史记录：Bc=4 未削 pad 为
+  21,512 B，差约 690 B；去掉 pad 会引入 bank 冲突，int8 路径记录为 21× 重放）；②warp 间 split-K
+  + 归并（历史记录为"唯一有历史印证的方向"，属重构）。
+- 量化收益上限：139k 时 attention 22.30 ms → 字节下限 3.92 ms，**18.4 ms/轮 ≈ 轮长的 23%**；
+  254k 会更大。
+
+### 110.6 项 3：跨引擎基座轮逐项对拍（**已完成**，85k、双方无投机、双方 fp16 KV）
+
+**他们那份 `vllm_nospec_32768.sqlite` 不可用**：没加 `--cuda-graph-trace=node`，decode 窗口
+（17.0 s 跨度）里只有 1.19 s 内核、**64 层栈完全缺失**，只剩图外的 LM head / 采样 / all-gather
+⇒ 无法逐项。已用他们自己的 no-MTP profile（`2x2080Ti/qwen27b/w8a16/nomtp-fp16kv-1x176K-text-only.env`）
+重采 → `profiles/nsys/vllm_nomtp_85k.nsys-rep`。⚠️ 停 server 必须 TERM 后**再 KILL 掉被
+re-parent 的 `VLLM::Worker`**，否则 nsys 一直等它们、不收尾（本轮实测）。
+（顺带：那份旧剖面仍给了一个可用事实 —— 512 个 decode 步 / 17.0 s ⇒ 他们基座轮 ≈33.2 ms @32,768，
+与 §106 记录的 33.33 ms 一致。）
+
+口径：双方同一份 85,070-token `" the"` 填充 prompt、128 生成、TP2 `0,1`、fp16 KV、无投机。
+他们由 `tools/profile_request.py --pure-filler` 驱动：ttft 77.42 s、prefill 1098.8 t/s、
+decode 26.64 tok/s ⇒ **37.5 ms/步**。我们 CLI 同 prompt：prefill 1032.9 t/s、decode 17.32 tok/s
+⇒ **57.95 ms/步**。他们的步窗口用**每步唯一的采样内核**（`gumbel`）切分，只取间隔 <0.1 s 的
+稳态后缀（68 步、38.5 ms/步）；前段因图捕获畸慢已弃用（这个取法对他们有利）。
+
+| 成分 | 我们 ms/步 | 他们 ms/步 | 比 |
+|---|---:|---:|---:|
+| 权重 GEMM | **36.69**（swiglu 15.74 + linear 12.87 + 6.22 + 1.86） | **23.38**（marlin，256 次/步） | **1.57×** |
+| decode attention | **10.92**（partial 10.18 + reduce 0.74） | **5.54**（flashinfer 5.39 + merge 0.15） | **1.97×** |
+| LM head | 2.17 | 2.17 | **1.00×** |
+| 其它内核 | 2.16 | 5.69 | 0.38× |
+| 内核合计 | 51.94 | 36.63 | 1.42× |
+| 窗口内空隙 | 6.01 | 1.87 | 3.2× |
+| **窗口/步** | **57.95** | **38.50** | **1.51×** |
+
+增长的 19.45 ms 构成：**权重 GEMM +13.31（68%）**、**attention +5.53（28%）**、空隙 +4.14、
+其它内核 −3.53。
+
+结论：
+1. **孤立叶子只差 1.09×（§104），但在位的权重 GEMM 是 1.57×** ⇒ 那 13.3 ms 里大头不是叶子的
+   MIO 速率，而是 64 层链上的每次发射/结构开销。这把「基座轮 1.504× 却叶子 1.09×」的悬案定位到
+   了**在位**的权重 GEMM，而不是继续调叶子。
+2. **attention 在位是 1.97×**（远超任何叶子口径），与 110.3（它只跑到 17% 带宽）互相印证 ⇒
+   attention 是第二个独立靶子。
+3. 我们空隙 6.01 vs 他们 1.87：部分是因为**我们的 allreduce 是 DMA 而非内核**（不计入内核时间，
+   因此全落在空隙里），而他们的 `cross_device_reduce_1stage` 是内核（2.48 ms/步、129 次/步）
+   计入内核时间。⇒ 两边的「内核/空隙」切分口径不同，该比值不能单独当结论。
+4. LM head 完全相同（2.17 vs 2.17）—— 独立性检查通过。
+
+### 110.7 顺带修正 §106 的配置记录（不可复现）
+
+`fp16 KV + MTP3 + --lm-head-draft` 在 `--max-context 139264` 就**进不去**（需
+`6,810,731,264 B`，可用 `6,475,399,424 B`），147,456 差得更多（需 `7,095,944,960 B`）。按
+~34,800 B/token 推算，该组合的上限约 **129,600**。而 §106 的表格写着 local rows 用
+"FP16 KV、`max_ctx` 147,456、占用 138,985" —— **该组合在本 checkout 不可能启动**，原始日志也已
+不在 `.scratch/`，故**那一栏应视为未经核实**。
+
+可复现的是**基座轮**：本轮实测 no-spec 85,122 + fp16 KV + `max_ctx 86016`
+（`runtime reservation` 4.38 GiB，装得下）→ decode **17.32 tok/s = 57.74 ms/轮**，对照 §106 的
+57.40 ms（+0.6%）。本轮起长上下文差分一律改用 **fp8 KV（当前 lane）**。
+
+### 110.8 未做
+
+- 未做 attention 3 blocks/SM 的候选（§110.5 两条）。
+- 未做在位权重 GEMM 1.57× 的进一步分解（§110.6 结论 1）：需要在内核级把"权重字节地板 / 发射
+  次数 / 依赖链"三者分开，目前的证据只能说"不在叶子的 MIO 速率里"。
+- 未改任何生产代码。
+
+---
+
+## §111 decode 权重叶的 L1/TEX 瓶颈定位；以及"跨行共享激活读"这条修复实测无效（已回退）（2026-10-08）
+
+### 111.1 先纠正 §104 的一个体制错误
+
+§104 的"孤立叶子只差 1.09×（他们 50.3 / 我们 46.0 TFLOPS）"是在 **M=2048/4096 的大 T 形状**上
+量的，那是**计算受限**体制；而 decode 的权重 GEMM 是 **T=1、算术强度 2 FLOP/byte 的纯带宽
+受限**问题（每个权重字节只被用 1 次）。两者本来就不可比。§110 的"在位权重 GEMM 1.57×"因此
+不是矛盾，而是**另一个体制**的数字 —— 沿用 §104 的 1.09× 来预测 decode 是错的。
+
+### 111.2 在位带宽：62.5% vs 93.5%
+
+他们 server 日志给了真实字节数（`Model loading took 14.28 GiB memory`），我们 14.91 GiB
+⇒ **只差 4.4%**（扣除 embedding/head/vision/MTP 后的层权重：我们 14.14 GB、他们 13.46 GB）：
+
+| | 层权重/卡 | 权重 GEMM | 达成带宽 | 占 616 GB/s |
+|---|---:|---:|---:|---:|
+| 我们 | 14.14 GB | 36.69 ms/步 | 385 GB/s | **62.5%** |
+| 他们 | 13.46 GB | 23.38 ms/步 | 576 GB/s | **93.5%** |
+
+⇒ **权重 GEMM 的 1.57× 是 DRAM 带宽利用率差，不是字节、不是张量率、不是发射次数。**
+
+### 111.3 ncu 定位：叶子卡在 L1/TEX，不是 DRAM
+
+`fp8_block_linear_kernel<GdnOutput, 0, 4>`、grid 2048×1×1、128 线程（85k decode、fp8 KV、
+`--no-cuda-graph`）：
+
+| 指标 | 值 |
+|---|---:|
+| **L1/TEX Cache Throughput** | **74.53%** |
+| DRAM Throughput | 51.61%（324 GB/s） |
+| Compute (SM) | 42.97% |
+| **L1/TEX Hit Rate** | **79.69%** |
+| Achieved / Theoretical Occupancy | 91.92% / 100% |
+| No Eligible / Issued per scheduler | 56.43% / 0.44 |
+| Active warps per scheduler | 7.28，其中仅 0.90 eligible |
+
+机制（读码得出，不是推测）：`row = blockIdx.x * kRowsPerBlock + warp`，而**激活地址不含 row**
+（`x + token_begin * input_rows + k_begin`），所以每个 warp、每个 row-block 都重读**同一份**激活。
+每 K-tile 每 warp 的 sector 账：权重 4 B/lane = 128 B = **4 sectors**；激活 4 token × 8 B/lane =
+1,024 B = **32 sectors**。⇒ **激活请求是权重请求的 8 倍**，L1 命中率 79.7% 正是这个比例，
+于是 L1/TEX 而非 DRAM 成为天花板。
+
+（另：`gqa_kv_dequant_fp8x2_f16`（`gqa_attention_kv_quant.cuh:119-123`）**已经在用无查表 ALU
+位变换**，所以 `math_pipe_throttle` 不是 attention 的 fp8 解码造成的 —— 这条假设廉价地排掉了。）
+
+### 111.4 修复尝试：每 warp 多行、共享一次激活读（已实现、已实测、**已回退**）
+
+做法：给 `fp8_block_linear_kernel` 与 `launch_scalar_tokens` 加 `RowsPerWarp`（默认 1 惰性），
+`NINFER_FP8_BLOCK_ROWS_PER_WARP=2` 启用；每行的 FMA 顺序不变 ⇒ **数值必须逐位相同**。
+
+- **正确性**：`ninfer_linear_fp8_block_test` 两种模式 **max_abs_error 完全相同**
+  （0.00292969 / 0.012207 / 0.00341797）⇒ 逐位不变 ✓
+- **内核级（ncu，同形状）**：L1/TEX **74.62 → 65.44%**、L1 命中 **79.66 → 67.83%**、
+  DRAM 52.31 → 53.85%、占用率不变（91.8 / 92.1%）、**Duration 134.91 → 129.92 µs（−3.7%）**
+  ⇒ **假设成立，改动按设计生效。**
+- **引擎级同会话 A/B/B/A**（85k 基座轮、无投机、fp16 KV）：R=1 **17.51 / 17.46**，
+  R=2 **17.08 / 17.08** ⇒ **R=2 慢 2.3%**（两组互相包夹，方向一致）。
+- **逐形状差分**（两份 nsys，按 gridX 配对 —— 内核名被截断，只能靠 grid 配对）：
+  n=7168 gridX 1792→896 **−2.3%**；n=8192 gridX 2048→1024 **−5.3%**；
+  **n=5120 gridX 1280→640 +15.8%（+2,031 µs/步）** ⇒ 它一个形状吃掉其它两个形状的全部收益还有余。
+- 选择性启用（只对 n=7168 / n=8192 开）净值 **−369 µs/步 = −0.64%/步**，落在仓库自记的 ±3%
+  会话噪声内 ⇒ **不值得为此加形状条件分支。已 `git checkout` 回退、重建并复测恢复
+  （17.46 / 17.44）。**
+
+### 111.5 结论与下一步
+
+- **诊断成立，这条杠杆不付钱。** decode 权重叶确实是 L1/TEX 受限（因激活重复读），但
+  "跨行共享激活读"在 `n=5120` 形状上以 15.8% 的退步抵消了其余形状的全部收益。该形状为何退这么多
+  **机制未定**：grid 从 1280 降到 640 仍远大于 136 个驻留块，波量化解释不了。
+- ⇒ **下一步若继续这条线，必须先解释 `n=5120` 为何退 15.8%；在那之前不要再改这个叶的粒度。**
+- 未做：swiglu 标量叶（15.74 ms/步，比 linear 的 12.87 还大）的同款改动 —— 但按上述结论，
+  在机制未明前做它没有意义。
+
+### 111.6 未做
+
+- 未动 attention 的 3 blocks/SM 候选（§110.5）。
+- 本轮唯一的源码改动（`RowsPerWarp`）**已完整回退**，工作树无引擎改动。
